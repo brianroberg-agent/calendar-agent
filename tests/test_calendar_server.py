@@ -579,6 +579,37 @@ class TestSearchEndpoint:
         response = client.post("/search", json=request_data)
         assert response.status_code == 200
 
+    def test_search_honors_flat_filter_fields(self, client, mock_proxy_client):
+        """Filter fields sent at the top level (not nested under 'filters') are honored.
+
+        Regression: a flat request silently dropped time bounds/query because the
+        fields landed outside the SearchFilters model, returning all-time results.
+        """
+        request_data = {
+            "calendar_id": "primary",
+            "query": "meeting",
+            "time_min": "2026-07-01T00:00:00Z",
+            "time_max": "2026-07-31T23:59:59Z",
+        }
+        response = client.post("/search", json=request_data)
+        assert response.status_code == 200
+        kwargs = mock_proxy_client.list_events.call_args.kwargs
+        assert kwargs["time_min"] == "2026-07-01T00:00:00Z"
+        assert kwargs["time_max"] == "2026-07-31T23:59:59Z"
+        assert kwargs["q"] == "meeting"
+
+    def test_search_nested_filters_are_forwarded(self, client, mock_proxy_client):
+        """Nested filters must still reach the client (backward compatibility)."""
+        request_data = {
+            "calendar_id": "primary",
+            "filters": {"time_min": "2026-01-01T00:00:00Z", "time_max": "2026-01-31T00:00:00Z"},
+        }
+        response = client.post("/search", json=request_data)
+        assert response.status_code == 200
+        kwargs = mock_proxy_client.list_events.call_args.kwargs
+        assert kwargs["time_min"] == "2026-01-01T00:00:00Z"
+        assert kwargs["time_max"] == "2026-01-31T00:00:00Z"
+
 
 class TestBulkActionsEndpoint:
     """Tests for POST /bulk-actions."""

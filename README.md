@@ -535,6 +535,10 @@ curl -X POST http://localhost:8082/search \
   }'
 ```
 
+The filter fields (`query`, `time_min`, `time_max`, `max_results`, `order_by`,
+`show_deleted`) may also be supplied flat at the top level instead of nested under
+`filters`; both shapes are accepted (nested wins if both are given).
+
 Response:
 ```json
 {

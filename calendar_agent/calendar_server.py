@@ -21,7 +21,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from . import __version__
 from .calendar_utils import (
@@ -180,9 +180,29 @@ class SearchFilters(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    """Request to search events."""
+    """Request to search events.
+
+    Filter fields may be supplied nested under ``filters`` or flat at the top
+    level (the shape the calendar skills document). Flat fields are folded into
+    ``filters`` so time bounds/query are no longer silently dropped; when both
+    are present, the nested value wins.
+    """
     calendar_id: str = Field(..., description="Calendar ID to search")
     filters: SearchFilters = Field(default_factory=SearchFilters)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_flat_filters(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            flat_keys = (
+                "query", "time_min", "time_max",
+                "max_results", "order_by", "show_deleted",
+            )
+            flat = {k: data[k] for k in flat_keys if k in data}
+            if flat:
+                nested = data.get("filters") or {}
+                data = {**data, "filters": {**flat, **nested}}
+        return data
 
 
 class BulkOperationType(str, Enum):
