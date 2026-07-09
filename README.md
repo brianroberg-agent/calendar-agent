@@ -171,6 +171,7 @@ Response:
       "end": "2024-01-15T11:00:00Z",
       "location": "Conference Room A",
       "attendee_count": 5,
+      "response_status": "accepted",
       "is_all_day": false,
       "status": "confirmed"
     }
@@ -546,6 +547,7 @@ Response:
       "start": "2024-01-20T14:00:00Z",
       "end": "2024-01-20T15:00:00Z",
       "attendee_count": 8,
+      "response_status": "needsAction",
       "is_all_day": false
     }
   ],

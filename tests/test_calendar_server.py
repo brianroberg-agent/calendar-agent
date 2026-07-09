@@ -3,6 +3,7 @@
 
 import pytest
 
+from calendar_agent.calendar_server import event_to_summary
 from calendar_agent.exceptions import ProxyAuthError, ProxyError, ProxyForbiddenError
 
 # ============================================================================
@@ -103,6 +104,24 @@ class TestEventsListEndpoint:
         assert data["success"] is True
         assert len(data["events"]) == 1
         assert data["events"][0]["summary"] == "Team Standup"
+
+    def test_list_events_exposes_owner_response_status(self, client, mock_proxy_client):
+        """The owner's RSVP (self attendee) is surfaced on each event summary."""
+        mock_proxy_client.list_events.return_value = {
+            "items": [{
+                "id": "inv1",
+                "summary": "Annual Advocacy Training Day",
+                "start": {"dateTime": "2026-11-02T10:00:00-05:00"},
+                "end": {"dateTime": "2026-11-02T16:00:00-05:00"},
+                "attendees": [
+                    {"email": "organizer@example.com", "responseStatus": "accepted"},
+                    {"email": "me@example.com", "self": True, "responseStatus": "needsAction"},
+                ],
+            }],
+        }
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 200
+        assert response.json()["events"][0]["response_status"] == "needsAction"
 
     def test_list_events_with_filters(self, client, mock_proxy_client):
         """List events accepts filter parameters."""
@@ -713,3 +732,37 @@ class TestRequestValidation:
         }
         response = client.post("/find-free-time", json=request_data)
         assert response.status_code == 422
+
+
+# ============================================================================
+# event_to_summary serialization
+# ============================================================================
+
+
+class TestEventToSummaryResponseStatus:
+    """event_to_summary should surface the calendar owner's RSVP status."""
+
+    def test_includes_self_response_status(self):
+        event = {
+            "id": "e1",
+            "summary": "GMDM Directors Meeting",
+            "start": {"dateTime": "2026-08-10T14:00:00-04:00"},
+            "end": {"dateTime": "2026-08-10T15:30:00-04:00"},
+            "attendees": [
+                {"email": "organizer@example.com", "responseStatus": "accepted"},
+                {"email": "me@example.com", "self": True, "responseStatus": "needsAction"},
+            ],
+        }
+        summary = event_to_summary(event, "robergb@dm.org")
+        assert summary.response_status == "needsAction"
+        assert summary.attendee_count == 2
+
+    def test_response_status_none_without_attendees(self):
+        event = {
+            "id": "e2",
+            "summary": "Solo block",
+            "start": {"dateTime": "2026-08-10T09:00:00-04:00"},
+            "end": {"dateTime": "2026-08-10T10:00:00-04:00"},
+        }
+        summary = event_to_summary(event, "robergb@dm.org")
+        assert summary.response_status is None

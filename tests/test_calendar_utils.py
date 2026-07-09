@@ -10,6 +10,7 @@ from calendar_agent.calendar_utils import (
     get_event_summary_text,
     get_event_time,
     get_now_rfc3339,
+    get_self_response_status,
     get_time_range_rfc3339,
     is_all_day_event,
     parse_attendee_name,
@@ -178,6 +179,38 @@ def test_format_attendees_empty_list():
 def test_format_attendees_none():
     """Test formatting None attendees."""
     assert format_attendees(None) == "No attendees"
+
+
+# ============================================================================
+# Tests for get_self_response_status
+# ============================================================================
+
+
+def test_get_self_response_status_returns_self_attendees_status():
+    """Return the responseStatus of the attendee marked self=true."""
+    attendees = [
+        {"email": "organizer@example.com", "responseStatus": "accepted"},
+        {"email": "me@example.com", "self": True, "responseStatus": "declined"},
+    ]
+    assert get_self_response_status(attendees) == "declined"
+
+
+def test_get_self_response_status_needs_action():
+    """A self attendee who hasn't responded reads needsAction."""
+    attendees = [{"email": "me@example.com", "self": True, "responseStatus": "needsAction"}]
+    assert get_self_response_status(attendees) == "needsAction"
+
+
+def test_get_self_response_status_none_when_no_self_attendee():
+    """No self attendee (e.g. events with only other people) -> None."""
+    attendees = [{"email": "alice@example.com", "responseStatus": "accepted"}]
+    assert get_self_response_status(attendees) is None
+
+
+def test_get_self_response_status_empty_and_none():
+    """Empty list or None -> None."""
+    assert get_self_response_status([]) is None
+    assert get_self_response_status(None) is None
 
 
 # ============================================================================

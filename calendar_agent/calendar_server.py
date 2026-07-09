@@ -24,7 +24,11 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .calendar_utils import find_free_slots, get_time_range_rfc3339
+from .calendar_utils import (
+    find_free_slots,
+    get_self_response_status,
+    get_time_range_rfc3339,
+)
 from .exceptions import ProxyAuthError, ProxyError, ProxyForbiddenError
 from .llm_service import get_llm_service
 from .proxy_client import get_calendar_client
@@ -247,6 +251,7 @@ class EventSummary(BaseModel):
     end: str
     location: str | None = None
     attendee_count: int
+    response_status: str | None = None
     is_all_day: bool
     status: str | None = None
     html_link: str | None = None
@@ -333,6 +338,7 @@ def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
         end=end_str,
         location=event.get("location"),
         attendee_count=len(attendees) if attendees else 0,
+        response_status=get_self_response_status(attendees),
         is_all_day=is_all_day,
         status=event.get("status"),
         html_link=event.get("htmlLink"),

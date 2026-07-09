@@ -98,6 +98,24 @@ def parse_attendee_name(attendee: dict[str, Any]) -> str:
     return attendee.get("displayName") or attendee.get("email", "Unknown")
 
 
+def get_self_response_status(
+    attendees: list[dict[str, Any]] | None,
+) -> str | None:
+    """Return the calendar owner's RSVP status for an event.
+
+    Google marks the owner's own attendee entry with ``self: true``; its
+    ``responseStatus`` is one of ``accepted``, ``declined``, ``tentative``, or
+    ``needsAction``. Returns ``None`` when there is no self attendee (e.g. an
+    event with no attendees, or one where the owner is only the organizer).
+    """
+    if not attendees:
+        return None
+    for attendee in attendees:
+        if attendee.get("self"):
+            return attendee.get("responseStatus")
+    return None
+
+
 def is_all_day_event(event: dict[str, Any]) -> bool:
     """Check if an event is an all-day event."""
     start = event.get("start", {})
