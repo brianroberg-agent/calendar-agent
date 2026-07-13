@@ -186,10 +186,11 @@ def test_endpoint_count_matches():
     # - 1 health
     # - 2 calendars (list, get)
     # - 5 events CRUD (list, create, get, update, patch, delete)
+    # - 1 events RSVP (respond)
     # - 3 basic LLM (summarize, ask-about, batch-summarize)
     # - 3 calendar LLM (find-free-time, analyze-schedule, prepare-briefing)
     # - 2 operations (search, bulk-actions)
-    expected_count = 17
+    expected_count = 18
 
     assert len(endpoints) == expected_count, (
         f"Expected {expected_count} endpoints, found {len(endpoints)}. "

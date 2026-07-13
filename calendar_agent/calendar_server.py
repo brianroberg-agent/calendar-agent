@@ -113,6 +113,13 @@ class EventPatchRequest(BaseModel):
     colorId: str | None = None
 
 
+class RespondRequest(BaseModel):
+    """Request body for RSVPing to an event (setting the owner's own status)."""
+    response_status: str = Field(
+        ..., description="'accepted', 'declined', or 'tentative'"
+    )
+
+
 class SummarizeRequest(BaseModel):
     """Request to summarize an event."""
     calendar_id: str = Field(..., description="Calendar ID containing the event")
@@ -585,6 +592,36 @@ async def delete_event(
             success=False,
             message="Failed to delete event",
             error=format_proxy_error(e),
+        )
+
+
+@app.post(
+    "/calendars/{calendar_id}/events/{event_id}/respond",
+    response_model=EventDetailResponse,
+    tags=["events"]
+)
+async def respond_to_event(
+    calendar_id: str,
+    event_id: str,
+    request: RespondRequest,
+):
+    """RSVP to an event by setting the owner's own responseStatus.
+
+    Forwards to the proxy's dedicated /respond route, which changes only the
+    self attendee's status and sends no invitations or notifications. Valid
+    values for response_status are 'accepted', 'declined', or 'tentative'.
+    """
+    try:
+        client = get_calendar_client()
+        result = await client.respond_to_event(
+            calendar_id,
+            event_id,
+            request.response_status,
+        )
+        return EventDetailResponse(success=True, event=result)
+    except Exception as e:
+        return EventDetailResponse(
+            success=False, event=None, error=format_proxy_error(e)
         )
 
 

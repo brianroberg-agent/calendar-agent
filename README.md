@@ -313,6 +313,35 @@ If confirmation is required:
 }
 ```
 
+### POST /calendars/{calendar_id}/events/{event_id}/respond
+
+RSVP to an event by setting **only your own** response status. Forwards to the
+proxy's dedicated respond route, which changes only the `self` attendee's status
+and sends no invitations or notifications.
+
+Request body:
+- `response_status` (string): one of `accepted`, `declined`, `tentative`
+
+```bash
+curl -X POST http://localhost:8082/calendars/primary/events/event123/respond \
+  -H "Content-Type: application/json" \
+  -d '{"response_status": "accepted"}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "event": {
+    "id": "event123",
+    "attendees": [
+      {"email": "you@example.com", "responseStatus": "accepted", "self": true}
+    ]
+  },
+  "error": null
+}
+```
+
 ---
 
 ## LLM-Powered Endpoints

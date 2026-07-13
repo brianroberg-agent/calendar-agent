@@ -187,6 +187,29 @@ class CalendarProxyClient:
             )
             return self._handle_response(response)
 
+    async def respond_to_event(
+        self,
+        calendar_id: str,
+        event_id: str,
+        response_status: str,
+    ) -> dict[str, Any]:
+        """RSVP to an event by setting the owner's own responseStatus.
+
+        Forwards to the proxy's dedicated ``/respond`` route, which changes only
+        the self attendee's status and sends no notifications.
+        """
+        url = (
+            f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}"
+            f"/events/{event_id}/respond"
+        )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                url,
+                headers=self._get_headers(),
+                json={"responseStatus": response_status},
+            )
+            return self._handle_response(response)
+
     async def update_event(
         self,
         calendar_id: str,
