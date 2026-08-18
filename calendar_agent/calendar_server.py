@@ -17,7 +17,7 @@ and enforces security policies.
 
 import os
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -115,7 +115,7 @@ class EventPatchRequest(BaseModel):
 
 class RespondRequest(BaseModel):
     """Request body for RSVPing to an event (setting the owner's own status)."""
-    response_status: str = Field(
+    response_status: Literal["accepted", "declined", "tentative"] = Field(
         ..., description="'accepted', 'declined', or 'tentative'"
     )
 

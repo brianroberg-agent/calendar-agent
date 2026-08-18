@@ -200,6 +200,7 @@ def mock_proxy_client():
         mock_client.update_event.return_value = SAMPLE_EVENTS["basic_meeting"]
         mock_client.patch_event.return_value = SAMPLE_EVENTS["basic_meeting"]
         mock_client.delete_event.return_value = {"success": True}
+        mock_client.respond_to_event.return_value = SAMPLE_EVENTS["basic_meeting"]
 
         mock_get.return_value = mock_client
         yield mock_client

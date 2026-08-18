@@ -2,6 +2,7 @@
 
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -198,9 +199,11 @@ class CalendarProxyClient:
         Forwards to the proxy's dedicated ``/respond`` route, which changes only
         the self attendee's status and sends no notifications.
         """
+        # Calendar IDs may contain characters like '#' (e.g. Google holiday
+        # calendars) that would otherwise truncate the URL as a fragment.
         url = (
-            f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}"
-            f"/events/{event_id}/respond"
+            f"{self.proxy_url}/calendar/v3/calendars/{quote(calendar_id, safe='@')}"
+            f"/events/{quote(event_id, safe='')}/respond"
         )
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
