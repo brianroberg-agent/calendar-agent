@@ -86,8 +86,19 @@ class CalendarProxyClient:
         if json_body is not None:
             kwargs["json"] = json_body
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            # The long CONFIRM_TIMEOUT budget is for the proxy's human-approval
+            # window, which only starts once a request reaches it; connecting
+            # gets the ordinary budget so an unreachable proxy fails fast.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=READ_TIMEOUT)
+            ) as client:
                 return await getattr(client, method)(url, **kwargs)
+        except httpx.ConnectTimeout as e:
+            # The request never reached the proxy: definitive failure, not an
+            # unknown outcome.
+            raise ProxyError(
+                f"Could not connect to proxy within {READ_TIMEOUT:.0f}s"
+            ) from e
         except httpx.TimeoutException as e:
             raise ProxyTimeoutError(
                 f"No response from proxy after {timeout:.0f}s; the operation's "
@@ -95,6 +106,8 @@ class CalendarProxyClient:
                 "complete if approved later. Verify by re-reading the resource "
                 "before retrying."
             ) from e
+        except httpx.HTTPError as e:
+            raise ProxyError(f"Proxy connection failed: {e}") from e
 
     # ========== Calendar Operations ==========
 

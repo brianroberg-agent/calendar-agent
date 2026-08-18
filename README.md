@@ -324,12 +324,22 @@ Response:
 }
 ```
 
-If confirmation is required:
+If the operator rejects the deletion (HTTP `403`):
 ```json
 {
   "success": false,
-  "message": "Deletion requires confirmation",
-  "error": "Operation blocked: Please confirm deletion of event 'Team Meeting'"
+  "message": "Deletion blocked or rejected by operator",
+  "error": "Operation blocked: Request rejected by operator"
+}
+```
+
+If no response arrives before the timeout (HTTP `504` — outcome unknown,
+re-read the event before assuming failure):
+```json
+{
+  "success": false,
+  "message": "Deletion outcome unknown: no response before timeout",
+  "error": "Outcome unknown: No response from proxy after 330s; ..."
 }
 ```
 

@@ -432,14 +432,18 @@ class TestProxyClientTimeouts:
         with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
             self._mock_http(mock_cls, "post", response=ok_response)
             await client.respond_to_event("primary", "e1", "accepted")
-        assert mock_cls.call_args.kwargs["timeout"] == CONFIRM_TIMEOUT
+        assert mock_cls.call_args.kwargs["timeout"] == httpx.Timeout(
+            CONFIRM_TIMEOUT, connect=READ_TIMEOUT
+        )
 
     async def test_read_call_uses_read_timeout(self, ok_response):
         client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
         with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
             self._mock_http(mock_cls, "get", response=ok_response)
             await client.get_event("primary", "e1")
-        assert mock_cls.call_args.kwargs["timeout"] == READ_TIMEOUT
+        assert mock_cls.call_args.kwargs["timeout"] == httpx.Timeout(
+            READ_TIMEOUT, connect=READ_TIMEOUT
+        )
 
     async def test_timeout_raises_proxy_timeout_error(self):
         """An httpx timeout surfaces as ProxyTimeoutError with unknown-outcome text."""
@@ -449,6 +453,30 @@ class TestProxyClientTimeouts:
             with pytest.raises(ProxyTimeoutError) as exc_info:
                 await client.delete_event("primary", "e1")
         assert "outcome is unknown" in str(exc_info.value)
+
+    async def test_connect_timeout_is_definitive_failure(self):
+        """A connect-phase timeout never reached the proxy: ProxyError, not
+        outcome-unknown ProxyTimeoutError."""
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
+            self._mock_http(mock_cls, "post", side_effect=httpx.ConnectTimeout("connect"))
+            with pytest.raises(ProxyError) as exc_info:
+                await client.create_event("primary", {"summary": "s"})
+        assert not isinstance(exc_info.value, ProxyTimeoutError)
+        assert "Could not connect" in str(exc_info.value)
+
+    async def test_connection_error_is_proxy_error(self):
+        """A down/unreachable proxy surfaces as ProxyError (502), not a raw
+        httpx exception (500)."""
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
+            self._mock_http(
+                mock_cls, "get", side_effect=httpx.ConnectError("All connection attempts failed")
+            )
+            with pytest.raises(ProxyError) as exc_info:
+                await client.get_event("primary", "e1")
+        assert not isinstance(exc_info.value, ProxyTimeoutError)
+        assert "Proxy connection failed" in str(exc_info.value)
 
 
 # ============================================================================

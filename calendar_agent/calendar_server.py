@@ -962,7 +962,12 @@ async def bulk_actions(request: BulkActionsRequest):
     Supports update, patch, and delete operations. Operations are executed
     sequentially, and the response includes results for each operation.
 
-    Note: Delete operations may require confirmation from the proxy.
+    Every mutation blocks while a human operator approves it, so a bulk
+    request can legitimately take several minutes (up to ~330s per gated
+    operation). A per-item error starting with "Operation blocked:" means the
+    operator rejected that operation (never "confirmation pending"); one
+    starting with "Outcome unknown:" means it timed out and must be verified
+    by re-reading the event before assuming failure.
     """
     try:
         client = get_calendar_client()
