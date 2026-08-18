@@ -69,10 +69,19 @@ uv run pytest --cov=calendar_agent  # With coverage
 ### Error Handling
 
 - Use `ProxyAuthError` for 401 responses
-- Use `ProxyForbiddenError` for 403 responses (including confirmations)
+- Use `ProxyForbiddenError` for 403 responses (policy blocks and operator
+  rejections — the proxy blocks mutations in-line for human approval, so a
+  403 means rejected, never "confirmation pending")
+- Use `ProxyTimeoutError` when the proxy doesn't answer before the client
+  timeout (outcome unknown — the mutation may still complete if approved)
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
-- Always return `{"success": false, "error": "..."}` pattern
+- Always return the `{"success": false, "error": "..."}` envelope via
+  `error_response(...)` so the HTTP status agrees with the body (issue #4):
+  403 forbidden/rejected, 504 timeout/outcome unknown, 502 upstream
+  proxy/LLM failure, 500 unexpected — never 200 for a failure
+- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default 330s,
+  must exceed the proxy's 300s confirmation window); reads use `READ_TIMEOUT`
 
 ## Testing Guidelines
 

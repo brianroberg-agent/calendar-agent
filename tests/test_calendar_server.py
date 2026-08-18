@@ -6,8 +6,13 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from calendar_agent.exceptions import ProxyAuthError, ProxyError, ProxyForbiddenError
-from calendar_agent.proxy_client import CalendarProxyClient
+from calendar_agent.exceptions import (
+    ProxyAuthError,
+    ProxyError,
+    ProxyForbiddenError,
+    ProxyTimeoutError,
+)
+from calendar_agent.proxy_client import CONFIRM_TIMEOUT, READ_TIMEOUT, CalendarProxyClient
 
 # ============================================================================
 # Health Endpoint Tests
@@ -269,15 +274,28 @@ class TestEventDeleteEndpoint:
         assert data["success"] is True
         assert "deleted" in data["message"].lower()
 
-    def test_delete_event_requires_confirmation(self, client, mock_proxy_client):
-        """Delete event handles confirmation requirement."""
+    def test_delete_event_rejected_by_operator(self, client, mock_proxy_client):
+        """An operator rejection surfaces as 403 with the rejection message."""
         mock_proxy_client.delete_event.side_effect = ProxyForbiddenError(
-            "Confirmation required: Please confirm deletion"
+            "Request rejected by operator"
         )
         response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 403
         data = response.json()
         assert data["success"] is False
-        assert "confirmation" in data["message"].lower()
+        assert "rejected" in data["message"].lower()
+        assert "rejected by operator" in data["error"]
+
+    def test_delete_event_timeout_outcome_unknown(self, client, mock_proxy_client):
+        """A timed-out delete surfaces as 504 with outcome-unknown messaging."""
+        mock_proxy_client.delete_event.side_effect = ProxyTimeoutError(
+            "No response from proxy after 330s"
+        )
+        response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 504
+        data = response.json()
+        assert data["success"] is False
+        assert "unknown" in data["message"].lower()
 
 
 class TestEventRespondEndpoint:
@@ -312,9 +330,24 @@ class TestEventRespondEndpoint:
             "/calendars/primary/events/e1/respond",
             json={"response_status": "accepted"},
         )
+        assert resp.status_code == 403
         data = resp.json()
         assert data["success"] is False
         assert data["error"]
+
+    def test_respond_timeout_returns_504(self, client, mock_proxy_client):
+        """A timed-out RSVP surfaces as 504 with outcome-unknown error text."""
+        mock_proxy_client.respond_to_event.side_effect = ProxyTimeoutError(
+            "No response from proxy after 330s"
+        )
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 504
+        data = resp.json()
+        assert data["success"] is False
+        assert "Outcome unknown" in data["error"]
 
 
 # ============================================================================
@@ -368,6 +401,54 @@ class TestProxyClientRespond:
             "http://proxy/calendar/v3/calendars/"
             "en.usa%23holiday@group.v.calendar.google.com/events/e1/respond"
         )
+
+
+class TestProxyClientTimeouts:
+    """Mutations must outlive the proxy's 300s confirmation window (issue #4)."""
+
+    def _mock_http(self, mock_cls, method: str, response=None, side_effect=None):
+        mock_http = AsyncMock()
+        if response is not None:
+            getattr(mock_http, method).return_value = response
+        if side_effect is not None:
+            getattr(mock_http, method).side_effect = side_effect
+        mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        return mock_http
+
+    @pytest.fixture
+    def ok_response(self):
+        r = AsyncMock(spec=httpx.Response)
+        r.status_code = 200
+        r.json.return_value = {"id": "e1"}
+        return r
+
+    def test_confirm_timeout_outlives_confirmation_window(self):
+        """The mutation timeout must exceed the proxy's 300s approval window."""
+        assert CONFIRM_TIMEOUT > 300
+
+    async def test_mutating_call_uses_confirm_timeout(self, ok_response):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
+            self._mock_http(mock_cls, "post", response=ok_response)
+            await client.respond_to_event("primary", "e1", "accepted")
+        assert mock_cls.call_args.kwargs["timeout"] == CONFIRM_TIMEOUT
+
+    async def test_read_call_uses_read_timeout(self, ok_response):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
+            self._mock_http(mock_cls, "get", response=ok_response)
+            await client.get_event("primary", "e1")
+        assert mock_cls.call_args.kwargs["timeout"] == READ_TIMEOUT
+
+    async def test_timeout_raises_proxy_timeout_error(self):
+        """An httpx timeout surfaces as ProxyTimeoutError with unknown-outcome text."""
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
+            self._mock_http(mock_cls, "delete", side_effect=httpx.ReadTimeout("timed out"))
+            with pytest.raises(ProxyTimeoutError) as exc_info:
+                await client.delete_event("primary", "e1")
+        assert "outcome is unknown" in str(exc_info.value)
 
 
 # ============================================================================
@@ -749,6 +830,7 @@ class TestProxyErrorHandling:
         """Authentication errors are properly formatted."""
         mock_proxy_client.list_calendars.side_effect = ProxyAuthError("Invalid API key")
         response = client.get("/calendars")
+        assert response.status_code == 502
         data = response.json()
         assert data["success"] is False
         assert "Authentication error" in data["error"]
@@ -756,17 +838,19 @@ class TestProxyErrorHandling:
     def test_forbidden_error_handling(self, client, mock_proxy_client):
         """Forbidden errors are properly formatted."""
         mock_proxy_client.delete_event.side_effect = ProxyForbiddenError(
-            "Confirmation required"
+            "Request rejected by operator"
         )
         response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 403
         data = response.json()
         assert data["success"] is False
-        assert "blocked" in data["error"].lower() or "confirmation" in data["message"].lower()
+        assert "blocked" in data["error"].lower()
 
     def test_generic_proxy_error_handling(self, client, mock_proxy_client):
         """Generic proxy errors are properly formatted."""
         mock_proxy_client.list_events.side_effect = ProxyError("Connection timeout")
         response = client.get("/calendars/primary/events")
+        assert response.status_code == 502
         data = response.json()
         assert data["success"] is False
         assert "Proxy error" in data["error"]

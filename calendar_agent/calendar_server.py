@@ -21,11 +21,18 @@ from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .calendar_utils import find_free_slots, get_time_range_rfc3339
-from .exceptions import ProxyAuthError, ProxyError, ProxyForbiddenError
+from .exceptions import (
+    LLMError,
+    ProxyAuthError,
+    ProxyError,
+    ProxyForbiddenError,
+    ProxyTimeoutError,
+)
 from .llm_service import get_llm_service
 from .proxy_client import get_calendar_client
 
@@ -316,9 +323,33 @@ def format_proxy_error(e: Exception) -> str:
         return f"Authentication error: {e}"
     if isinstance(e, ProxyForbiddenError):
         return f"Operation blocked: {e}"
+    if isinstance(e, ProxyTimeoutError):
+        return f"Outcome unknown: {e}"
     if isinstance(e, ProxyError):
         return f"Proxy error: {e}"
     return str(e)
+
+
+def error_status_code(e: Exception) -> int:
+    """Map an error to the HTTP status this server should return.
+
+    The success/error envelope stays in the body; the status code must agree
+    with it (issue #4): 403 passes through an operator rejection or policy
+    block, 504 marks a timed-out call whose outcome is unknown, 502 covers
+    upstream proxy/LLM failures, 500 anything unexpected.
+    """
+    if isinstance(e, ProxyForbiddenError):
+        return 403
+    if isinstance(e, ProxyTimeoutError):
+        return 504
+    if isinstance(e, ProxyAuthError | ProxyError | LLMError):
+        return 502
+    return 500
+
+
+def error_response(body: BaseModel, e: Exception) -> JSONResponse:
+    """Return an error envelope with a status code that agrees with it."""
+    return JSONResponse(status_code=error_status_code(e), content=body.model_dump())
 
 
 def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
@@ -388,7 +419,9 @@ async def list_calendars(
 
         return CalendarsResponse(success=True, calendars=calendars)
     except Exception as e:
-        return CalendarsResponse(success=False, calendars=[], error=format_proxy_error(e))
+        return error_response(
+            CalendarsResponse(success=False, calendars=[], error=format_proxy_error(e)), e
+        )
 
 
 @app.get("/calendars/{calendar_id}", response_model=CalendarDetailResponse, tags=["calendars"])
@@ -399,7 +432,9 @@ async def get_calendar(calendar_id: str):
         calendar = await client.get_calendar(calendar_id)
         return CalendarDetailResponse(success=True, calendar=calendar)
     except Exception as e:
-        return CalendarDetailResponse(success=False, calendar=None, error=format_proxy_error(e))
+        return error_response(
+            CalendarDetailResponse(success=False, calendar=None, error=format_proxy_error(e)), e
+        )
 
 
 # ============================================================================
@@ -450,7 +485,9 @@ async def list_events(
             next_page_token=result.get("nextPageToken"),
         )
     except Exception as e:
-        return EventsListResponse(success=False, events=[], error=format_proxy_error(e))
+        return error_response(
+            EventsListResponse(success=False, events=[], error=format_proxy_error(e)), e
+        )
 
 
 @app.post(
@@ -476,7 +513,9 @@ async def create_event(
         )
         return EventDetailResponse(success=True, event=result)
     except Exception as e:
-        return EventDetailResponse(success=False, event=None, error=format_proxy_error(e))
+        return error_response(
+            EventDetailResponse(success=False, event=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.get(
@@ -499,7 +538,9 @@ async def get_event(
         )
         return EventDetailResponse(success=True, event=event)
     except Exception as e:
-        return EventDetailResponse(success=False, event=None, error=format_proxy_error(e))
+        return error_response(
+            EventDetailResponse(success=False, event=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.put(
@@ -526,7 +567,9 @@ async def update_event(
         )
         return EventDetailResponse(success=True, event=result)
     except Exception as e:
-        return EventDetailResponse(success=False, event=None, error=format_proxy_error(e))
+        return error_response(
+            EventDetailResponse(success=False, event=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.patch(
@@ -553,7 +596,9 @@ async def patch_event(
         )
         return EventDetailResponse(success=True, event=result)
     except Exception as e:
-        return EventDetailResponse(success=False, event=None, error=format_proxy_error(e))
+        return error_response(
+            EventDetailResponse(success=False, event=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.delete(
@@ -568,9 +613,11 @@ async def delete_event(
 ):
     """Delete an event.
 
-    Note: The proxy may require confirmation for delete operations.
-    If confirmation is required, this endpoint will return an error with
-    details on how to confirm the deletion.
+    The proxy requires operator confirmation for deletes: the request blocks
+    while a human approves it. A 403 here means the operator rejected the
+    deletion (or never answered); a 504 means this server got no response
+    before its timeout and the outcome is unknown — verify by re-reading the
+    event before assuming failure.
     """
     try:
         client = get_calendar_client()
@@ -581,17 +628,31 @@ async def delete_event(
         )
         return ActionResponse(success=True, message="Event deleted successfully")
     except ProxyForbiddenError as e:
-        # Pass through confirmation requirements
-        return ActionResponse(
-            success=False,
-            message="Deletion requires confirmation",
-            error=str(e),
+        return error_response(
+            ActionResponse(
+                success=False,
+                message="Deletion blocked or rejected by operator",
+                error=format_proxy_error(e),
+            ),
+            e,
+        )
+    except ProxyTimeoutError as e:
+        return error_response(
+            ActionResponse(
+                success=False,
+                message="Deletion outcome unknown: no response before timeout",
+                error=format_proxy_error(e),
+            ),
+            e,
         )
     except Exception as e:
-        return ActionResponse(
-            success=False,
-            message="Failed to delete event",
-            error=format_proxy_error(e),
+        return error_response(
+            ActionResponse(
+                success=False,
+                message="Failed to delete event",
+                error=format_proxy_error(e),
+            ),
+            e,
         )
 
 
@@ -610,6 +671,11 @@ async def respond_to_event(
     Forwards to the proxy's dedicated /respond route, which changes only the
     self attendee's status and sends no invitations or notifications. Valid
     values for response_status are 'accepted', 'declined', or 'tentative'.
+
+    Like other mutations, the proxy blocks while a human operator approves
+    the RSVP: 403 means it was rejected (or the operator never answered);
+    504 means no response before this server's timeout and the outcome is
+    unknown — verify by re-reading the event.
     """
     try:
         client = get_calendar_client()
@@ -620,8 +686,8 @@ async def respond_to_event(
         )
         return EventDetailResponse(success=True, event=result)
     except Exception as e:
-        return EventDetailResponse(
-            success=False, event=None, error=format_proxy_error(e)
+        return error_response(
+            EventDetailResponse(success=False, event=None, error=format_proxy_error(e)), e
         )
 
 
@@ -649,7 +715,9 @@ async def summarize_event(request: SummarizeRequest):
 
         return LLMResponse(success=True, data=result)
     except Exception as e:
-        return LLMResponse(success=False, data=None, error=format_proxy_error(e))
+        return error_response(
+            LLMResponse(success=False, data=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.post("/ask-about", response_model=LLMResponse, tags=["llm"])
@@ -670,7 +738,9 @@ async def ask_about_event(request: AskAboutRequest):
 
         return LLMResponse(success=True, data=result)
     except Exception as e:
-        return LLMResponse(success=False, data=None, error=format_proxy_error(e))
+        return error_response(
+            LLMResponse(success=False, data=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.post("/batch-summarize", response_model=LLMResponse, tags=["llm"])
@@ -700,7 +770,9 @@ async def batch_summarize_events(request: BatchSummarizeRequest):
 
         return LLMResponse(success=True, data=result)
     except Exception as e:
-        return LLMResponse(success=False, data=None, error=format_proxy_error(e))
+        return error_response(
+            LLMResponse(success=False, data=None, error=format_proxy_error(e)), e
+        )
 
 
 # ============================================================================
@@ -755,7 +827,9 @@ async def find_free_time(request: FindFreeTimeRequest):
 
         return LLMResponse(success=True, data=suggestions)
     except Exception as e:
-        return LLMResponse(success=False, data=None, error=format_proxy_error(e))
+        return error_response(
+            LLMResponse(success=False, data=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.post("/analyze-schedule", response_model=LLMResponse, tags=["llm"])
@@ -790,7 +864,9 @@ async def analyze_schedule(request: AnalyzeScheduleRequest):
 
         return LLMResponse(success=True, data=analysis)
     except Exception as e:
-        return LLMResponse(success=False, data=None, error=format_proxy_error(e))
+        return error_response(
+            LLMResponse(success=False, data=None, error=format_proxy_error(e)), e
+        )
 
 
 @app.post("/prepare-briefing", response_model=LLMResponse, tags=["llm"])
@@ -836,7 +912,9 @@ async def prepare_briefing(request: PrepareBriefingRequest):
 
         return LLMResponse(success=True, data=briefing)
     except Exception as e:
-        return LLMResponse(success=False, data=None, error=format_proxy_error(e))
+        return error_response(
+            LLMResponse(success=False, data=None, error=format_proxy_error(e)), e
+        )
 
 
 # ============================================================================
@@ -872,7 +950,9 @@ async def search_events(request: SearchRequest):
             next_page_token=result.get("nextPageToken"),
         )
     except Exception as e:
-        return EventsListResponse(success=False, events=[], error=format_proxy_error(e))
+        return error_response(
+            EventsListResponse(success=False, events=[], error=format_proxy_error(e)), e
+        )
 
 
 @app.post("/bulk-actions", response_model=BulkActionsResponse, tags=["operations"])
@@ -969,12 +1049,15 @@ async def bulk_actions(request: BulkActionsRequest):
             error_count=error_count,
         )
     except Exception as e:
-        return BulkActionsResponse(
-            success=False,
-            results=[],
-            success_count=0,
-            error_count=0,
-            error=format_proxy_error(e),
+        return error_response(
+            BulkActionsResponse(
+                success=False,
+                results=[],
+                success_count=0,
+                error_count=0,
+                error=format_proxy_error(e),
+            ),
+            e,
         )
 
 

@@ -14,7 +14,19 @@ class ProxyAuthError(ProxyError):
 
 
 class ProxyForbiddenError(ProxyError):
-    """Raised when an operation is forbidden or requires confirmation (403)."""
+    """Raised when the proxy returns 403: an operation blocked by policy or
+    rejected by the operator (the proxy blocks in-line while a human approves
+    mutations; 403 means rejection or operator timeout, never "pending")."""
+
+    pass
+
+
+class ProxyTimeoutError(ProxyError):
+    """Raised when the proxy doesn't respond before the client-side timeout.
+
+    The operation's outcome is unknown: a confirmation-gated mutation may
+    still execute if the operator approves after this client gave up. Callers
+    must verify by re-reading the resource, not assume failure."""
 
     pass
 

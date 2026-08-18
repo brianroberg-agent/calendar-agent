@@ -57,6 +57,7 @@ Required environment variables:
 | `LLM_URL` | URL of the local LLM server | `http://localhost:8080/v1/chat/completions` |
 | `LLM_MODEL` | Model name for LLM requests | `qwen/qwen3-14b` |
 | `CALENDAR_AGENT_PORT` | Port for the calendar agent server | `8082` |
+| `PROXY_CONFIRM_TIMEOUT` | Client timeout (seconds) for mutations, which block in the proxy while a human operator approves them; must exceed the proxy's 300s confirmation window | `330` |
 
 ### Running the Server
 
@@ -71,6 +72,21 @@ uv run uvicorn calendar_agent.calendar_server:app --host 0.0.0.0 --port 8082
 The server will be available at `http://localhost:8082`. API documentation is at `http://localhost:8082/docs`.
 
 ## API Endpoints
+
+### Error Responses
+
+Every endpoint returns a body with a `success` field, and on failure an
+`error` message; the HTTP status code always agrees with the body
+([issue #4](https://github.com/brianroberg/calendar-agent/issues/4)):
+
+| Status | Meaning |
+|--------|---------|
+| `200` | The operation succeeded (`success: true`) |
+| `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
+| `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) |
+| `502` | The proxy or LLM backend failed |
+| `504` | No response before this server's timeout — **the outcome is unknown**: a confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
+| `500` | Unexpected internal error |
 
 ### GET /health
 
@@ -289,7 +305,11 @@ Response:
 
 ### DELETE /calendars/{calendar_id}/events/{event_id}
 
-Delete an event. Note: The proxy may require confirmation for delete operations.
+Delete an event. The proxy requires operator confirmation for deletes: the
+request blocks while a human approves it, then returns `200` on approval,
+`403` if the operator rejects (or never answers), or `504` if this server
+times out first — in which case the outcome is unknown and the event should
+be re-read before assuming failure.
 
 ```bash
 curl -X DELETE http://localhost:8082/calendars/primary/events/event123
