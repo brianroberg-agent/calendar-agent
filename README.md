@@ -669,6 +669,23 @@ uv run ruff check --fix .
 uv run ruff format .
 ```
 
+### Refreshing the API Proxy Spec Snapshot
+
+`docs/api-proxy-openapi-doc.json` is a snapshot of the
+[api-proxy](https://github.com/brianroberg/api-proxy) OpenAPI spec, stamped
+with the commit and time it was generated from (`x-generated-from`). It records
+the proxy contract this agent was built against; `tests/test_proxy_contract.py`
+fails if `proxy_client.py` calls a route the snapshot doesn't contain, so
+refresh it whenever the proxy contract changes:
+
+```bash
+# From a local api-proxy checkout
+uv run python scripts/refresh_openapi.py --checkout ../api-proxy
+
+# From a running proxy instance
+uv run python scripts/refresh_openapi.py --url http://localhost:8000
+```
+
 ### Project Structure
 
 ```
@@ -683,9 +700,12 @@ calendar-agent/
 ├── tests/
 │   ├── conftest.py           # Test fixtures
 │   ├── test_calendar_server.py
+│   ├── test_proxy_contract.py    # Client routes vs. the api-proxy spec snapshot
 │   └── test_readme_documentation.py
 ├── docs/
-│   └── api-proxy-openapi-doc.json
+│   └── api-proxy-openapi-doc.json    # Stamped snapshot of the api-proxy spec
+├── scripts/
+│   └── refresh_openapi.py    # Regenerates the api-proxy spec snapshot
 ├── pyproject.toml
 ├── README.md
 └── .env.example
