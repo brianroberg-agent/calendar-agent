@@ -55,13 +55,33 @@ uv run pytest --cov=calendar_agent  # With coverage
 - Always include security warnings about untrusted content
 - Use THINKING_PATTERN regex to strip Qwen3 thinking tags
 
+### Updating the api-proxy Contract Snapshot
+
+- `docs/api-proxy-openapi-doc.json` is a stamped snapshot of the api-proxy
+  OpenAPI spec (`x-generated-from` records source commit and time) — the
+  authoritative spec is generated at runtime by the api-proxy FastAPI app
+- `tests/test_proxy_contract.py` fails if `proxy_client.py` calls a route the
+  snapshot doesn't contain; refresh the snapshot in the same change that adds
+  the client method
+- Refresh with `uv run python scripts/refresh_openapi.py --checkout <path>`
+  (local api-proxy checkout) or `--url <proxy-url>` (running instance)
+
 ### Error Handling
 
 - Use `ProxyAuthError` for 401 responses
-- Use `ProxyForbiddenError` for 403 responses (including confirmations)
+- Use `ProxyForbiddenError` for 403 responses (policy blocks and operator
+  rejections — the proxy blocks mutations in-line for human approval, so a
+  403 means rejected, never "confirmation pending")
+- Use `ProxyTimeoutError` when the proxy doesn't answer before the client
+  timeout (outcome unknown — the mutation may still complete if approved)
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
-- Always return `{"success": false, "error": "..."}` pattern
+- Always return the `{"success": false, "error": "..."}` envelope via
+  `error_response(...)` so the HTTP status agrees with the body (issue #4):
+  403 forbidden/rejected, 504 timeout/outcome unknown, 502 upstream
+  proxy/LLM failure, 500 unexpected — never 200 for a failure
+- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default 330s,
+  must exceed the proxy's 300s confirmation window); reads use `READ_TIMEOUT`
 
 ## Testing Guidelines
 

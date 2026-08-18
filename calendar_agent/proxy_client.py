@@ -2,16 +2,24 @@
 
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
 
-from .exceptions import ProxyAuthError, ProxyError, ProxyForbiddenError
+from .exceptions import ProxyAuthError, ProxyError, ProxyForbiddenError, ProxyTimeoutError
 
 load_dotenv()
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8000")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
+
+# Read operations answer immediately; mutations block in the proxy while a
+# human operator approves them (a 300s window server-side). The mutation
+# timeout must outlive that window, or the approval/rejection outcome is
+# undeliverable and the operation completes unobserved (see issue #4).
+READ_TIMEOUT = 30.0
+CONFIRM_TIMEOUT = float(os.environ.get("PROXY_CONFIRM_TIMEOUT", "330"))
 
 
 class CalendarProxyClient:
@@ -48,7 +56,7 @@ class CalendarProxyClient:
 
         if response.status_code == 403:
             message = self._parse_error_message(
-                response, "Operation forbidden or requires confirmation"
+                response, "Operation forbidden or rejected by operator"
             )
             raise ProxyForbiddenError(message)
 
@@ -61,6 +69,45 @@ class CalendarProxyClient:
             raise ProxyError(f"Proxy error ({response.status_code}): {message}")
 
         return response.json()
+
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout: float = READ_TIMEOUT,
+    ) -> httpx.Response:
+        """Send one request to the proxy, mapping timeouts to ProxyTimeoutError."""
+        kwargs: dict[str, Any] = {"headers": self._get_headers()}
+        if params is not None:
+            kwargs["params"] = params
+        if json_body is not None:
+            kwargs["json"] = json_body
+        try:
+            # The long CONFIRM_TIMEOUT budget is for the proxy's human-approval
+            # window, which only starts once a request reaches it; connecting
+            # gets the ordinary budget so an unreachable proxy fails fast.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=READ_TIMEOUT)
+            ) as client:
+                return await getattr(client, method)(url, **kwargs)
+        except httpx.ConnectTimeout as e:
+            # The request never reached the proxy: definitive failure, not an
+            # unknown outcome.
+            raise ProxyError(
+                f"Could not connect to proxy within {READ_TIMEOUT:.0f}s"
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ProxyTimeoutError(
+                f"No response from proxy after {timeout:.0f}s; the operation's "
+                "outcome is unknown — a confirmation-gated mutation may still "
+                "complete if approved later. Verify by re-reading the resource "
+                "before retrying."
+            ) from e
+        except httpx.HTTPError as e:
+            raise ProxyError(f"Proxy connection failed: {e}") from e
 
     # ========== Calendar Operations ==========
 
@@ -84,19 +131,15 @@ class CalendarProxyClient:
         if show_hidden is not None:
             params["showHidden"] = show_hidden
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                url, headers=self._get_headers(), params=params or None
-            )
-            return self._handle_response(response)
+        response = await self._send("get", url, params=params or None)
+        return self._handle_response(response)
 
     async def get_calendar(self, calendar_id: str) -> dict[str, Any]:
         """Get metadata for a specific calendar."""
         url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=self._get_headers())
-            return self._handle_response(response)
+        response = await self._send("get", url)
+        return self._handle_response(response)
 
     # ========== Event Operations ==========
 
@@ -137,11 +180,8 @@ class CalendarProxyClient:
         if sync_token is not None:
             params["syncToken"] = sync_token
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                url, headers=self._get_headers(), params=params
-            )
-            return self._handle_response(response)
+        response = await self._send("get", url, params=params)
+        return self._handle_response(response)
 
     async def get_event(
         self,
@@ -156,11 +196,8 @@ class CalendarProxyClient:
         if time_zone is not None:
             params["timeZone"] = time_zone
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                url, headers=self._get_headers(), params=params or None
-            )
-            return self._handle_response(response)
+        response = await self._send("get", url, params=params or None)
+        return self._handle_response(response)
 
     async def create_event(
         self,
@@ -178,14 +215,34 @@ class CalendarProxyClient:
         if conference_data_version is not None:
             params["conferenceDataVersion"] = conference_data_version
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                headers=self._get_headers(),
-                params=params or None,
-                json=event_data,
-            )
-            return self._handle_response(response)
+        response = await self._send(
+            "post", url, params=params or None, json_body=event_data,
+            timeout=CONFIRM_TIMEOUT,
+        )
+        return self._handle_response(response)
+
+    async def respond_to_event(
+        self,
+        calendar_id: str,
+        event_id: str,
+        response_status: str,
+    ) -> dict[str, Any]:
+        """RSVP to an event by setting the owner's own responseStatus.
+
+        Forwards to the proxy's dedicated ``/respond`` route, which changes only
+        the self attendee's status and sends no notifications.
+        """
+        # Calendar IDs may contain characters like '#' (e.g. Google holiday
+        # calendars) that would otherwise truncate the URL as a fragment.
+        url = (
+            f"{self.proxy_url}/calendar/v3/calendars/{quote(calendar_id, safe='@')}"
+            f"/events/{quote(event_id, safe='')}/respond"
+        )
+        response = await self._send(
+            "post", url, json_body={"responseStatus": response_status},
+            timeout=CONFIRM_TIMEOUT,
+        )
+        return self._handle_response(response)
 
     async def update_event(
         self,
@@ -204,14 +261,11 @@ class CalendarProxyClient:
         if conference_data_version is not None:
             params["conferenceDataVersion"] = conference_data_version
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.put(
-                url,
-                headers=self._get_headers(),
-                params=params or None,
-                json=event_data,
-            )
-            return self._handle_response(response)
+        response = await self._send(
+            "put", url, params=params or None, json_body=event_data,
+            timeout=CONFIRM_TIMEOUT,
+        )
+        return self._handle_response(response)
 
     async def patch_event(
         self,
@@ -230,14 +284,11 @@ class CalendarProxyClient:
         if conference_data_version is not None:
             params["conferenceDataVersion"] = conference_data_version
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.patch(
-                url,
-                headers=self._get_headers(),
-                params=params or None,
-                json=event_data,
-            )
-            return self._handle_response(response)
+        response = await self._send(
+            "patch", url, params=params or None, json_body=event_data,
+            timeout=CONFIRM_TIMEOUT,
+        )
+        return self._handle_response(response)
 
     async def delete_event(
         self,
@@ -252,14 +303,13 @@ class CalendarProxyClient:
         if send_updates is not None:
             params["sendUpdates"] = send_updates
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.delete(
-                url, headers=self._get_headers(), params=params or None
-            )
-            # DELETE may return empty response on success
-            if response.status_code == 204:
-                return {"success": True}
-            return self._handle_response(response)
+        response = await self._send(
+            "delete", url, params=params or None, timeout=CONFIRM_TIMEOUT
+        )
+        # DELETE may return empty response on success
+        if response.status_code == 204:
+            return {"success": True}
+        return self._handle_response(response)
 
 
 # Singleton pattern for easy access

@@ -57,6 +57,7 @@ Required environment variables:
 | `LLM_URL` | URL of the local LLM server | `http://localhost:8080/v1/chat/completions` |
 | `LLM_MODEL` | Model name for LLM requests | `qwen/qwen3-14b` |
 | `CALENDAR_AGENT_PORT` | Port for the calendar agent server | `8082` |
+| `PROXY_CONFIRM_TIMEOUT` | Client timeout (seconds) for mutations, which block in the proxy while a human operator approves them; must exceed the proxy's 300s confirmation window | `330` |
 
 ### Running the Server
 
@@ -71,6 +72,21 @@ uv run uvicorn calendar_agent.calendar_server:app --host 0.0.0.0 --port 8082
 The server will be available at `http://localhost:8082`. API documentation is at `http://localhost:8082/docs`.
 
 ## API Endpoints
+
+### Error Responses
+
+Every endpoint returns a body with a `success` field, and on failure an
+`error` message; the HTTP status code always agrees with the body
+([issue #4](https://github.com/brianroberg/calendar-agent/issues/4)):
+
+| Status | Meaning |
+|--------|---------|
+| `200` | The operation succeeded (`success: true`) |
+| `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
+| `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) |
+| `502` | The proxy or LLM backend failed |
+| `504` | No response before this server's timeout — **the outcome is unknown**: a confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
+| `500` | Unexpected internal error |
 
 ### GET /health
 
@@ -289,7 +305,11 @@ Response:
 
 ### DELETE /calendars/{calendar_id}/events/{event_id}
 
-Delete an event. Note: The proxy may require confirmation for delete operations.
+Delete an event. The proxy requires operator confirmation for deletes: the
+request blocks while a human approves it, then returns `200` on approval,
+`403` if the operator rejects (or never answers), or `504` if this server
+times out first — in which case the outcome is unknown and the event should
+be re-read before assuming failure.
 
 ```bash
 curl -X DELETE http://localhost:8082/calendars/primary/events/event123
@@ -304,12 +324,51 @@ Response:
 }
 ```
 
-If confirmation is required:
+If the operator rejects the deletion (HTTP `403`):
 ```json
 {
   "success": false,
-  "message": "Deletion requires confirmation",
-  "error": "Operation blocked: Please confirm deletion of event 'Team Meeting'"
+  "message": "Deletion blocked or rejected by operator",
+  "error": "Operation blocked: Request rejected by operator"
+}
+```
+
+If no response arrives before the timeout (HTTP `504` — outcome unknown,
+re-read the event before assuming failure):
+```json
+{
+  "success": false,
+  "message": "Deletion outcome unknown: no response before timeout",
+  "error": "Outcome unknown: No response from proxy after 330s; ..."
+}
+```
+
+### POST /calendars/{calendar_id}/events/{event_id}/respond
+
+RSVP to an event by setting **only your own** response status. Forwards to the
+proxy's dedicated respond route, which changes only the `self` attendee's status
+and sends no invitations or notifications.
+
+Request body:
+- `response_status` (string): one of `accepted`, `declined`, `tentative`
+
+```bash
+curl -X POST http://localhost:8082/calendars/primary/events/event123/respond \
+  -H "Content-Type: application/json" \
+  -d '{"response_status": "accepted"}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "event": {
+    "id": "event123",
+    "attendees": [
+      {"email": "you@example.com", "responseStatus": "accepted", "self": true}
+    ]
+  },
+  "error": null
 }
 ```
 
@@ -640,6 +699,23 @@ uv run ruff check --fix .
 uv run ruff format .
 ```
 
+### Refreshing the API Proxy Spec Snapshot
+
+`docs/api-proxy-openapi-doc.json` is a snapshot of the
+[api-proxy](https://github.com/brianroberg/api-proxy) OpenAPI spec, stamped
+with the commit and time it was generated from (`x-generated-from`). It records
+the proxy contract this agent was built against; `tests/test_proxy_contract.py`
+fails if `proxy_client.py` calls a route the snapshot doesn't contain, so
+refresh it whenever the proxy contract changes:
+
+```bash
+# From a local api-proxy checkout
+uv run python scripts/refresh_openapi.py --checkout ../api-proxy
+
+# From a running proxy instance
+uv run python scripts/refresh_openapi.py --url http://localhost:8000
+```
+
 ### Project Structure
 
 ```
@@ -654,9 +730,12 @@ calendar-agent/
 ├── tests/
 │   ├── conftest.py           # Test fixtures
 │   ├── test_calendar_server.py
+│   ├── test_proxy_contract.py    # Client routes vs. the api-proxy spec snapshot
 │   └── test_readme_documentation.py
 ├── docs/
-│   └── api-proxy-openapi-doc.json
+│   └── api-proxy-openapi-doc.json    # Stamped snapshot of the api-proxy spec
+├── scripts/
+│   └── refresh_openapi.py    # Regenerates the api-proxy spec snapshot
 ├── pyproject.toml
 ├── README.md
 └── .env.example
