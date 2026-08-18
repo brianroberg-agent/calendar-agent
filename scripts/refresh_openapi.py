@@ -127,7 +127,12 @@ def main() -> None:
             "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
 
-    SNAPSHOT_PATH.write_text(json.dumps(with_provenance(spec, provenance), indent=2) + "\n")
+    # ensure_ascii=False pins one canonical encoding (literal UTF-8) so
+    # refreshes from either mode never produce spurious \uXXXX diffs.
+    SNAPSHOT_PATH.write_text(
+        json.dumps(with_provenance(spec, provenance), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     print(f"Wrote {SNAPSHOT_PATH} ({len(spec.get('paths', {}))} paths)")
 
 
