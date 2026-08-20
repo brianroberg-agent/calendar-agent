@@ -8,11 +8,19 @@ import pytest
 
 from calendar_agent.exceptions import (
     ProxyAuthError,
+    ProxyConfigError,
     ProxyError,
     ProxyForbiddenError,
+    ProxyNotFoundError,
     ProxyTimeoutError,
 )
-from calendar_agent.proxy_client import CONFIRM_TIMEOUT, READ_TIMEOUT, CalendarProxyClient
+from calendar_agent.proxy_client import (
+    CONFIRM_TIMEOUT,
+    PROXY_CONFIRMATION_WINDOW,
+    READ_TIMEOUT,
+    CalendarProxyClient,
+    resolve_confirm_timeout,
+)
 
 # ============================================================================
 # Health Endpoint Tests
@@ -829,7 +837,7 @@ class TestBulkActionsEndpoint:
         }
         response = client.post("/bulk-actions", json=request_data)
         data = response.json()
-        assert data["success"] is True  # Overall still success
+        assert data["success"] is False  # one operation did not happen
         assert data["success_count"] == 1
         assert data["error_count"] == 1
 
@@ -919,3 +927,130 @@ class TestRequestValidation:
         }
         response = client.post("/find-free-time", json=request_data)
         assert response.status_code == 422
+
+
+class TestConfirmTimeoutResolution:
+    """The confirm timeout is env-overridable; it must never silently drop
+    back below the proxy's approval window (issue #4, item 1)."""
+
+    def test_default_outlives_the_proxy_confirmation_window(self):
+        """With nothing configured, the mutation budget clears the window."""
+        assert resolve_confirm_timeout(None) > PROXY_CONFIRMATION_WINDOW
+
+    def test_override_above_the_window_is_honoured(self):
+        assert resolve_confirm_timeout("400") == 400.0
+
+    def test_override_below_the_window_is_rejected(self):
+        """A 30s override is the original incident's configuration; accepting
+        it silently makes every approval outcome undeliverable again."""
+        with pytest.raises(ProxyConfigError) as exc_info:
+            resolve_confirm_timeout("30")
+        assert "PROXY_CONFIRM_TIMEOUT" in str(exc_info.value)
+        assert "300" in str(exc_info.value)
+
+    def test_non_numeric_override_is_rejected(self):
+        """A typo must fail loudly rather than fall back to a short default."""
+        with pytest.raises(ProxyConfigError):
+            resolve_confirm_timeout("5 minutes")
+
+
+class TestMissingEventStatus:
+    """A resource the proxy says is gone must surface as 404, not 502.
+
+    Item 3's verify-by-re-read (issue #4) is specified as "expect 404 or
+    status: cancelled"; collapsing 404 into the generic upstream-error bucket
+    leaves a caller unable to tell "deleted" from "proxy is broken"."""
+
+    async def test_proxy_404_raises_not_found(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        response = AsyncMock(spec=httpx.Response)
+        response.status_code = 404
+        response.json.return_value = {"detail": "Not Found"}
+        with pytest.raises(ProxyNotFoundError):
+            client._handle_response(response)
+
+    def test_get_deleted_event_returns_404(self, client, mock_proxy_client):
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Event not found")
+        response = client.get("/calendars/primary/events/gone_123")
+        assert response.status_code == 404
+        data = response.json()
+        assert data["success"] is False
+        assert data["event"] is None
+
+
+class TestBulkActionsOutcomeHonesty:
+    """/bulk-actions must not answer 200/success:true for work that failed or
+    whose outcome is unknown (issue #4, item 4)."""
+
+    def _delete_ops(self, *event_ids: str) -> dict:
+        return {
+            "operations": [
+                {"operation": "delete", "event_id": e, "calendar_id": "primary"}
+                for e in event_ids
+            ]
+        }
+
+    def test_all_operations_failing_is_not_reported_as_success(
+        self, client, mock_proxy_client
+    ):
+        mock_proxy_client.delete_event.side_effect = ProxyError("Event not found")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.status_code == 502
+        data = response.json()
+        assert data["success"] is False
+        assert data["error_count"] == 2
+
+    def test_partial_failure_is_not_reported_as_success(self, client, mock_proxy_client):
+        mock_proxy_client.delete_event.side_effect = [
+            {"success": True},
+            ProxyError("Event not found"),
+        ]
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.json()["success"] is False
+        assert response.status_code == 502
+
+    def test_timed_out_operation_is_unknown_not_failed(self, client, mock_proxy_client):
+        """A mutation that timed out may still be applied after later approval;
+        recording it as a plain failure is the incident's error inverted."""
+        mock_proxy_client.delete_event.side_effect = ProxyTimeoutError("no response")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1"))
+        assert response.status_code == 504
+        data = response.json()
+        assert data["success"] is False
+        assert data["unknown_count"] == 1
+        assert data["error_count"] == 0
+        assert data["results"][0]["outcome"] == "unknown"
+
+    def test_unknown_outcome_outranks_a_definite_failure(self, client, mock_proxy_client):
+        """504 (verify before acting) must win over 502, because the unknown
+        operation is the one that can still change the calendar."""
+        mock_proxy_client.delete_event.side_effect = [
+            ProxyError("Event not found"),
+            ProxyTimeoutError("no response"),
+        ]
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.status_code == 504
+
+    def test_rejected_operation_propagates_403(self, client, mock_proxy_client):
+        mock_proxy_client.delete_event.side_effect = ProxyForbiddenError("rejected")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1"))
+        assert response.status_code == 403
+
+    def test_all_succeeding_stays_200_and_true(self, client, mock_proxy_client):
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["unknown_count"] == 0
+        assert [r["outcome"] for r in data["results"]] == ["succeeded", "succeeded"]
+
+    def test_missing_update_payload_is_a_client_error(self, client, mock_proxy_client):
+        """Nothing was attempted upstream: that is the caller's mistake, 400."""
+        request_data = {
+            "operations": [
+                {"operation": "update", "event_id": "e1", "calendar_id": "primary"},
+            ]
+        }
+        response = client.post("/bulk-actions", json=request_data)
+        assert response.status_code == 400
+        assert response.json()["results"][0]["outcome"] == "failed"

@@ -72,16 +72,35 @@ uv run pytest --cov=calendar_agent  # With coverage
 - Use `ProxyForbiddenError` for 403 responses (policy blocks and operator
   rejections — the proxy blocks mutations in-line for human approval, so a
   403 means rejected, never "confirmation pending")
+- Use `ProxyNotFoundError` for 404 responses (the calendar or event does not
+  exist — the *expected* answer when verifying that a delete took effect, so
+  it must not be folded into the generic upstream-error bucket)
 - Use `ProxyTimeoutError` when the proxy doesn't answer before the client
   timeout (outcome unknown — the mutation may still complete if approved)
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
 - Always return the `{"success": false, "error": "..."}` envelope via
   `error_response(...)` so the HTTP status agrees with the body (issue #4):
-  403 forbidden/rejected, 504 timeout/outcome unknown, 502 upstream
-  proxy/LLM failure, 500 unexpected — never 200 for a failure
-- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default 330s,
-  must exceed the proxy's 300s confirmation window); reads use `READ_TIMEOUT`
+  400 caller error with nothing attempted, 403 forbidden/rejected, 404
+  absent, 504 timeout/outcome unknown, 502 upstream proxy/LLM failure, 500
+  unexpected — never 200 for a failure
+- Per-item results (`/bulk-actions`) carry an `outcome` of `succeeded` /
+  `failed` / `unknown`. Never collapse `unknown` into `failed`: a timed-out
+  mutation may still be applied when the operator approves it, and treating
+  that as failure is what produced the duplicate-event incident in issue #4.
+  An unknown outcome outranks a definite failure when picking the status code
+- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default 330s;
+  `resolve_confirm_timeout` refuses any value that does not outlive the
+  proxy's 300s confirmation window); reads use `READ_TIMEOUT`
+
+### Wrapper Scripts
+
+- `scripts/calendar-delete-event.sh` is the supported way to delete an event
+  from a script. It re-reads the event to decide, and exits `0` success /
+  `1` failure / `2` unknown. Exit `2` means do not act — never create a
+  replacement event until a deletion has been observed complete
+- It is covered end to end by `tests/test_delete_event_script.py`, which runs
+  the real script against a loopback stub of calendar-agent
 
 ## Testing Guidelines
 

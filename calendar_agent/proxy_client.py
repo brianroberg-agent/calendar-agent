@@ -7,7 +7,14 @@ from urllib.parse import quote
 import httpx
 from dotenv import load_dotenv
 
-from .exceptions import ProxyAuthError, ProxyError, ProxyForbiddenError, ProxyTimeoutError
+from .exceptions import (
+    ProxyAuthError,
+    ProxyConfigError,
+    ProxyError,
+    ProxyForbiddenError,
+    ProxyNotFoundError,
+    ProxyTimeoutError,
+)
 
 load_dotenv()
 
@@ -19,7 +26,39 @@ PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 # timeout must outlive that window, or the approval/rejection outcome is
 # undeliverable and the operation completes unobserved (see issue #4).
 READ_TIMEOUT = 30.0
-CONFIRM_TIMEOUT = float(os.environ.get("PROXY_CONFIRM_TIMEOUT", "330"))
+
+# api-proxy's own ``confirmation_timeout`` (src/api_proxy/config.py). Kept here
+# as a named constant so the mismatch that caused issue #4 is checkable rather
+# than folklore.
+PROXY_CONFIRMATION_WINDOW = 300.0
+DEFAULT_CONFIRM_TIMEOUT = 330.0
+
+
+def resolve_confirm_timeout(raw: str | None) -> float:
+    """Resolve the mutation timeout from its raw ``PROXY_CONFIRM_TIMEOUT`` value.
+
+    Refuses anything that does not outlive the proxy's approval window. A
+    shorter budget is not a tuning choice: it makes every approval and
+    rejection undeliverable, so mutations complete unobserved (issue #4).
+    """
+    if raw is None:
+        return DEFAULT_CONFIRM_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError as e:
+        raise ProxyConfigError(
+            f"PROXY_CONFIRM_TIMEOUT must be a number of seconds, got {raw!r}"
+        ) from e
+    if timeout <= PROXY_CONFIRMATION_WINDOW:
+        raise ProxyConfigError(
+            f"PROXY_CONFIRM_TIMEOUT is {timeout:.0f}s, which does not outlive the "
+            f"proxy's {PROXY_CONFIRMATION_WINDOW:.0f}s operator-approval window; "
+            "mutations would time out client-side and complete unobserved"
+        )
+    return timeout
+
+
+CONFIRM_TIMEOUT = resolve_confirm_timeout(os.environ.get("PROXY_CONFIRM_TIMEOUT"))
 
 
 class CalendarProxyClient:
@@ -59,6 +98,10 @@ class CalendarProxyClient:
                 response, "Operation forbidden or rejected by operator"
             )
             raise ProxyForbiddenError(message)
+
+        if response.status_code == 404:
+            message = self._parse_error_message(response, "Not found")
+            raise ProxyNotFoundError(message)
 
         if response.status_code >= 500:
             message = self._parse_error_message(response, "Proxy server error")

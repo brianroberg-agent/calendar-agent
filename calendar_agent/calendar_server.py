@@ -31,6 +31,7 @@ from .exceptions import (
     ProxyAuthError,
     ProxyError,
     ProxyForbiddenError,
+    ProxyNotFoundError,
     ProxyTimeoutError,
 )
 from .llm_service import get_llm_service
@@ -295,20 +296,40 @@ class LLMResponse(BaseModel):
     error: str | None = None
 
 
+class BulkOperationOutcome(str, Enum):
+    """What is actually known about one bulk operation.
+
+    ``UNKNOWN`` is a first-class outcome, not a flavour of failure: a mutation
+    that timed out may still be applied when the operator approves it later
+    (issue #4). Treating it as failed is what produced the duplicate-event
+    incident.
+    """
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 class BulkOperationResult(BaseModel):
     """Result of a single bulk operation."""
     event_id: str
     operation: str
     success: bool
+    outcome: BulkOperationOutcome = BulkOperationOutcome.FAILED
     error: str | None = None
 
 
 class BulkActionsResponse(BaseModel):
-    """Response for bulk operations."""
+    """Response for bulk operations.
+
+    ``success`` is true only when every operation is known to have happened;
+    ``unknown_count`` covers operations whose outcome must be verified by
+    re-reading the event before anything is done about them.
+    """
     success: bool
     results: list[BulkOperationResult]
     success_count: int
     error_count: int
+    unknown_count: int = 0
     error: str | None = None
 
 
@@ -317,12 +338,22 @@ class BulkActionsResponse(BaseModel):
 # ============================================================================
 
 
+class BulkInputError(Exception):
+    """A bulk operation rejected before anything was sent upstream.
+
+    Nothing was attempted, so the outcome is definitively "did not happen" and
+    the fault is the caller's.
+    """
+
+
 def format_proxy_error(e: Exception) -> str:
     """Format a proxy error for user-friendly display."""
     if isinstance(e, ProxyAuthError):
         return f"Authentication error: {e}"
     if isinstance(e, ProxyForbiddenError):
         return f"Operation blocked: {e}"
+    if isinstance(e, ProxyNotFoundError):
+        return f"Not found: {e}"
     if isinstance(e, ProxyTimeoutError):
         return f"Outcome unknown: {e}"
     if isinstance(e, ProxyError):
@@ -335,13 +366,18 @@ def error_status_code(e: Exception) -> int:
 
     The success/error envelope stays in the body; the status code must agree
     with it (issue #4): 403 passes through an operator rejection or policy
-    block, 504 marks a timed-out call whose outcome is unknown, 502 covers
-    upstream proxy/LLM failures, 500 anything unexpected.
+    block, 404 an absent calendar or event, 504 marks a timed-out call whose
+    outcome is unknown, 502 covers upstream proxy/LLM failures, 500 anything
+    unexpected.
     """
     if isinstance(e, ProxyForbiddenError):
         return 403
+    if isinstance(e, ProxyNotFoundError):
+        return 404
     if isinstance(e, ProxyTimeoutError):
         return 504
+    if isinstance(e, BulkInputError):
+        return 400
     if isinstance(e, ProxyAuthError | ProxyError | LLMError):
         return 502
     return 500
@@ -350,6 +386,20 @@ def error_status_code(e: Exception) -> int:
 def error_response(body: BaseModel, e: Exception) -> JSONResponse:
     """Return an error envelope with a status code that agrees with it."""
     return JSONResponse(status_code=error_status_code(e), content=body.model_dump())
+
+
+def bulk_status_code(errors: list[Exception]) -> int:
+    """Pick the status for a bulk response from its per-operation failures.
+
+    An unknown outcome outranks a definite failure, however many of each there
+    are: the timed-out operation is the one that can still change the calendar,
+    so the caller must verify before issuing anything compensating (issue #4).
+    """
+    if not errors:
+        return 200
+    if any(isinstance(e, ProxyTimeoutError) for e in errors):
+        return 504
+    return error_status_code(errors[0])
 
 
 def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
@@ -972,8 +1022,10 @@ async def bulk_actions(request: BulkActionsRequest):
     try:
         client = get_calendar_client()
         results: list[BulkOperationResult] = []
+        errors: list[Exception] = []
         success_count = 0
         error_count = 0
+        unknown_count = 0
 
         for op in request.operations:
             try:
@@ -983,76 +1035,65 @@ async def bulk_actions(request: BulkActionsRequest):
                         event_id=op.event_id,
                         send_updates=op.send_updates,
                     )
-                    results.append(BulkOperationResult(
-                        event_id=op.event_id,
-                        operation="delete",
-                        success=True,
-                    ))
-                    success_count += 1
 
-                elif op.operation == BulkOperationType.UPDATE:
+                elif op.operation in (
+                    BulkOperationType.UPDATE, BulkOperationType.PATCH
+                ):
                     if not op.updates:
-                        results.append(BulkOperationResult(
-                            event_id=op.event_id,
-                            operation="update",
-                            success=False,
-                            error="No update data provided",
-                        ))
-                        error_count += 1
-                        continue
+                        raise BulkInputError("No update data provided")
 
-                    await client.update_event(
+                    write = (
+                        client.update_event
+                        if op.operation == BulkOperationType.UPDATE
+                        else client.patch_event
+                    )
+                    await write(
                         calendar_id=op.calendar_id,
                         event_id=op.event_id,
                         event_data=op.updates,
                         send_updates=op.send_updates,
                     )
-                    results.append(BulkOperationResult(
-                        event_id=op.event_id,
-                        operation="update",
-                        success=True,
-                    ))
-                    success_count += 1
 
-                elif op.operation == BulkOperationType.PATCH:
-                    if not op.updates:
-                        results.append(BulkOperationResult(
-                            event_id=op.event_id,
-                            operation="patch",
-                            success=False,
-                            error="No update data provided",
-                        ))
-                        error_count += 1
-                        continue
-
-                    await client.patch_event(
-                        calendar_id=op.calendar_id,
-                        event_id=op.event_id,
-                        event_data=op.updates,
-                        send_updates=op.send_updates,
-                    )
-                    results.append(BulkOperationResult(
-                        event_id=op.event_id,
-                        operation="patch",
-                        success=True,
-                    ))
-                    success_count += 1
+                results.append(BulkOperationResult(
+                    event_id=op.event_id,
+                    operation=op.operation.value,
+                    success=True,
+                    outcome=BulkOperationOutcome.SUCCEEDED,
+                ))
+                success_count += 1
 
             except Exception as e:
+                # A timed-out mutation is not a failure: the operator may
+                # approve it after this loop has moved on (issue #4).
+                unknown = isinstance(e, ProxyTimeoutError)
                 results.append(BulkOperationResult(
                     event_id=op.event_id,
                     operation=op.operation.value,
                     success=False,
+                    outcome=(
+                        BulkOperationOutcome.UNKNOWN
+                        if unknown
+                        else BulkOperationOutcome.FAILED
+                    ),
                     error=format_proxy_error(e),
                 ))
-                error_count += 1
+                errors.append(e)
+                if unknown:
+                    unknown_count += 1
+                else:
+                    error_count += 1
 
-        return BulkActionsResponse(
-            success=True,
+        body = BulkActionsResponse(
+            success=not errors,
             results=results,
             success_count=success_count,
             error_count=error_count,
+            unknown_count=unknown_count,
         )
+        status = bulk_status_code(errors)
+        if status == 200:
+            return body
+        return JSONResponse(status_code=status, content=body.model_dump())
     except Exception as e:
         return error_response(
             BulkActionsResponse(
@@ -1060,6 +1101,7 @@ async def bulk_actions(request: BulkActionsRequest):
                 results=[],
                 success_count=0,
                 error_count=0,
+                unknown_count=0,
                 error=format_proxy_error(e),
             ),
             e,
