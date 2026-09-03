@@ -510,8 +510,9 @@ class TestCalendarPerspective:
         assert calendar_perspective(event) == (False, None, "not_attendee")
 
     def test_cancelled_stub_with_no_organizer_or_attendees_is_unknown(self):
-        # showDeleted=true returns cancelled recurring-instance stubs that
-        # carry neither organizer nor attendees; nothing to classify from.
+        # A plain list with singleEvents=false returns cancelled recurring-
+        # instance stubs that carry neither organizer nor attendees; nothing
+        # to classify from.
         assert calendar_perspective({"status": "cancelled"}) == (False, None, "unknown")
 
     def test_needs_action_passes_through(self):

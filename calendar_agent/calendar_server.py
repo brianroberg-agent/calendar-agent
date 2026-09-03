@@ -2,7 +2,9 @@
 
 This server acts as an intermediary between AI agents (like Claude Code) and the
 Google Calendar API via a proxy server. Calendar event details are processed
-locally; only metadata and LLM-generated summaries are returned to calling agents.
+locally; calling agents receive event metadata (including the organizer's and
+creator's email addresses, never descriptions or attendee lists) and
+LLM-generated summaries.
 
 Key features:
 - Calendar and event CRUD operations via proxy
@@ -131,11 +133,10 @@ class EventPatchRequest(BaseModel):
 class RespondRequest(BaseModel):
     """Request body for RSVPing to an event.
 
-    The proxy patches the attendee entry Google marks ``self`` on the copy
-    of the event that sits on ``calendar_id`` -- that is the CALENDAR's own
-    entry. On the authenticated user's own calendar that is the user; on a
-    colleague's calendar it is the colleague. Only RSVP through the user's
-    own calendar (``primary``).
+    The proxy writes the AUTHENTICATED USER's own attendee entry, found by
+    email address (it does not trust Google's ``self`` flag), whatever
+    ``calendar_id`` is. That is the opposite perspective from the read
+    side, whose ``calendar_*`` fields describe the calendar being read.
     """
     response_status: RsvpResponse = Field(
         ...,
@@ -306,8 +307,10 @@ class EventSummary(BaseModel):
     status: str | None = Field(
         None,
         description=(
-            "Google event status: 'confirmed', 'tentative', or 'cancelled' "
-            "(cancelled instances appear only under show_deleted)."
+            "Google event status: 'confirmed', 'tentative', or 'cancelled'. "
+            "Cancelled rows are the stubs Google keeps for deleted instances "
+            "of a recurring series; they are returned when single_events is "
+            "false and carry empty start/end, no organizer and no attendees."
         ),
     )
     html_link: str | None = None
@@ -662,7 +665,8 @@ def bulk_error_summary(results: list[BulkOperationResult]) -> str | None:
 
 
 def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
-    """Convert a full event to a summary (metadata only, no body).
+    """Convert a full event to an EventSummary: metadata plus the organizer's
+    and creator's addresses; no description, no attendee list.
 
     The ``calendar_*`` fields are derived from Google's ``self`` flags and so
     describe ``calendar_id`` -- the calendar this copy of the event sits on.
@@ -970,20 +974,26 @@ async def respond_to_event(
     event_id: str,
     request: RespondRequest,
 ):
-    """RSVP to an event by setting the calendar's own responseStatus.
+    """RSVP to an event by setting the authenticated user's own responseStatus.
 
-    Forwards to the proxy's dedicated /respond route, which patches only the
-    attendee entry Google marks ``self`` on the copy of the event that sits
-    on ``calendar_id``, and sends no invitations or notifications. Because
-    ``self`` marks the calendar, not the caller, this RSVPs as the
-    authenticated user only on the user's own calendar (``primary``); on a
-    colleague's calendar it would RSVP the colleague. Valid values for
-    response_status are 'accepted', 'declined', or 'tentative'.
+    Forwards to the proxy's dedicated /respond route. The proxy resolves the
+    authenticated account's email address (from its primary calendar), finds
+    that address in the event's attendee list -- it does not trust Google's
+    ``self`` flag -- patches only that entry, and sends no invitations or
+    notifications. So this always RSVPs as the authenticated user, whatever
+    ``calendar_id`` is; on a colleague's calendar it updates the user's own
+    entry on that copy, never the colleague's. That is the opposite
+    perspective from the read side, whose ``calendar_*`` fields describe the
+    calendar being read. Valid values for response_status are 'accepted',
+    'declined', or 'tentative'.
 
-    Like other mutations, the proxy blocks while a human operator approves
-    the RSVP: 403 means it was rejected (or the operator never answered);
-    504 means no response before this server's timeout and the outcome is
-    unknown — verify by re-reading the event.
+    If the authenticated user is not an attendee, the proxy answers 400
+    ("You are not an attendee of this event; cannot RSVP."), which this
+    server surfaces as 502 with that message in ``error``. Like other
+    mutations, the proxy blocks while a human operator approves the RSVP:
+    403 means it was rejected (or the operator never answered); 504 means
+    no response before this server's timeout and the outcome is unknown --
+    verify by re-reading the event.
     """
     try:
         client = get_calendar_client()

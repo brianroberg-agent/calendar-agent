@@ -4,13 +4,14 @@ A privacy-focused FastAPI server that wraps the Google Calendar API for use with
 
 ## Overview
 
-Calendar Agent acts as an intermediary between AI orchestrators (like Claude Code) and the Google Calendar API via a proxy server. Calendar event details are processed locally; only metadata and LLM-generated summaries are returned to calling agents.
+Calendar Agent acts as an intermediary between AI orchestrators (like Claude Code) and the Google Calendar API via a proxy server. Calendar event details are processed locally; calling agents receive event metadata, the organizer's and creator's email addresses, and LLM-generated summaries -- never event descriptions or attendee lists (see Key Privacy Features).
 
 **Key Privacy Features:**
-- Event descriptions and details never leave the local server
-- Event summaries expose metadata (IDs, dates, titles, status, attendee
-  counts) plus the **organizer's and creator's email addresses** -- and
-  nothing else about attendees: no attendee list, no attendee addresses.
+- Event descriptions never leave the local server
+- Event summaries expose metadata (IDs, dates, titles, location, status,
+  the Google Calendar link, attendee counts) plus the **organizer's and
+  creator's email addresses** -- and nothing else about attendees: no
+  attendee list, no attendee addresses.
   The two addresses are included by decision (2026-09-03) because on a
   group calendar Google makes the calendar itself the organizer, so the
   creator's address is the only way to know which person created an event.
@@ -104,7 +105,7 @@ Every endpoint returns a body with a `success` field, and on failure an
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
 | `404` | The calendar or event does not exist. When verifying a deletion this is the *expected* answer: the event is gone |
 | `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) — nothing was sent upstream. A bulk `update`/`patch` with no `updates` payload rejects the **whole batch** this way, before any operation runs |
-| `502` | The proxy or LLM backend failed — or, on a delete, the proxy claimed success for an event that is still present on re-read |
+| `502` | The proxy or LLM backend failed; the proxy refused the request with a 4xx other than 401/403/404 (its message is carried in `error`; e.g. `/respond` when the authenticated user is not an attendee); or, on a delete, the proxy claimed success for an event that is still present on re-read |
 | `504` | **The outcome is unknown**: no response before this server's timeout and the resource is still present, or the verifying re-read itself failed. A confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
 
 Mutation envelopes (`DELETE …/events/{id}` and each `/bulk-actions` result)
@@ -229,10 +230,12 @@ Response:
 #### Organizer and RSVP fields -- whose perspective they report
 
 **The `calendar_*` fields describe the calendar named by `calendar_id`,
-not the authenticated user.** Google's Events reference defines
-`organizer.self` and `attendees[].self` as "whether this entry represents
-**the calendar on which this copy of the event appears**", and those flags
-are what these fields are computed from. So:
+not the authenticated user.** They are computed from Google's `self` flags,
+which the Events reference defines relative to the calendar:
+`attendees[].self` is "whether this entry represents **the calendar on
+which this copy of the event appears**", and `organizer.self` is "whether
+the organizer corresponds to **the calendar on which this copy of the event
+appears**". So:
 
 - Reading your own calendar (`primary`, or your own address), they describe
   you.
@@ -250,7 +253,7 @@ Fields:
 - `organizer_email`: the organizer's address as Google reports it. For an
   event created on a group calendar this is the group calendar's id. `null`
   when the event carries no organizer (e.g. a cancelled recurring-instance
-  stub returned under `show_deleted`).
+  stub -- see `status`).
 - `creator_email`: the address of the account that created the event.
   Usually the same as `organizer_email`; differs on group calendars (above)
   and for events moved between calendars. `null` when absent.
@@ -277,13 +280,19 @@ Fields:
     recognisable `responseStatus`, or the event carries no organizer and no
     attendees at all (cancelled recurring-instance stubs look like this).
 - `status`: Google's event status -- `"confirmed"`, `"tentative"`, or
-  `"cancelled"` (the last only under `show_deleted`).
+  `"cancelled"`. Cancelled rows are the stubs Google keeps for deleted
+  instances of a recurring series. They are returned by a plain `GET` with
+  `single_events=false` (the default `single_events=true` expansion omits
+  them) and carry empty `start`/`end`, no organizer and no attendees, so
+  they read as `calendar_rsvp_state: "unknown"`.
 
 Only `"accepted"`, `"declined"` and `"tentative"` can be sent back to `POST
-.../respond`; a `"needsAction"` or derived state cannot be echoed to it. And
-because `/respond` writes to the same `self` entry these fields read from,
-**it too acts as the calendar, not as you** -- see that endpoint's warning
-below.
+.../respond`; a `"needsAction"` or derived state cannot be echoed to it. Note
+that the read side and `/respond` take **different perspectives**: these
+fields report the calendar's own entry, while `/respond` always writes the
+**authenticated user's** entry (matched by email address, never by the
+`self` flag). On your own calendar the two coincide; on a colleague's or
+group calendar they do not -- see that endpoint's note below.
 
 ### POST /calendars/{calendar_id}/events
 
@@ -496,19 +505,27 @@ until a deletion has been observed complete.
 
 ### POST /calendars/{calendar_id}/events/{event_id}/respond
 
-RSVP to an event by setting the response status of **the calendar's own**
-attendee entry. Forwards to the proxy's dedicated respond route, which reads
-the event's attendee list, changes only the entry Google marks `self`, and
-sends no invitations or notifications.
+RSVP to an event by setting the response status of **the authenticated
+user's own** attendee entry. Forwards to the proxy's dedicated respond route,
+which reads the event, finds the authenticated account's entry in the
+attendee list **by email address** (it resolves that address from the
+account's primary calendar and does not trust Google's `self` flag), patches
+only that entry, and sends no invitations or notifications.
 
-> **Only call this on your own calendar (`primary`).** Google's `self` flag
-> marks the calendar the event copy sits on, not the caller. On a
-> colleague's calendar the `self` entry is the colleague's, so
-> `POST /calendars/colleague@example.com/events/{event_id}/respond` would
-> **RSVP on the colleague's behalf**, silently and without notification.
-> A read-then-respond loop must not carry a colleague's `calendar_id` into
-> this call. The proxy returns `400` if the calendar has no attendee entry
-> of its own to update.
+> **Whose RSVP this changes: always the authenticated user's** -- the account
+> the proxy holds credentials for -- whatever `calendar_id` is. On a
+> colleague's calendar, `POST /calendars/colleague@example.com/events/{event_id}/respond`
+> updates *your* entry on that copy of the event, or fails if you are not an
+> attendee; it cannot RSVP on the colleague's behalf. This is the opposite
+> perspective from the read side: on the same `calendar_id`,
+> `calendar_rsvp_state` reports the **colleague's** entry, so a
+> read-then-respond loop must not treat the value it read as the entry it is
+> about to write.
+>
+> If the authenticated user is not an attendee, the proxy answers
+> `400 You are not an attendee of this event; cannot RSVP.` This service
+> surfaces that as **`502`** with the proxy's message in `error` (every proxy
+> 4xx other than 401/403 maps to 502 here -- see Error Responses).
 
 Request body:
 - `response_status` (string): one of `accepted`, `declined`, `tentative`

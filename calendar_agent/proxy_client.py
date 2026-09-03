@@ -333,13 +333,13 @@ class CalendarProxyClient:
         event_id: str,
         response_status: str,
     ) -> dict[str, Any]:
-        """RSVP to an event by setting the calendar's own responseStatus.
+        """RSVP to an event as the authenticated user.
 
-        Forwards to the proxy's dedicated ``/respond`` route, which patches
-        only the attendee entry Google marks ``self`` on the ``calendar_id``
-        copy of the event and sends no notifications. ``self`` marks the
-        calendar the copy sits on, so this acts as the authenticated user
-        only on the user's own calendar.
+        Forwards to the proxy's dedicated ``/respond`` route, which finds the
+        authenticated account's attendee entry by email address (not by
+        Google's ``self`` flag) on the ``calendar_id`` copy of the event,
+        patches only that entry and sends no notifications. The proxy
+        answers 400 when the authenticated user is not an attendee.
         """
         url = f"{self._event_url(calendar_id, event_id)}/respond"
         response = await self._send(

@@ -36,7 +36,7 @@ ReadResponseStatus = Literal[RsvpResponse, "needsAction"]
 #   unknown            an entry exists but carries no recognisable
 #                      responseStatus, or the event carries no organizer and
 #                      no attendees at all (e.g. a cancelled recurring-
-#                      instance stub returned under showDeleted=true).
+#                      instance stub, returned when singleEvents=false).
 RsvpState = Literal[ReadResponseStatus, "organizer_no_rsvp", "not_attendee", "unknown"]
 
 RSVP_RESPONSES: tuple[str, ...] = get_args(RsvpResponse)
