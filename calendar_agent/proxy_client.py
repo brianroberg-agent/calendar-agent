@@ -149,7 +149,9 @@ class CalendarProxyClient:
             )
             raise ProxyForbiddenError(message)
 
-        if response.status_code == 404:
+        if response.status_code in (404, 410):
+            # 410 Gone is Google's answer for an event that has been deleted:
+            # "absent", the expected result when verifying a delete.
             message = self._parse_error_message(response, "Not found")
             raise ProxyNotFoundError(message)
 
@@ -202,6 +204,17 @@ class CalendarProxyClient:
         except httpx.HTTPError as e:
             raise ProxyError(f"Proxy connection failed: {e}") from e
 
+    # ========== URL construction ==========
+
+    def _calendar_url(self, calendar_id: str) -> str:
+        # Calendar IDs may contain characters like '#' (Google's built-in
+        # calendars: '#contacts@group.v.calendar.google.com') that would
+        # otherwise truncate the URL as a fragment and hit a different route.
+        return f"{self.proxy_url}/calendar/v3/calendars/{quote(calendar_id, safe='@')}"
+
+    def _event_url(self, calendar_id: str, event_id: str) -> str:
+        return f"{self._calendar_url(calendar_id)}/events/{quote(event_id, safe='')}"
+
     # ========== Calendar Operations ==========
 
     async def list_calendars(
@@ -229,7 +242,7 @@ class CalendarProxyClient:
 
     async def get_calendar(self, calendar_id: str) -> dict[str, Any]:
         """Get metadata for a specific calendar."""
-        url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}"
+        url = self._calendar_url(calendar_id)
 
         response = await self._send("get", url)
         return self._handle_response(response)
@@ -251,7 +264,7 @@ class CalendarProxyClient:
         sync_token: str | None = None,
     ) -> dict[str, Any]:
         """List events in a calendar."""
-        url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}/events"
+        url = f"{self._calendar_url(calendar_id)}/events"
         params: dict[str, Any] = {"singleEvents": single_events}
 
         if max_results is not None:
@@ -283,7 +296,7 @@ class CalendarProxyClient:
         time_zone: str | None = None,
     ) -> dict[str, Any]:
         """Get a specific event by ID."""
-        url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}/events/{event_id}"
+        url = self._event_url(calendar_id, event_id)
         params: dict[str, Any] = {}
 
         if time_zone is not None:
@@ -300,7 +313,7 @@ class CalendarProxyClient:
         conference_data_version: int | None = None,
     ) -> dict[str, Any]:
         """Create a new event in a calendar."""
-        url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}/events"
+        url = f"{self._calendar_url(calendar_id)}/events"
         params: dict[str, Any] = {}
 
         if send_updates is not None:
@@ -325,12 +338,7 @@ class CalendarProxyClient:
         Forwards to the proxy's dedicated ``/respond`` route, which changes only
         the self attendee's status and sends no notifications.
         """
-        # Calendar IDs may contain characters like '#' (e.g. Google holiday
-        # calendars) that would otherwise truncate the URL as a fragment.
-        url = (
-            f"{self.proxy_url}/calendar/v3/calendars/{quote(calendar_id, safe='@')}"
-            f"/events/{quote(event_id, safe='')}/respond"
-        )
+        url = f"{self._event_url(calendar_id, event_id)}/respond"
         response = await self._send(
             "post", url, json_body={"responseStatus": response_status},
             timeout=CONFIRM_TIMEOUT,
@@ -346,7 +354,7 @@ class CalendarProxyClient:
         conference_data_version: int | None = None,
     ) -> dict[str, Any]:
         """Update an event (full replacement)."""
-        url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}/events/{event_id}"
+        url = self._event_url(calendar_id, event_id)
         params: dict[str, Any] = {}
 
         if send_updates is not None:
@@ -369,7 +377,7 @@ class CalendarProxyClient:
         conference_data_version: int | None = None,
     ) -> dict[str, Any]:
         """Partially update an event."""
-        url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}/events/{event_id}"
+        url = self._event_url(calendar_id, event_id)
         params: dict[str, Any] = {}
 
         if send_updates is not None:
@@ -390,7 +398,7 @@ class CalendarProxyClient:
         send_updates: str | None = None,
     ) -> dict[str, Any]:
         """Delete an event."""
-        url = f"{self.proxy_url}/calendar/v3/calendars/{calendar_id}/events/{event_id}"
+        url = self._event_url(calendar_id, event_id)
         params: dict[str, Any] = {}
 
         if send_updates is not None:

@@ -413,6 +413,60 @@ class TestProxyClientRespond:
         )
 
 
+class TestProxyClientPathQuoting:
+    """Every event route must percent-encode its path segments (F9).
+
+    Google's built-in calendar ids contain ``#`` (``#contacts@group.v...``,
+    ``en.usa#holiday@...``). Unquoted, httpx reads the ``#`` as a fragment and
+    the request goes to ``/calendars/`` — a different route, whose 404 now maps
+    to "the event does not exist" instead of a recognisable upstream error.
+    """
+
+    CAL = "#contacts@group.v.calendar.google.com"
+    EXPECTED = (
+        "http://proxy/calendar/v3/calendars/"
+        "%23contacts@group.v.calendar.google.com/events/e%2F1"
+    )
+
+    @pytest.fixture
+    def ok_response(self):
+        r = AsyncMock(spec=httpx.Response)
+        r.status_code = 200
+        r.json.return_value = {"id": "e/1"}
+        return r
+
+    @pytest.mark.parametrize(
+        ("method", "call"),
+        [
+            ("get", lambda c, cal: c.get_event(cal, "e/1")),
+            ("put", lambda c, cal: c.update_event(cal, "e/1", {"summary": "x"})),
+            ("patch", lambda c, cal: c.patch_event(cal, "e/1", {"summary": "x"})),
+            ("delete", lambda c, cal: c.delete_event(cal, "e/1")),
+        ],
+    )
+    async def test_event_routes_quote_both_segments(self, ok_response, method, call):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            getattr(mock_http, method).return_value = ok_response
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await call(client, self.CAL)
+        url = getattr(mock_http, method).call_args.args[0]
+        assert url == self.EXPECTED
+        assert httpx.URL(url).raw_path.decode().endswith("/events/e%2F1")
+
+    async def test_proxy_410_is_not_found(self):
+        """Google answers 410 Gone for a deleted event; that is "absent", the
+        expected answer when verifying a delete, not a generic proxy error."""
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        response = AsyncMock(spec=httpx.Response)
+        response.status_code = 410
+        response.json.return_value = {"detail": "Resource has been deleted"}
+        with pytest.raises(ProxyNotFoundError):
+            client._handle_response(response)
+
+
 class TestProxyClientTimeouts:
     """Mutations must outlive the proxy's 300s confirmation window (issue #4)."""
 
