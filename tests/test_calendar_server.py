@@ -2177,3 +2177,161 @@ class TestValidationErrorEnvelope:
         assert "duration_minutes" in data["error"]
         assert "preferMorning" in data["error"]
         assert len(data["detail"]) == 2
+
+
+# ============================================================================
+# Writable-field coverage and fetch-modify-write round trips (issue #8,
+# second review round)
+#
+# extra="forbid" only holds up if the models declare every field a caller
+# legitimately sends. Two gaps were found: EventPatchRequest lacked fields the
+# create model accepts (transparency, visibility, guestsCan*) plus `status`
+# (Google's documented cancel path), and a fetch -> modify -> PUT of a real
+# Google event 422'd on Google's own server-populated fields (id, etag,
+# htmlLink, ...) and on attendee fields Google returns (id, resource, ...).
+# ============================================================================
+
+
+# Every read-only, server-populated key Google puts on an event it returns.
+# A caller doing fetch -> modify -> write sends these back verbatim; the
+# server strips exactly this set (and nothing else) before forwarding.
+GOOGLE_READ_ONLY_EVENT_FIELDS = {
+    "kind": "calendar#event",
+    "etag": '"3181161784712000"',
+    "id": "meeting_001",
+    "htmlLink": "https://calendar.google.com/event?eid=meeting_001",
+    "created": "2024-01-08T10:00:00Z",
+    "updated": "2024-01-15T10:00:00Z",
+    "creator": {"email": "owner@example.com", "self": True},
+    "organizer": {"email": "owner@example.com", "self": True},
+    "iCalUID": "meeting_001@google.com",
+    "sequence": 3,
+    "eventType": "default",
+    "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    "recurringEventId": "recurring_001",
+    "originalStartTime": {"dateTime": "2024-01-15T10:00:00Z", "timeZone": "UTC"},
+}
+
+# A Google-shaped attendee entry as Google returns it (all writable/tolerated).
+GOOGLE_ATTENDEE = {
+    "id": "attendee-id-1",
+    "email": "alice@example.com",
+    "displayName": "Alice Smith",
+    "responseStatus": "accepted",
+    "optional": False,
+    "organizer": False,
+    "self": False,
+    "resource": False,
+    "comment": "Joining remotely",
+    "additionalGuests": 1,
+}
+
+
+class TestPatchAcceptsEveryCreateField:
+    """A field the create model accepts must be patchable too (C4)."""
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("transparency", "transparent"),
+            ("visibility", "private"),
+            ("guestsCanInviteOthers", False),
+            ("guestsCanModify", True),
+            ("guestsCanSeeOtherGuests", False),
+            ("status", "cancelled"),
+        ],
+    )
+    def test_patch_forwards_field(self, client, mock_proxy_client, field, value):
+        response = client.patch(
+            "/calendars/primary/events/event_123", json={field: value}
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {field: value}
+
+    @pytest.mark.parametrize("method", ["post", "put"])
+    def test_status_is_writable_on_create_and_update(self, client, mock_proxy_client, method):
+        path = "/calendars/primary/events" + ("" if method == "post" else "/event_123")
+        response = getattr(client, method)(
+            path, json={"summary": "Standup", "status": "tentative"}
+        )
+        assert response.status_code == 200, response.text
+        forwarder = mock_proxy_client.create_event if method == "post" else mock_proxy_client.update_event
+        assert forwarder.call_args.kwargs["event_data"]["status"] == "tentative"
+
+
+class TestGoogleEventRoundTrip:
+    """fetch -> modify -> write of a real Google event succeeds (C3)."""
+
+    def _fetched_event(self):
+        return {
+            **GOOGLE_READ_ONLY_EVENT_FIELDS,
+            "status": "confirmed",
+            "summary": "Team Standup",
+            "description": "Daily standup meeting",
+            "location": "Zoom",
+            "start": {"dateTime": "2024-01-15T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2024-01-15T10:30:00Z", "timeZone": "UTC"},
+            "attendees": [GOOGLE_ATTENDEE, {"email": "room@example.com", "resource": True}],
+            "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 10}]},
+            "transparency": "opaque",
+            "visibility": "default",
+            "guestsCanInviteOthers": True,
+            "guestsCanModify": False,
+            "guestsCanSeeOtherGuests": True,
+        }
+
+    @pytest.mark.parametrize("method", ["put", "patch"])
+    def test_round_trip_succeeds_and_strips_only_read_only_keys(
+        self, client, mock_proxy_client, method
+    ):
+        body = self._fetched_event()
+        body["summary"] = "Team Standup (moved)"
+        response = getattr(client, method)("/calendars/primary/events/meeting_001", json=body)
+        assert response.status_code == 200, response.text
+
+        forwarder = mock_proxy_client.update_event if method == "put" else mock_proxy_client.patch_event
+        forwarded = forwarder.call_args.kwargs["event_data"]
+        for key in GOOGLE_READ_ONLY_EVENT_FIELDS:
+            assert key not in forwarded, f"read-only key {key!r} was forwarded"
+        assert forwarded["summary"] == "Team Standup (moved)"
+        assert forwarded["status"] == "confirmed"
+        assert forwarded["attendees"][0] == GOOGLE_ATTENDEE
+        assert forwarded["attendees"][1] == {"email": "room@example.com", "resource": True}
+        assert forwarded["reminders"]["overrides"][0] == {"method": "popup", "minutes": 10}
+
+    def test_round_trip_through_create_succeeds(self, client, mock_proxy_client):
+        """Duplicating an event by POSTing a fetched one works the same way."""
+        response = client.post("/calendars/primary/events", json=self._fetched_event())
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.create_event.call_args.kwargs["event_data"]
+        assert "id" not in forwarded and "etag" not in forwarded
+        assert forwarded["summary"] == "Team Standup"
+
+    def test_unknown_key_outside_read_only_set_still_rejected(self, client, mock_proxy_client):
+        body = {**self._fetched_event(), "titel": "typo"}
+        response = client.put("/calendars/primary/events/meeting_001", json=body)
+        assert response.status_code == 422
+        data = response.json()
+        assert data["detail"] == [
+            {
+                "type": "extra_forbidden",
+                "loc": ["body", "titel"],
+                "msg": "Extra inputs are not permitted",
+                "input": "typo",
+            }
+        ]
+        mock_proxy_client.update_event.assert_not_called()
+
+    def test_read_only_keys_are_not_silently_written_by_a_bare_request(
+        self, client, mock_proxy_client
+    ):
+        """Stripping is exactly the named set: a read-only key sent alone is
+        dropped (200, nothing forwarded for it), never forwarded."""
+        response = client.patch(
+            "/calendars/primary/events/meeting_001",
+            json={"etag": '"1"', "location": "Room B"},
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {
+            "location": "Room B"
+        }

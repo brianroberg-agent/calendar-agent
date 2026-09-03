@@ -129,13 +129,17 @@ class EventDateTime(StrictRequestModel):
 
 
 class EventAttendee(StrictRequestModel):
-    """Event attendee."""
+    """Event attendee, as Google returns it (so a fetched list round-trips)."""
     email: str
+    id: str | None = Field(None, description="Google's attendee id (round-tripped)")
     displayName: str | None = None
     responseStatus: str | None = None
     optional: bool | None = None
     organizer: bool | None = None
     self_: bool | None = Field(None, alias="self")
+    resource: bool | None = Field(None, description="True for a booked room/resource")
+    comment: str | None = Field(None, description="The attendee's response comment")
+    additionalGuests: int | None = Field(None, ge=0, description="Extra guests")
 
 
 class EventReminder(StrictRequestModel):
@@ -150,8 +154,35 @@ class EventReminders(StrictRequestModel):
     overrides: list[EventReminder] | None = None
 
 
-class EventCreateRequest(StrictRequestModel):
-    """Request body for creating a new event."""
+# Server-populated, read-only keys Google puts on every event it returns. A
+# caller doing fetch -> modify -> write sends them back verbatim; Google
+# tolerates that, so these -- and ONLY these -- are stripped before the
+# extra="forbid" check instead of being rejected. Documented in README.md
+# next to the "Unknown fields are rejected" paragraph; keep the two in sync.
+GOOGLE_READ_ONLY_EVENT_FIELDS: frozenset[str] = frozenset({
+    "kind",
+    "etag",
+    "id",
+    "htmlLink",
+    "hangoutLink",
+    "created",
+    "updated",
+    "creator",
+    "organizer",
+    "iCalUID",
+    "sequence",
+    "eventType",
+    "recurringEventId",
+    "originalStartTime",
+})
+
+
+class EventFields(StrictRequestModel):
+    """Every writable Google event field this server forwards.
+
+    Shared by the create, update (PUT) and patch bodies so that a field one
+    write route accepts is accepted by all of them (issue #8, review round 2).
+    """
     summary: str | None = Field(None, description="Event title")
     description: str | None = Field(None, description="Event description")
     location: str | None = Field(None, description="Event location")
@@ -161,29 +192,38 @@ class EventCreateRequest(StrictRequestModel):
     reminders: EventReminders | None = Field(None, description="Reminder settings")
     recurrence: list[str] | None = Field(None, description="Recurrence rules (RRULE)")
     colorId: str | None = Field(None, description="Color ID")
+    status: str | None = Field(
+        None, description="'confirmed', 'tentative' or 'cancelled' (Google's cancel path)"
+    )
     transparency: str | None = Field(None, description="'opaque' or 'transparent'")
     visibility: str | None = Field(None, description="'default', 'public', 'private'")
     guestsCanInviteOthers: bool | None = None
     guestsCanModify: bool | None = None
     guestsCanSeeOtherGuests: bool | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_google_read_only_fields(cls, data: Any) -> Any:
+        """Drop Google's server-populated keys so a fetched event round-trips.
+
+        Runs before the extra="forbid" check. Only the named set is dropped;
+        any other undeclared key is still rejected.
+        """
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if k not in GOOGLE_READ_ONLY_EVENT_FIELDS}
+        return data
+
+
+class EventCreateRequest(EventFields):
+    """Request body for creating a new event."""
+
 
 class EventUpdateRequest(EventCreateRequest):
     """Request body for updating an event (full replacement)."""
-    pass
 
 
-class EventPatchRequest(StrictRequestModel):
+class EventPatchRequest(EventFields):
     """Request body for partially updating an event."""
-    summary: str | None = None
-    description: str | None = None
-    location: str | None = None
-    start: EventDateTime | None = None
-    end: EventDateTime | None = None
-    attendees: list[EventAttendee] | None = None
-    reminders: EventReminders | None = None
-    recurrence: list[str] | None = None
-    colorId: str | None = None
 
 
 # Rendered into the field descriptions below so /openapi.json lists exactly
