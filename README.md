@@ -208,13 +208,43 @@ Response:
       "location": "Conference Room A",
       "attendee_count": 5,
       "is_all_day": false,
-      "status": "confirmed"
+      "status": "confirmed",
+      "organizer_email": "alice@example.com",
+      "is_organizer": false,
+      "response_status": "accepted"
     }
   ],
   "next_page_token": null,
   "error": null
 }
 ```
+
+#### `organizer_email` / `is_organizer` / `response_status`
+
+- `organizer_email`: the event organizer's address. `null` if the event
+  carries no organizer at all (shouldn't happen per the Google API, but the
+  field is defensive).
+- `is_organizer`: `true` when the **authenticated user** is the organizer.
+- `response_status`: the **authenticated user's own RSVP** on this event --
+  not the calendar owner's, even when `calendar_id` names someone else's
+  calendar. One of `"accepted"`, `"declined"`, `"tentative"`,
+  `"needsAction"`, or `null`.
+
+  `null` has three different causes, and reading it as "hasn't responded
+  yet" is only safe once you've also checked `is_organizer`:
+
+  1. `attendee_count == 0` -- you created the event for yourself; there's
+     no RSVP to report.
+  2. `is_organizer == true` and `attendee_count > 0`, but you're not
+     yourself in the attendee list -- again, your own event, not an
+     unanswered invitation.
+  3. `is_organizer == false` and you *are* an attendee, but Google omitted
+     the `responseStatus` key for your record -- genuinely unknown.
+
+  Note the read-side domain (above) is larger than what `POST
+  .../respond` accepts (`"accepted"`, `"declined"`, `"tentative"` only --
+  see that endpoint's docs below). A caller cannot echo a `"needsAction"`
+  or `null` `response_status` straight back to `/respond`.
 
 ### POST /calendars/{calendar_id}/events
 
@@ -687,7 +717,10 @@ Response:
       "start": "2024-01-20T14:00:00Z",
       "end": "2024-01-20T15:00:00Z",
       "attendee_count": 8,
-      "is_all_day": false
+      "is_all_day": false,
+      "organizer_email": "primary@example.com",
+      "is_organizer": true,
+      "response_status": null
     }
   ],
   "next_page_token": null,

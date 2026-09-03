@@ -267,7 +267,33 @@ class CalendarDetailResponse(BaseModel):
 
 
 class EventSummary(BaseModel):
-    """Summary of an event (metadata only, no body)."""
+    """Summary of an event (metadata only, no body).
+
+    ``response_status`` is the **authenticated user's own RSVP** on this
+    event -- never the calendar owner's, even when ``calendar_id`` names a
+    colleague's calendar (Google's ``self`` flag always marks the
+    authenticated user, not the calendar being read).
+
+    It can be ``null`` for three different reasons, and only one of them is
+    ambiguous once ``is_organizer`` is also read:
+
+    1. The event has no attendees at all (``attendee_count == 0``) -- you
+       created it for yourself; there is nothing to RSVP to.
+    2. You are the organizer (``is_organizer == True``) but are not
+       yourself listed as an attendee, even though others are
+       (``attendee_count > 0``). This is your own event, not an unanswered
+       invitation.
+    3. You *are* an attendee but Google omitted the ``responseStatus`` key
+       for your attendee record. This is the one case that stays genuinely
+       unknown -- distinguishable from case 2 because ``is_organizer`` is
+       False here.
+
+    The live values also include ``"needsAction"`` for a pending
+    invitation. That is a strictly larger domain than
+    ``RespondRequest.response_status`` (``"accepted"``, ``"declined"``,
+    ``"tentative"`` only) -- a caller cannot echo a read-side
+    ``"needsAction"`` or ``null`` straight back to ``POST .../respond``.
+    """
     id: str
     calendar_id: str
     summary: str
@@ -278,6 +304,20 @@ class EventSummary(BaseModel):
     is_all_day: bool
     status: str | None = None
     html_link: str | None = None
+    organizer_email: str | None = Field(
+        None, description="Email of the event's organizer"
+    )
+    is_organizer: bool = Field(
+        False, description="Whether the authenticated user organizes this event"
+    )
+    response_status: str | None = Field(
+        None,
+        description=(
+            "The authenticated user's own RSVP status on this event: "
+            "'accepted', 'declined', 'tentative', 'needsAction', or null. "
+            "See the class docstring for what null means."
+        ),
+    )
 
 
 class EventsListResponse(BaseModel):
@@ -575,11 +615,27 @@ def bulk_error_summary(results: list[BulkOperationResult]) -> str | None:
     )
 
 
+def get_self_response_status(attendees: list[dict[str, Any]]) -> str | None:
+    """Return the authenticated user's own RSVP status, or None.
+
+    None means "no self attendee record" -- either there is no attendee
+    list, or the attendee list doesn't include a ``self: true`` entry.
+    Callers should not read None as "hasn't responded yet" on its own; see
+    the ``EventSummary.response_status`` docstring for the full
+    disambiguation, which also needs ``is_organizer``.
+    """
+    for attendee in attendees or []:
+        if attendee.get("self"):
+            return attendee.get("responseStatus")
+    return None
+
+
 def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
     """Convert a full event to a summary (metadata only)."""
     start = event.get("start", {})
     end = event.get("end", {})
     attendees = event.get("attendees", [])
+    organizer = event.get("organizer") or {}
 
     # Get time string (prefer dateTime, fall back to date for all-day)
     start_str = start.get("dateTime") or start.get("date") or ""
@@ -597,6 +653,9 @@ def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
         is_all_day=is_all_day,
         status=event.get("status"),
         html_link=event.get("htmlLink"),
+        organizer_email=organizer.get("email"),
+        is_organizer=bool(organizer.get("self")),
+        response_status=get_self_response_status(attendees),
     )
 
 

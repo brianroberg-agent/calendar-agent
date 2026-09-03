@@ -52,6 +52,7 @@ def get_sample_event(
     duration_hours: int = 1,
     attendees: list[dict[str, Any]] | None = None,
     is_all_day: bool = False,
+    organizer: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate a sample event with customizable properties."""
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -86,6 +87,9 @@ def get_sample_event(
 
     if attendees is not None:
         event["attendees"] = attendees
+
+    if organizer is not None:
+        event["organizer"] = organizer
 
     return event
 

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from calendar_agent.calendar_server import event_to_summary
 from calendar_agent.exceptions import (
     ProxyAuthError,
     ProxyConfigError,
@@ -23,6 +24,7 @@ from calendar_agent.proxy_client import (
     resolve_confirm_timeout,
     resolve_confirmation_window,
 )
+from tests.conftest import get_sample_event
 
 # ============================================================================
 # Health Endpoint Tests
@@ -109,6 +111,117 @@ class TestCalendarsEndpoint:
 # ============================================================================
 # Event CRUD Endpoint Tests
 # ============================================================================
+
+
+class TestEventToSummary:
+    """Tests for event_to_summary(): organizer exposure and response_status
+    disambiguation (issue #9).
+
+    ``response_status`` reflects the *authenticated user's* RSVP on this
+    event, not anything about the calendar owner (case 3 in the issue) and
+    not always "hasn't responded" when null (cases 1 and 2).
+    """
+
+    def test_exposes_organizer_email_and_is_organizer_false_for_invitee(self):
+        """An event organized by someone else exposes organizer_email and
+        is_organizer=False."""
+        event = get_sample_event(
+            organizer={"email": "carol@example.com", "displayName": "Carol", "self": False},
+            attendees=[
+                {"email": "me@example.com", "self": True, "responseStatus": "accepted"},
+            ],
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.organizer_email == "carol@example.com"
+        assert summary.is_organizer is False
+        assert summary.response_status == "accepted"
+
+    def test_self_organized_event_with_no_attendees(self):
+        """Case 1: an event you created for yourself, no attendee list at
+        all. response_status is null, but is_organizer=True and
+        attendee_count=0 together say why: there is no RSVP to report."""
+        event = get_sample_event(
+            organizer={"email": "me@example.com", "self": True},
+            attendees=None,
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.is_organizer is True
+        assert summary.organizer_email == "me@example.com"
+        assert summary.attendee_count == 0
+        assert summary.response_status is None
+
+    def test_organizer_not_in_attendee_list_is_disambiguated(self):
+        """Case 2 (the dangerous one): you organize the event, there ARE
+        attendees, but you are not present in the attendee list yourself.
+        response_status is still null -- but is_organizer=True now makes it
+        unambiguous that this is your own event, not an unanswered
+        invitation, even though attendee_count > 0."""
+        event = get_sample_event(
+            organizer={"email": "me@example.com", "self": True},
+            attendees=[
+                {"email": "alice@example.com", "responseStatus": "accepted"},
+                {"email": "bob@example.com", "responseStatus": "needsAction"},
+            ],
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.is_organizer is True
+        assert summary.attendee_count == 2
+        assert summary.response_status is None
+
+    def test_self_attendee_missing_response_status_key_stays_ambiguous(self):
+        """Case 3: a self attendee record exists but Google omitted the
+        responseStatus key. This is the one case that legitimately stays
+        null+ambiguous -- but it is now distinguishable from case 2 because
+        is_organizer is False here."""
+        event = get_sample_event(
+            organizer={"email": "carol@example.com", "self": False},
+            attendees=[
+                {"email": "me@example.com", "self": True},
+                {"email": "carol@example.com"},
+            ],
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.is_organizer is False
+        assert summary.attendee_count == 2
+        assert summary.response_status is None
+
+    def test_response_status_needs_action(self):
+        """A pending invitation reads back needsAction, not null -- and
+        needsAction is NOT one of the three values /respond accepts."""
+        event = get_sample_event(
+            organizer={"email": "carol@example.com", "self": False},
+            attendees=[
+                {"email": "me@example.com", "self": True, "responseStatus": "needsAction"},
+            ],
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.response_status == "needsAction"
+
+    def test_response_status_reflects_authenticated_user_not_calendar_owner(self):
+        """On a colleague's calendar (calendar_id != the authenticated
+        user), response_status is still the authenticated user's own RSVP,
+        never the calendar owner's -- self:true always marks the
+        authenticated user, per Google's contract."""
+        event = get_sample_event(
+            organizer={"email": "carol@example.com", "self": False},
+            attendees=[
+                {"email": "carol@example.com", "responseStatus": "accepted"},
+                {"email": "me@example.com", "self": True, "responseStatus": "declined"},
+            ],
+        )
+        summary = event_to_summary(event, "carol@example.com")
+        assert summary.calendar_id == "carol@example.com"
+        assert summary.response_status == "declined"
+
+    def test_no_organizer_key_defaults_safely(self):
+        """An event dict with no organizer key at all (shouldn't happen per
+        the Google API, but defend anyway) doesn't raise and reports
+        is_organizer=False."""
+        event = get_sample_event(organizer=None, attendees=None)
+        event.pop("organizer", None)
+        summary = event_to_summary(event, "primary")
+        assert summary.is_organizer is False
+        assert summary.organizer_email is None
 
 
 class TestEventsListEndpoint:
