@@ -421,7 +421,6 @@ def test_find_free_slots_all_day_event():
     assert len(slots) == 0
 
 
-
 # ============================================================================
 # Tests for the organizer / RSVP perspective helpers (issue #9)
 #
@@ -474,8 +473,12 @@ class TestCalendarPerspective:
         event = {
             "organizer": {"email": "carol@example.com", "self": True},
             "attendees": [
-                {"email": "carol@example.com", "self": True, "organizer": True,
-                 "responseStatus": "somethingNew"},
+                {
+                    "email": "carol@example.com",
+                    "self": True,
+                    "organizer": True,
+                    "responseStatus": "somethingNew",
+                },
             ],
         }
         assert calendar_perspective(event) == (True, "unknown")
@@ -484,8 +487,12 @@ class TestCalendarPerspective:
         event = {
             "organizer": {"email": "carol@example.com", "self": True},
             "attendees": [
-                {"email": "carol@example.com", "self": True, "organizer": True,
-                 "responseStatus": "accepted"},
+                {
+                    "email": "carol@example.com",
+                    "self": True,
+                    "organizer": True,
+                    "responseStatus": "accepted",
+                },
             ],
         }
         assert calendar_perspective(event) == (True, "accepted")

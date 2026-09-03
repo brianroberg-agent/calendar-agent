@@ -116,7 +116,11 @@ SAMPLE_EVENTS = {
         start_hours_from_now=1,
         duration_hours=0.5,
         attendees=[
-            {"email": "alice@example.com", "displayName": "Alice Smith", "responseStatus": "accepted"},
+            {
+                "email": "alice@example.com",
+                "displayName": "Alice Smith",
+                "responseStatus": "accepted",
+            },
             {"email": "bob@example.com", "displayName": "Bob Jones", "responseStatus": "tentative"},
         ],
     ),
