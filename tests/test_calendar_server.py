@@ -16,10 +16,12 @@ from calendar_agent.exceptions import (
 )
 from calendar_agent.proxy_client import (
     CONFIRM_TIMEOUT,
+    CONFIRM_TIMEOUT_MARGIN,
     PROXY_CONFIRMATION_WINDOW,
     READ_TIMEOUT,
     CalendarProxyClient,
     resolve_confirm_timeout,
+    resolve_confirmation_window,
 )
 
 # ============================================================================
@@ -952,6 +954,53 @@ class TestConfirmTimeoutResolution:
         """A typo must fail loudly rather than fall back to a short default."""
         with pytest.raises(ProxyConfigError):
             resolve_confirm_timeout("5 minutes")
+
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "NaN", "Infinity"])
+    def test_non_finite_override_is_rejected(self, raw):
+        """float('nan') parses and compares False against everything, so the
+        old ``<= window`` guard let it through; ``inf`` disables the timeout.
+        Neither is a budget that outlives anything."""
+        with pytest.raises(ProxyConfigError):
+            resolve_confirm_timeout(raw)
+
+    @pytest.mark.parametrize("raw", ["301", "329.9"])
+    def test_override_inside_the_margin_is_rejected(self, raw):
+        """Clearing the window by a second is not clearing it: the proxy's own
+        timeout, its response, and the network all sit inside that gap."""
+        with pytest.raises(ProxyConfigError) as exc_info:
+            resolve_confirm_timeout(raw)
+        assert str(int(PROXY_CONFIRMATION_WINDOW + CONFIRM_TIMEOUT_MARGIN)) in str(
+            exc_info.value
+        )
+
+    def test_override_at_window_plus_margin_is_accepted(self):
+        assert resolve_confirm_timeout("330") == 330.0
+
+    def test_guard_follows_an_overridden_confirmation_window(self):
+        """The window is api-proxy's ``--confirmation-timeout``, not a law of
+        nature; an operator who raises it there must be able to keep this
+        guard honest, or it passes while the invariant is violated (F5)."""
+        with pytest.raises(ProxyConfigError):
+            resolve_confirm_timeout("330", window=600.0)
+        assert resolve_confirm_timeout("630", window=600.0) == 630.0
+
+
+class TestConfirmationWindowResolution:
+    """``PROXY_CONFIRMATION_WINDOW`` mirrors api-proxy's confirmation timeout."""
+
+    def test_default_matches_api_proxy_default(self):
+        assert resolve_confirmation_window(None) == 300.0
+
+    def test_override_is_honoured(self):
+        assert resolve_confirmation_window("600") == 600.0
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "five"])
+    def test_unbounded_or_invalid_window_is_rejected(self, raw):
+        """api-proxy treats ``<= 0`` as "wait forever" — a window no client
+        timeout can outlive, so the guard cannot be honest and must say so."""
+        with pytest.raises(ProxyConfigError) as exc_info:
+            resolve_confirmation_window(raw)
+        assert "PROXY_CONFIRMATION_WINDOW" in str(exc_info.value)
 
 
 class TestMissingEventStatus:

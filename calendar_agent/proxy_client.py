@@ -1,5 +1,6 @@
 """HTTP client for communicating with the Calendar API proxy server."""
 
+import math
 import os
 from typing import Any
 from urllib.parse import quote
@@ -22,37 +23,86 @@ PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8000")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 
 # Read operations answer immediately; mutations block in the proxy while a
-# human operator approves them (a 300s window server-side). The mutation
-# timeout must outlive that window, or the approval/rejection outcome is
-# undeliverable and the operation completes unobserved (see issue #4).
+# human operator approves them (a 300s window server-side by default). The
+# mutation timeout must outlive that window, or the approval/rejection outcome
+# is undeliverable and the operation completes unobserved (see issue #4).
 READ_TIMEOUT = 30.0
 
-# api-proxy's own ``confirmation_timeout`` (src/api_proxy/config.py). Kept here
-# as a named constant so the mismatch that caused issue #4 is checkable rather
-# than folklore.
-PROXY_CONFIRMATION_WINDOW = 300.0
-DEFAULT_CONFIRM_TIMEOUT = 330.0
+# The proxy's window is api-proxy's ``--confirmation-timeout`` (300s unless
+# its operator changed it; ``<= 0`` there means wait forever). api-proxy does
+# not publish the value on ``/health``, so this side has to be told: the
+# ``PROXY_CONFIRMATION_WINDOW`` env var must be kept in step with the proxy's
+# flag by hand. It is a named, checkable number here so the mismatch that
+# caused issue #4 is a configuration error rather than folklore.
+DEFAULT_PROXY_CONFIRMATION_WINDOW = 300.0
+
+# How far past the window the mutation budget must reach. The proxy's own
+# timeout firing, its 403 travelling back, and the network all happen inside
+# this gap; a budget that clears the window by a second is not clearing it.
+CONFIRM_TIMEOUT_MARGIN = 30.0
 
 
-def resolve_confirm_timeout(raw: str | None) -> float:
-    """Resolve the mutation timeout from its raw ``PROXY_CONFIRM_TIMEOUT`` value.
+def _finite_seconds(raw: str, name: str) -> float:
+    """Parse ``raw`` as a finite number of seconds, or raise ProxyConfigError.
 
-    Refuses anything that does not outlive the proxy's approval window. A
-    shorter budget is not a tuning choice: it makes every approval and
-    rejection undeliverable, so mutations complete unobserved (issue #4).
+    ``float("nan")`` and ``float("inf")`` parse cleanly and compare False
+    against every bound, so a plain numeric check lets them through; ``nan``
+    then becomes an httpx timeout that is neither bounded nor infinite.
     """
-    if raw is None:
-        return DEFAULT_CONFIRM_TIMEOUT
     try:
-        timeout = float(raw)
+        value = float(raw)
     except ValueError as e:
         raise ProxyConfigError(
-            f"PROXY_CONFIRM_TIMEOUT must be a number of seconds, got {raw!r}"
+            f"{name} must be a number of seconds, got {raw!r}"
         ) from e
-    if timeout <= PROXY_CONFIRMATION_WINDOW:
+    if not math.isfinite(value):
+        raise ProxyConfigError(f"{name} must be a finite number of seconds, got {raw!r}")
+    return value
+
+
+def resolve_confirmation_window(raw: str | None) -> float:
+    """Resolve the proxy's approval window from ``PROXY_CONFIRMATION_WINDOW``.
+
+    Refuses ``<= 0``: api-proxy reads that as "wait forever", a window no
+    client timeout can outlive, so the guard below could not be honest.
+    """
+    if raw is None:
+        return DEFAULT_PROXY_CONFIRMATION_WINDOW
+    window = _finite_seconds(raw, "PROXY_CONFIRMATION_WINDOW")
+    if window <= 0:
+        raise ProxyConfigError(
+            f"PROXY_CONFIRMATION_WINDOW is {raw!r}; api-proxy treats a non-positive "
+            "--confirmation-timeout as 'wait forever', which no client timeout can "
+            "outlive. Give the proxy a finite window and mirror it here"
+        )
+    return window
+
+
+PROXY_CONFIRMATION_WINDOW = resolve_confirmation_window(
+    os.environ.get("PROXY_CONFIRMATION_WINDOW")
+)
+DEFAULT_CONFIRM_TIMEOUT = PROXY_CONFIRMATION_WINDOW + CONFIRM_TIMEOUT_MARGIN
+
+
+def resolve_confirm_timeout(
+    raw: str | None, window: float = PROXY_CONFIRMATION_WINDOW
+) -> float:
+    """Resolve the mutation timeout from its raw ``PROXY_CONFIRM_TIMEOUT`` value.
+
+    Refuses anything that does not outlive the proxy's approval window by
+    ``CONFIRM_TIMEOUT_MARGIN``. A shorter budget is not a tuning choice: it
+    makes every approval and rejection undeliverable, so mutations complete
+    unobserved (issue #4).
+    """
+    floor = window + CONFIRM_TIMEOUT_MARGIN
+    if raw is None:
+        return floor
+    timeout = _finite_seconds(raw, "PROXY_CONFIRM_TIMEOUT")
+    if timeout < floor:
         raise ProxyConfigError(
             f"PROXY_CONFIRM_TIMEOUT is {timeout:.0f}s, which does not outlive the "
-            f"proxy's {PROXY_CONFIRMATION_WINDOW:.0f}s operator-approval window; "
+            f"proxy's {window:.0f}s operator-approval window by the required "
+            f"{CONFIRM_TIMEOUT_MARGIN:.0f}s margin (minimum {floor:.0f}s); "
             "mutations would time out client-side and complete unobserved"
         )
     return timeout

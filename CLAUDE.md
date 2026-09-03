@@ -89,9 +89,15 @@ uv run pytest --cov=calendar_agent  # With coverage
   mutation may still be applied when the operator approves it, and treating
   that as failure is what produced the duplicate-event incident in issue #4.
   An unknown outcome outranks a definite failure when picking the status code
-- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default 330s;
-  `resolve_confirm_timeout` refuses any value that does not outlive the
-  proxy's 300s confirmation window); reads use `READ_TIMEOUT`
+- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default
+  window + 30s = 330s; `resolve_confirm_timeout` refuses `nan`/`inf` and any
+  value below `PROXY_CONFIRMATION_WINDOW + CONFIRM_TIMEOUT_MARGIN`); reads
+  use `READ_TIMEOUT`
+- `PROXY_CONFIRMATION_WINDOW` (env, default 300s) is a *copy* of api-proxy's
+  `--confirmation-timeout`, which the proxy does not expose on `/health`. The
+  guard is honest only while the two are kept in step by hand; changing one
+  without the other re-creates issue #4 silently. Refuses `<= 0` (the proxy
+  reads that as "wait forever", which nothing can outlive)
 
 ### Wrapper Scripts
 

@@ -57,7 +57,21 @@ Required environment variables:
 | `LLM_URL` | URL of the local LLM server | `http://localhost:8080/v1/chat/completions` |
 | `LLM_MODEL` | Model name for LLM requests | `qwen/qwen3-14b` |
 | `CALENDAR_AGENT_PORT` | Port for the calendar agent server | `8082` |
-| `PROXY_CONFIRM_TIMEOUT` | Client timeout (seconds) for mutations, which block in the proxy while a human operator approves them; must exceed the proxy's 300s confirmation window | `330` |
+| `PROXY_CONFIRMATION_WINDOW` | How long (seconds) api-proxy waits for a human to approve a mutation — **must mirror the proxy's `--confirmation-timeout` by hand** (see [Coupling with api-proxy](#coupling-with-api-proxy)). Must be finite and positive | `300` |
+| `PROXY_CONFIRM_TIMEOUT` | Client timeout (seconds) for mutations, which block in the proxy while a human operator approves them. Must be at least `PROXY_CONFIRMATION_WINDOW` + 30s; the server refuses to start otherwise, and refuses `nan`/`inf` | `330` (window + 30) |
+
+#### Coupling with api-proxy
+
+Mutations block inside api-proxy until a human approves them, for at most the
+proxy's `--confirmation-timeout` (300s by default; `0` or less means *wait
+forever*). This server's mutation timeout must outlive that window, or every
+approval and rejection arrives after the client has given up and the
+operation completes unobserved (issue #4). The proxy does not publish its
+window on `/health`, so the check is only as honest as its inputs: **if you
+change `--confirmation-timeout` on the proxy, change `PROXY_CONFIRMATION_WINDOW`
+here to match** (and set `PROXY_CONFIRM_TIMEOUT` at least 30s above it, or
+leave it unset to follow automatically). A proxy configured to wait forever
+cannot be mirrored — set a finite window on both sides.
 
 ### Running the Server
 
