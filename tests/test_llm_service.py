@@ -217,6 +217,10 @@ class TestPrepareBriefingAttendeeCount:
         mock_provider = AsyncMock()
         mock_provider.generate.return_value = "briefing"
         service = LLMService(provider=mock_provider)
-        event = {"summary": "Standup", "start": {"dateTime": "2024-01-15T10:00:00Z"}, "attendees": [None]}
+        event = {
+            "summary": "Standup",
+            "start": {"dateTime": "2024-01-15T10:00:00Z"},
+            "attendees": [None],
+        }
         await service.prepare_briefing([event], briefing_type="daily")
         assert "attendees)" not in mock_provider.generate.call_args.args[1]
