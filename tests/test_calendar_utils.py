@@ -16,10 +16,7 @@ from calendar_agent.calendar_utils import (
     get_now_rfc3339,
     get_time_range_rfc3339,
     is_all_day_event,
-    is_own_calendar,
-    normalize_email,
     parse_attendee_name,
-    user_perspective,
 )
 
 # ============================================================================
@@ -423,6 +420,7 @@ def test_find_free_slots_all_day_event():
     assert len(slots) == 0
 
 
+
 # ============================================================================
 # Tests for the organizer / RSVP perspective helpers (issue #9)
 #
@@ -430,13 +428,13 @@ def test_find_free_slots_all_day_event():
 # "whether this entry represents the calendar on which this copy of the
 # event appears", and ``organizer.self`` is "whether the organizer
 # corresponds to the calendar on which this copy of the event appears".
-# So the ``self`` flags describe the CALENDAR BEING READ, never the
-# authenticated user. The authenticated user's own view must be derived by
-# email instead, except on their own calendar where the two coincide.
+# So the ``self`` flags describe the CALENDAR BEING READ (``calendar_id``),
+# never the authenticated user -- the two coincide only on the user's own
+# calendar.
 # ============================================================================
 
 
-def _invitation(*, calendar_entry_status="accepted", user_entry_status="declined"):
+def _invitation(*, calendar_entry_status="accepted"):
     """A colleague's copy of an invitation from Dave: the colleague's entry
     carries self:true (it is their calendar); the authenticated user's
     entry does not."""
@@ -445,42 +443,32 @@ def _invitation(*, calendar_entry_status="accepted", user_entry_status="declined
         "organizer": {"email": "dave@example.com", "displayName": "Dave", "self": False},
         "attendees": [
             {"email": "carol@example.com", "self": True, "responseStatus": calendar_entry_status},
-            {"email": "me@example.com", "responseStatus": user_entry_status},
+            {"email": "me@example.com", "responseStatus": "declined"},
             {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
         ],
     }
 
 
-class TestNormalizeEmail:
-    def test_strips_and_lowercases_ascii(self):
-        assert normalize_email("  Me@Example.COM ") == "me@example.com"
-
-    def test_non_string_is_empty(self):
-        assert normalize_email(None) == ""
-        assert normalize_email(42) == ""
-
-    def test_only_ascii_case_is_folded(self):
-        # U+212A KELVIN SIGN lowercases to ASCII "k" under str.lower(); a
-        # crafted attendee address must not collide with a real one.
-        assert normalize_email("Kim@example.com") != "kim@example.com"
-
-
 class TestCalendarPerspective:
     def test_self_flags_describe_the_calendar_being_read(self):
-        is_organizer, state = calendar_perspective(_invitation())
-        assert is_organizer is False
-        assert state == "accepted"  # Carol's entry, not me@'s "declined"
+        p = calendar_perspective(_invitation())
+        assert p.is_organizer is False
+        assert p.response_status == "accepted"  # Carol's entry, not me@'s "declined"
+        assert p.rsvp_state == "accepted"
+
+    def test_is_a_plain_tuple_too(self):
+        assert calendar_perspective(_invitation()) == (False, "accepted", "accepted")
 
     def test_calendar_organizes_with_no_attendees(self):
         event = {"organizer": {"email": "carol@example.com", "self": True}}
-        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
+        assert calendar_perspective(event) == (True, None, "organizer_no_rsvp")
 
     def test_calendar_organizes_but_is_not_in_attendee_list(self):
         event = {
             "organizer": {"email": "carol@example.com", "self": True},
             "attendees": [{"email": "alice@example.com", "responseStatus": "needsAction"}],
         }
-        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
+        assert calendar_perspective(event) == (True, None, "organizer_no_rsvp")
 
     def test_organizer_as_attendee_without_response_status_is_organizer_no_rsvp(self):
         # The organizer's own attendee entry exists but Google omitted the
@@ -492,7 +480,7 @@ class TestCalendarPerspective:
                 {"email": "alice@example.com", "responseStatus": "accepted"},
             ],
         }
-        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
+        assert calendar_perspective(event) == (True, None, "organizer_no_rsvp")
 
     def test_organizer_as_attendee_with_status_reports_the_status(self):
         event = {
@@ -502,14 +490,14 @@ class TestCalendarPerspective:
                  "responseStatus": "accepted"},
             ],
         }
-        assert calendar_perspective(event) == (True, "accepted")
+        assert calendar_perspective(event) == (True, "accepted", "accepted")
 
     def test_attendee_entry_without_response_status_is_unknown(self):
         event = {
             "organizer": {"email": "dave@example.com", "self": False},
             "attendees": [{"email": "carol@example.com", "self": True}],
         }
-        assert calendar_perspective(event) == (False, "unknown")
+        assert calendar_perspective(event) == (False, None, "unknown")
 
     def test_not_organizer_and_not_attendee(self):
         # The fourth null cause the PR's docs missed: neither organizer nor
@@ -519,61 +507,26 @@ class TestCalendarPerspective:
             "organizer": {"email": "dave@example.com", "self": False},
             "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
         }
-        assert calendar_perspective(event) == (False, "not_attendee")
+        assert calendar_perspective(event) == (False, None, "not_attendee")
 
     def test_cancelled_stub_with_no_organizer_or_attendees_is_unknown(self):
         # showDeleted=true returns cancelled recurring-instance stubs that
         # carry neither organizer nor attendees; nothing to classify from.
-        assert calendar_perspective({"status": "cancelled"}) == (False, "unknown")
+        assert calendar_perspective({"status": "cancelled"}) == (False, None, "unknown")
 
     def test_needs_action_passes_through(self):
         event = _invitation(calendar_entry_status="needsAction")
-        assert calendar_perspective(event) == (False, "needsAction")
+        assert calendar_perspective(event) == (False, "needsAction", "needsAction")
 
-    def test_unrecognised_response_status_is_unknown_not_an_error(self):
+    def test_unrecognised_response_status_is_unknown_but_raw_value_is_kept(self):
+        # A value this service does not know is not an error: the derived
+        # state says "unknown" and the raw value is still reported verbatim.
         event = _invitation(calendar_entry_status="somethingNew")
-        assert calendar_perspective(event) == (False, "unknown")
+        assert calendar_perspective(event) == (False, "somethingNew", "unknown")
 
-
-class TestUserPerspective:
-    def test_matches_the_users_entry_by_email(self):
-        assert user_perspective(_invitation(), "me@example.com") == (False, "declined")
-
-    def test_email_match_is_case_insensitive_and_trimmed(self):
-        assert user_perspective(_invitation(), " ME@Example.com ") == (False, "declined")
-
-    def test_user_is_organizer_by_email(self):
-        assert user_perspective(_invitation(), "dave@example.com") == (True, "accepted")
-
-    def test_user_organizes_but_has_no_entry(self):
-        event = {
-            "organizer": {"email": "me@example.com", "self": False},
-            "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
-        }
-        assert user_perspective(event, "me@example.com") == (True, "organizer_no_rsvp")
-
-    def test_user_absent_from_event_is_not_attendee(self):
-        assert user_perspective(_invitation(), "nobody@example.com") == (False, "not_attendee")
-
-    def test_empty_email_never_matches(self):
-        # A blank identity must not match a blank/missing attendee email.
-        event = {"organizer": {"email": ""}, "attendees": [{"responseStatus": "accepted"}]}
-        assert user_perspective(event, "") == (False, "not_attendee")
-
-
-class TestIsOwnCalendar:
-    def test_primary_is_always_own(self):
-        assert is_own_calendar("primary", None) is True
-        assert is_own_calendar("primary", "me@example.com") is True
-
-    def test_own_address_is_own(self):
-        assert is_own_calendar("Me@Example.com", "me@example.com") is True
-
-    def test_other_calendar_is_not_own(self):
-        assert is_own_calendar("carol@example.com", "me@example.com") is False
-
-    def test_unresolved_user_cannot_claim_an_address(self):
-        assert is_own_calendar("me@example.com", None) is False
+    def test_non_string_response_status_is_reported_as_none(self):
+        event = _invitation(calendar_entry_status=42)
+        assert calendar_perspective(event) == (False, None, "unknown")
 
 
 class TestResponseStatusVocabularies:

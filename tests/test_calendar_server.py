@@ -24,7 +24,7 @@ from calendar_agent.proxy_client import (
     resolve_confirm_timeout,
     resolve_confirmation_window,
 )
-from tests.factories import get_sample_event
+from tests.factories import SAMPLE_EVENTS, make_event
 
 # ============================================================================
 # Health Endpoint Tests
@@ -114,114 +114,115 @@ class TestCalendarsEndpoint:
 
 
 class TestEventToSummary:
-    """Tests for event_to_summary(): organizer exposure and response_status
-    disambiguation (issue #9).
+    """event_to_summary(): organizer exposure and RSVP state (issue #9).
 
-    ``response_status`` reflects the *authenticated user's* RSVP on this
-    event, not anything about the calendar owner (case 3 in the issue) and
-    not always "hasn't responded" when null (cases 1 and 2).
+    Google defines ``attendees[].self`` / ``organizer.self`` relative to the
+    calendar the event copy sits on, so every ``calendar_*`` field describes
+    the calendar named by ``calendar_id`` -- which is the authenticated user
+    only when that calendar is the user's own.
     """
 
-    def test_exposes_organizer_email_and_is_organizer_false_for_invitee(self):
-        """An event organized by someone else exposes organizer_email and
-        is_organizer=False."""
-        event = get_sample_event(
-            organizer={"email": "carol@example.com", "displayName": "Carol", "self": False},
+    @staticmethod
+    def _carols_copy():
+        """Carol's calendar's copy of Dave's invitation: Carol's entry is the
+        self entry; the authenticated user (me@) is a plain attendee."""
+        return make_event(
+            organizer={"email": "dave@example.com", "displayName": "Dave", "self": False},
+            creator={"email": "dave@example.com"},
             attendees=[
-                {"email": "me@example.com", "self": True, "responseStatus": "accepted"},
+                {"email": "carol@example.com", "self": True, "responseStatus": "accepted"},
+                {"email": "me@example.com", "responseStatus": "declined"},
             ],
         )
-        summary = event_to_summary(event, "primary")
-        assert summary.organizer_email == "carol@example.com"
-        assert summary.is_organizer is False
-        assert summary.response_status == "accepted"
 
-    def test_self_organized_event_with_no_attendees(self):
-        """Case 1: an event you created for yourself, no attendee list at
-        all. response_status is null, but is_organizer=True and
-        attendee_count=0 together say why: there is no RSVP to report."""
-        event = get_sample_event(
-            organizer={"email": "me@example.com", "self": True},
-            attendees=None,
+    def test_self_flags_describe_the_calendar_being_read(self):
+        summary = event_to_summary(self._carols_copy(), "carol@example.com")
+        assert summary.calendar_id == "carol@example.com"
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_response_status == "accepted"  # Carol's RSVP, not me@'s
+        assert summary.calendar_rsvp_state == "accepted"
+        assert summary.organizer_email == "dave@example.com"
+        assert summary.creator_email == "dave@example.com"
+
+    def test_no_field_claims_to_be_the_authenticated_users_rsvp(self):
+        """The old contract (is_organizer / response_status "of the
+        authenticated user") is gone: nothing on the wire is named as if it
+        described the caller rather than the calendar."""
+        dumped = event_to_summary(self._carols_copy(), "carol@example.com").model_dump()
+        assert "is_organizer" not in dumped
+        assert "response_status" not in dumped
+        assert not any(k.startswith("user_") for k in dumped)
+
+    def test_pending_invitation_on_own_calendar(self):
+        event = make_event(
+            organizer={"email": "dave@example.com", "self": False},
+            attendees=[{"email": "me@example.com", "self": True, "responseStatus": "needsAction"}],
         )
         summary = event_to_summary(event, "primary")
-        assert summary.is_organizer is True
-        assert summary.organizer_email == "me@example.com"
-        assert summary.attendee_count == 0
-        assert summary.response_status is None
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_response_status == "needsAction"
+        assert summary.calendar_rsvp_state == "needsAction"
 
-    def test_organizer_not_in_attendee_list_is_disambiguated(self):
-        """Case 2 (the dangerous one): you organize the event, there ARE
-        attendees, but you are not present in the attendee list yourself.
-        response_status is still null -- but is_organizer=True now makes it
-        unambiguous that this is your own event, not an unanswered
-        invitation, even though attendee_count > 0."""
-        event = get_sample_event(
+    def test_own_event_with_attendees_but_no_own_entry(self):
+        """The dangerous null from issue #9: the calendar organizes, others
+        are invited, the calendar has no attendee entry of its own. Reads as
+        the calendar's own event, not an unanswered invitation."""
+        event = make_event(
             organizer={"email": "me@example.com", "self": True},
+            creator={"email": "me@example.com", "self": True},
             attendees=[
                 {"email": "alice@example.com", "responseStatus": "accepted"},
                 {"email": "bob@example.com", "responseStatus": "needsAction"},
             ],
         )
         summary = event_to_summary(event, "primary")
-        assert summary.is_organizer is True
         assert summary.attendee_count == 2
-        assert summary.response_status is None
+        assert summary.calendar_is_organizer is True
+        assert summary.calendar_response_status is None
+        assert summary.calendar_rsvp_state == "organizer_no_rsvp"
 
-    def test_self_attendee_missing_response_status_key_stays_ambiguous(self):
-        """Case 3: a self attendee record exists but Google omitted the
-        responseStatus key. This is the one case that legitimately stays
-        null+ambiguous -- but it is now distinguishable from case 2 because
-        is_organizer is False here."""
-        event = get_sample_event(
-            organizer={"email": "carol@example.com", "self": False},
-            attendees=[
-                {"email": "me@example.com", "self": True},
-                {"email": "carol@example.com"},
-            ],
+    def test_group_calendar_native_event_names_the_calendar_and_the_creator(self):
+        """An event created directly on a group calendar: Google makes the
+        calendar itself the organizer (email == calendar id, self:true); the
+        person who created it is only in ``creator``."""
+        group = "abc123@group.calendar.google.com"
+        event = make_event(
+            organizer={"email": group, "displayName": "Team Calendar", "self": True},
+            creator={"email": "me@example.com"},
+            attendees=None,
+        )
+        summary = event_to_summary(event, group)
+        assert summary.calendar_is_organizer is True
+        assert summary.calendar_rsvp_state == "organizer_no_rsvp"
+        assert summary.organizer_email == group
+        assert summary.creator_email == "me@example.com"
+
+    def test_calendar_neither_organizes_nor_attends(self):
+        event = make_event(
+            organizer={"email": "dave@example.com", "self": False},
+            attendees=[{"email": "alice@example.com", "responseStatus": "accepted"}],
         )
         summary = event_to_summary(event, "primary")
-        assert summary.is_organizer is False
-        assert summary.attendee_count == 2
-        assert summary.response_status is None
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_response_status is None
+        assert summary.calendar_rsvp_state == "not_attendee"
 
-    def test_response_status_needs_action(self):
-        """A pending invitation reads back needsAction, not null -- and
-        needsAction is NOT one of the three values /respond accepts."""
-        event = get_sample_event(
-            organizer={"email": "carol@example.com", "self": False},
-            attendees=[
-                {"email": "me@example.com", "self": True, "responseStatus": "needsAction"},
-            ],
-        )
+    def test_cancelled_recurring_stub_is_unknown_not_own_event(self):
+        event = make_event(organizer=None, attendees=None, status="cancelled")
         summary = event_to_summary(event, "primary")
-        assert summary.response_status == "needsAction"
-
-    def test_response_status_reflects_authenticated_user_not_calendar_owner(self):
-        """On a colleague's calendar (calendar_id != the authenticated
-        user), response_status is still the authenticated user's own RSVP,
-        never the calendar owner's -- self:true always marks the
-        authenticated user, per Google's contract."""
-        event = get_sample_event(
-            organizer={"email": "carol@example.com", "self": False},
-            attendees=[
-                {"email": "carol@example.com", "responseStatus": "accepted"},
-                {"email": "me@example.com", "self": True, "responseStatus": "declined"},
-            ],
-        )
-        summary = event_to_summary(event, "carol@example.com")
-        assert summary.calendar_id == "carol@example.com"
-        assert summary.response_status == "declined"
-
-    def test_no_organizer_key_defaults_safely(self):
-        """An event dict with no organizer key at all (shouldn't happen per
-        the Google API, but defend anyway) doesn't raise and reports
-        is_organizer=False."""
-        event = get_sample_event(organizer=None, attendees=None)
-        event.pop("organizer", None)
-        summary = event_to_summary(event, "primary")
-        assert summary.is_organizer is False
+        assert summary.status == "cancelled"
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_rsvp_state == "unknown"
         assert summary.organizer_email is None
+        assert summary.creator_email is None
+
+    def test_attendee_addresses_are_not_on_the_wire(self):
+        """Brian's 2026-09-03 decision: organizer and creator addresses are
+        exposed; the attendee list is still only a count."""
+        dumped = event_to_summary(self._carols_copy(), "carol@example.com").model_dump_json()
+        assert "carol@example.com" in dumped  # it is the calendar_id
+        assert "me@example.com" not in dumped
+        assert "attendees" not in dumped
 
 
 class TestEventsListEndpoint:
@@ -276,6 +277,56 @@ class TestEventsListEndpoint:
         response = client.get("/calendars/primary/events")
         data = response.json()
         assert data["next_page_token"] == "next_page_123"
+
+
+class TestRsvpFieldsOnTheWire:
+    """The organizer/RSVP fields as list and search actually emit them."""
+
+    def test_list_on_primary(self, client, mock_proxy_client):
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["invitation"]]}
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 200
+        event = response.json()["events"][0]
+        assert event["organizer_email"] == "dave@example.com"
+        assert event["creator_email"] == "dave@example.com"
+        assert event["calendar_is_organizer"] is False
+        assert event["calendar_response_status"] == "needsAction"
+        assert event["calendar_rsvp_state"] == "needsAction"
+        assert event["status"] == "confirmed"
+        assert "is_organizer" not in event
+        assert "response_status" not in event
+
+    def test_list_on_colleague_calendar_reports_the_colleagues_rsvp(
+        self, client, mock_proxy_client
+    ):
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["colleague_copy"]]}
+        response = client.get("/calendars/carol@example.com/events")
+        assert response.status_code == 200
+        event = response.json()["events"][0]
+        assert event["calendar_id"] == "carol@example.com"
+        assert event["calendar_rsvp_state"] == "accepted"  # Carol's, not john.doe's "declined"
+        assert not any(k.startswith("user_") for k in event)
+
+    def test_search_on_colleague_calendar_reports_the_colleagues_rsvp(
+        self, client, mock_proxy_client
+    ):
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["colleague_copy"]]}
+        response = client.post(
+            "/search", json={"calendar_id": "carol@example.com", "filters": {"query": "Budget"}}
+        )
+        assert response.status_code == 200
+        event = response.json()["events"][0]
+        assert event["calendar_is_organizer"] is False
+        assert event["calendar_response_status"] == "accepted"
+        assert event["calendar_rsvp_state"] == "accepted"
+
+    def test_read_needs_no_extra_proxy_call(self, client, mock_proxy_client):
+        """Deriving the calendar's perspective is local: one proxy call per
+        list, nothing to resolve the caller's identity."""
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["colleague_copy"]]}
+        assert client.get("/calendars/carol@example.com/events").status_code == 200
+        assert mock_proxy_client.list_events.await_count == 1
+        assert mock_proxy_client.get_calendar.await_count == 0
 
 
 class TestEventCreateEndpoint:

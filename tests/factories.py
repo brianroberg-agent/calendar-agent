@@ -165,6 +165,38 @@ SAMPLE_EVENTS = {
             for i in range(50)
         ],
     ),
+    # The authenticated user's (john.doe@example.com, per SAMPLE_CALENDARS)
+    # own copy of an invitation: their entry carries self:true.
+    "invitation": {**get_sample_event(
+        event_id="invite_001",
+        summary="Budget Review",
+        description="Quarterly budget walkthrough",
+        location=None,
+        start_hours_from_now=5,
+        duration_hours=1,
+        organizer={"email": "dave@example.com", "displayName": "Dave Organizer", "self": False},
+        attendees=[
+            {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
+            {"email": "john.doe@example.com", "self": True, "responseStatus": "needsAction"},
+            {"email": "alice@example.com", "responseStatus": "accepted"},
+        ],
+    ), "creator": {"email": "dave@example.com"}},
+    # Carol's calendar's copy of the same invitation: Carol's entry is the
+    # self entry and the authenticated user is a plain attendee.
+    "colleague_copy": {**get_sample_event(
+        event_id="invite_001",
+        summary="Budget Review",
+        description="Quarterly budget walkthrough",
+        location=None,
+        start_hours_from_now=5,
+        duration_hours=1,
+        organizer={"email": "dave@example.com", "displayName": "Dave Organizer", "self": False},
+        attendees=[
+            {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
+            {"email": "carol@example.com", "self": True, "responseStatus": "accepted"},
+            {"email": "john.doe@example.com", "responseStatus": "declined"},
+        ],
+    ), "creator": {"email": "dave@example.com"}},
     "past_event": get_sample_event(
         event_id="past_001",
         summary="Yesterday's Meeting",
@@ -179,6 +211,7 @@ def make_event(
     event_id: str = "event_static",
     summary: str = "Planning Meeting",
     organizer: dict[str, Any] | None = None,
+    creator: dict[str, Any] | None = None,
     attendees: list[dict[str, Any]] | None = None,
     status: str | None = "confirmed",
 ) -> dict[str, Any]:
@@ -186,9 +219,9 @@ def make_event(
 
     Unlike ``get_sample_event`` (which stamps times relative to *now*), every
     field here is fixed, so organizer/RSVP tests are deterministic and the
-    dict can be compared whole. ``organizer`` / ``attendees`` are omitted from
-    the dict when None, matching what Google returns for events that carry
-    neither (e.g. cancelled recurring-instance stubs).
+    dict can be compared whole. ``organizer`` / ``creator`` / ``attendees``
+    are omitted from the dict when None, matching what Google returns for
+    events that carry none of them (e.g. cancelled recurring-instance stubs).
     """
     event: dict[str, Any] = {
         "id": event_id,
@@ -201,6 +234,8 @@ def make_event(
         event["status"] = status
     if organizer is not None:
         event["organizer"] = organizer
+    if creator is not None:
+        event["creator"] = creator
     if attendees is not None:
         event["attendees"] = attendees
     return event
