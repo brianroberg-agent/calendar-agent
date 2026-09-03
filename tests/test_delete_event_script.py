@@ -11,6 +11,7 @@ re-reading the event rather than by trusting the delete's own answer.
 """
 
 import json
+import shutil
 import subprocess
 import threading
 import time
@@ -25,20 +26,25 @@ EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_UNKNOWN = 2
 EXIT_NOT_FOUND = 3
+EXIT_USAGE = 4
+
+EVENT_PATH = "/calendars/primary/events/event_1"
+ROUTER_404 = {"status": 404, "body": {"detail": "Not Found"}}  # FastAPI, no envelope
 
 
 class _FakeAgentHandler(BaseHTTPRequestHandler):
-    """Serves whatever ``server.script`` says, and records what was asked."""
+    """Serves ``server.script`` for the one real event route, and records what
+    was asked. Any other path gets FastAPI's bare router 404, so a script that
+    drops a path segment or hits a misconfigured base URL is caught (F10)."""
 
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):  # noqa: A003 - silence stderr noise
         pass
 
-    def handle_error(self, *args):
-        """A client that timed out and hung up is the scenario, not an error."""
-
     def _respond(self, spec: dict) -> None:
+        if self.path != EVENT_PATH:
+            spec = ROUTER_404
         if spec.get("delay"):
             time.sleep(spec["delay"])
         payload = json.dumps(spec.get("body", {})).encode()
@@ -48,7 +54,7 @@ class _FakeAgentHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             # curl hit --max-time and closed the socket: exactly what the
             # timeout scenarios are simulating.
             self.close_connection = True
@@ -81,16 +87,34 @@ def fake_agent():
     thread.join(timeout=5)
 
 
-def run_script(fake_agent, *, event_id="event_1", max_time="5"):
+def run_script(
+    fake_agent,
+    *,
+    event_id="event_1",
+    max_time="5",
+    url=None,
+    extra_env=None,
+    path="/usr/bin:/bin:/usr/local/bin",
+):
+    # The stub answers in seconds, so its "mutation budget" is declared as 0:
+    # the script's deadline floor is relative to it (F1).
+    env = {
+        "PATH": path,
+        "CALENDAR_AGENT_URL": url or fake_agent.url,
+        "CALENDAR_AGENT_CONFIRM_TIMEOUT": "0",
+    }
+    if max_time is not None:
+        env["CALENDAR_DELETE_MAX_TIME"] = max_time
+    for key, value in (extra_env or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     return subprocess.run(
         [str(SCRIPT), event_id, "primary"],
         capture_output=True,
         text=True,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "CALENDAR_AGENT_URL": fake_agent.url,
-            "CALENDAR_DELETE_MAX_TIME": max_time,
-        },
+        env=env,
         timeout=60,
     )
 
@@ -119,10 +143,11 @@ class TestVerifiedSuccess:
         assert result.returncode == EXIT_SUCCESS
         assert "RESULT: SUCCESS" in result.stdout
 
-    def test_re_read_happens_after_the_delete(self, fake_agent):
+    def test_exactly_one_delete_then_one_get_on_the_event_route(self, fake_agent):
+        """Both requests must hit the real route with both ids in place (F10:
+        a stub that answered any path let a dropped calendar segment pass)."""
         run_script(fake_agent)
-        methods = [method for method, _ in fake_agent.calls]
-        assert methods == ["DELETE", "GET"]
+        assert fake_agent.calls == [("DELETE", EVENT_PATH), ("GET", EVENT_PATH)]
 
 
 class TestDefiniteFailure:
@@ -197,6 +222,33 @@ class TestUnknownOutcome:
         assert result.returncode == EXIT_UNKNOWN
         assert "RESULT: UNKNOWN" in result.stdout
 
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    def test_server_error_with_event_still_present_is_unknown(self, fake_agent, status):
+        """F2: calendar-agent answers 502 for a transport fault *after* the
+        request reached the proxy, where it stays queued for approval. A 5xx
+        is therefore not "nothing outstanding" — reporting FAILURE invites the
+        compensating create the whole script exists to prevent."""
+        fake_agent.script["delete"] = {
+            "status": status,
+            "body": {"success": False, "error": "Proxy error: connection reset"},
+        }
+        fake_agent.script["get"] = confirmed_event()
+        result = run_script(fake_agent)
+        assert result.returncode == EXIT_UNKNOWN
+        assert "RESULT: UNKNOWN" in result.stdout
+
+    def test_verify_has_its_own_shorter_deadline(self, fake_agent):
+        """F1: the DELETE deadline must outlive the operator window, but the
+        re-read is an ordinary 30s-bounded GET and must not inherit a 340s
+        wait. A slow re-read is inconclusive, and the DELETE is untouched."""
+        fake_agent.script["get"] = {**confirmed_event(), "delay": 3}
+        result = run_script(
+            fake_agent, max_time="5", extra_env={"CALENDAR_DELETE_VERIFY_MAX_TIME": "1"}
+        )
+        assert result.returncode == EXIT_UNKNOWN
+        assert "VERIFY event_1 (verify deadline 1s) -> no response" in result.stdout
+        assert "DELETE primary event event_1 (deadline 5s) -> HTTP 200" in result.stdout
+
 
 class TestNotFound:
     """Exit 3 means the id never existed; a 404 delete is not evidence of work.
@@ -225,6 +277,16 @@ class TestNotFound:
         assert result.returncode == EXIT_NOT_FOUND
         assert "RESULT: NOT FOUND" in result.stdout
 
+    def test_router_404_is_not_read_as_absent(self, fake_agent):
+        """F10: a 404 without calendar-agent's envelope is the *router* saying
+        "no such route" — a wrong CALENDAR_AGENT_URL, not a missing event.
+        Reporting NOT FOUND ("check the id") sends the operator hunting the
+        wrong thing; nothing has been established."""
+        result = run_script(fake_agent, url=fake_agent.url + "/wrong-prefix")
+        assert result.returncode == EXIT_UNKNOWN
+        assert "RESULT: NOT FOUND" not in result.stdout
+        assert "envelope" in result.stdout
+
     def test_delete_404_but_get_still_present_is_failure(self, fake_agent):
         """A 404 delete followed by a present re-read is the FAILURE path,
         not NOT FOUND — the claim only matters when verify says gone."""
@@ -248,10 +310,38 @@ class TestNoRetryOnItsOwn:
         assert [m for m, _ in fake_agent.calls].count("DELETE") == 1
 
 
-class TestUsage:
-    """Guard rails that keep the whitelisted script narrowly scoped."""
+class TestDeadlines:
+    """F1: the DELETE deadline must outlive calendar-agent's mutation budget,
+    or a late approval lands after curl has given up — the same client/server
+    mismatch the server guards against, re-created one hop out."""
 
-    def test_missing_event_id_exits_nonzero(self, fake_agent):
+    def test_default_deadline_outlives_the_server_budget(self, fake_agent):
+        """Unset, the deadline is 340s against the 330s default budget, and
+        the re-read gets its own 35s (get_event is READ_TIMEOUT-bounded)."""
+        result = run_script(
+            fake_agent, max_time=None, extra_env={"CALENDAR_AGENT_CONFIRM_TIMEOUT": None}
+        )
+        assert result.returncode == EXIT_SUCCESS
+        assert "deadline 340s" in result.stdout
+        assert "verify deadline 35s" in result.stdout
+
+    def test_deadline_inside_the_server_budget_is_refused(self, fake_agent):
+        """The PR's original default (90s) is exactly this misconfiguration."""
+        result = run_script(
+            fake_agent, max_time="90", extra_env={"CALENDAR_AGENT_CONFIRM_TIMEOUT": "330"}
+        )
+        assert result.returncode == EXIT_USAGE
+        assert "CALENDAR_DELETE_MAX_TIME" in result.stderr
+        assert "330" in result.stderr
+        assert fake_agent.calls == []  # refused before any request
+
+
+class TestUsage:
+    """Guard rails that keep the whitelisted script narrowly scoped. Usage and
+    configuration failures exit 4: nothing was attempted, so none of the
+    outcome codes (0-3) would be true."""
+
+    def test_missing_event_id_exits_usage(self, fake_agent):
         result = subprocess.run(
             [str(SCRIPT)],
             capture_output=True,
@@ -259,10 +349,10 @@ class TestUsage:
             env={"PATH": "/usr/bin:/bin", "CALENDAR_AGENT_URL": fake_agent.url},
             timeout=30,
         )
-        assert result.returncode != EXIT_SUCCESS
+        assert result.returncode == EXIT_USAGE
         assert "usage" in result.stderr.lower()
 
-    def test_missing_agent_url_exits_nonzero(self):
+    def test_missing_agent_url_exits_usage(self):
         result = subprocess.run(
             [str(SCRIPT), "event_1"],
             capture_output=True,
@@ -270,5 +360,17 @@ class TestUsage:
             env={"PATH": "/usr/bin:/bin"},
             timeout=30,
         )
-        assert result.returncode != EXIT_SUCCESS
+        assert result.returncode == EXIT_USAGE
         assert "CALENDAR_AGENT_URL" in result.stderr
+
+    def test_missing_python3_is_fatal_before_any_request(self, fake_agent, tmp_path):
+        """F10: ``enc()`` failing used to be non-fatal under ``set -uo pipefail``
+        — the URL silently lost both ids and the DELETE went to ``/calendars//events/``."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for tool in ("bash", "curl"):
+            (bin_dir / tool).symlink_to(shutil.which(tool))
+        result = run_script(fake_agent, path=str(bin_dir))
+        assert result.returncode == EXIT_USAGE
+        assert "python3" in result.stderr
+        assert fake_agent.calls == []

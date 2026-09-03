@@ -119,10 +119,23 @@ uv run pytest --cov=calendar_agent  # With coverage
 
 - `scripts/calendar-delete-event.sh` is the supported way to delete an event
   from a script. It re-reads the event to decide, and exits `0` success /
-  `1` failure / `2` unknown / `3` not found (the DELETE itself 404/410'd —
-  the id never existed, nothing was deleted). Exit `2` means do not act —
-  never create a replacement event until a deletion has been observed
-  complete
+  `1` failure / `2` unknown / `3` not found (the DELETE itself 404/410'd with
+  calendar-agent's envelope — the id never existed, nothing was deleted) /
+  `4` usage or configuration error (nothing attempted). Exit `2` means do
+  not act — never create a replacement event until a deletion has been
+  observed complete
+- Its DELETE deadline (`CALENDAR_DELETE_MAX_TIME`, default 340) must exceed
+  calendar-agent's mutation budget (`CALENDAR_AGENT_CONFIRM_TIMEOUT`,
+  default 330, a hand-kept copy of the server's `PROXY_CONFIRM_TIMEOUT`);
+  it refuses to run otherwise. The verify GET has its own 35s deadline.
+  Worst case 375s: callers must pass a tool timeout above that
+- Any `5xx` from the DELETE is `unknown`, not `failed` — a 502 can be a
+  transport fault after the request reached the proxy's approval queue. A
+  404 counts as "absent" only when the body carries the `success` envelope;
+  a bare router 404 (wrong `CALENDAR_AGENT_URL`) is inconclusive
+- **The workspace's whitelisted copy and the `calendar-delete-event` skill
+  are separate and unchanged by this repo** — both must be replaced after
+  merge for any of this to take effect
 - It is covered end to end by `tests/test_delete_event_script.py`, which runs
   the real script against a loopback stub of calendar-agent
 

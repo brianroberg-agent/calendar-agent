@@ -378,17 +378,19 @@ gone):
 
 #### Deleting from a script: `scripts/calendar-delete-event.sh`
 
-A raw `curl -X DELETE` cannot tell these three cases apart, and a caller that
-reads only the status code will believe a deletion that has not happened.
-The wrapper script decides by **re-reading the event** rather than by trusting
-the delete's own answer, and reports three outcomes through its exit status:
+The server now verifies deletes itself (above), but a caller that reads only
+`curl`'s status code, or whose `curl` is killed by a harness timeout, still
+cannot tell the cases apart. The wrapper script captures body and status,
+**re-reads the event itself** rather than trusting the delete's answer, and
+reports through its exit status:
 
 | Exit | Result | Meaning |
 |------|--------|---------|
 | `0` | `SUCCESS` | The event is gone — re-read returned `404`, or `status: cancelled` |
-| `1` | `FAILURE` | The event is still there and nothing is outstanding (rejected, or `success: false`) |
-| `2` | `UNKNOWN` | The event is still there but the deletion may yet be applied, or the re-read established nothing |
-| `3` | `NOT FOUND` | The DELETE itself answered `404`/`410` — the event id (or calendar id) didn't exist before this ran, so nothing was deleted. Check the id; a re-read that also 404s is not evidence of a completed deletion |
+| `1` | `FAILURE` | The event is still there and nothing is outstanding (rejected `403`, other `4xx`, or `success: false`) |
+| `2` | `UNKNOWN` | The event is still there but the deletion may yet be applied (the DELETE timed out, or answered `408`/**any `5xx`** — a `502` can be a transport fault *after* the request reached the proxy, where it stays queued), or the re-read established nothing, or the response carried no calendar-agent envelope (a bare router `404` from a wrong `CALENDAR_AGENT_URL`) |
+| `3` | `NOT FOUND` | The DELETE itself answered `404`/`410` *with* calendar-agent's envelope — the event id (or calendar id) didn't exist before this ran, so nothing was deleted. Check the id; a re-read that also 404s is not evidence of a completed deletion |
+| `4` | `USAGE` | Bad arguments or configuration (missing url, `python3` not on `PATH`, a deadline that does not outlive the server's budget). Nothing was attempted |
 
 ```bash
 CALENDAR_AGENT_URL=http://localhost:8082 \
@@ -396,19 +398,32 @@ CALENDAR_AGENT_URL=http://localhost:8082 \
 ```
 
 ```
-DELETE primary event event123 -> HTTP 200 (body success: true)
-VERIFY event123 -> HTTP 404 (event status: <absent>)
+DELETE primary event event123 (deadline 340s) -> HTTP 200 (body success: true)
+VERIFY event123 (verify deadline 35s) -> HTTP 404 (event status: <absent>)
 RESULT: SUCCESS - event no longer present
 ```
 
-`CALENDAR_DELETE_MAX_TIME` (default `90`) sets the per-request `curl` deadline.
-Keep it below whatever timeout the *calling* harness imposes: if the caller
-kills `curl`, the script never reaches its verification step, which is the one
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `CALENDAR_AGENT_CONFIRM_TIMEOUT` | calendar-agent's own mutation budget (its `PROXY_CONFIRM_TIMEOUT`); the script cannot read it across the container boundary, so keep them in step by hand | `330` |
+| `CALENDAR_DELETE_MAX_TIME` | `curl` deadline for the DELETE. **Must exceed the budget** — the script refuses (exit `4`) otherwise, because a shorter deadline abandons the DELETE while the operator can still approve it, re-creating one hop out the very mismatch the server guards against | budget + 10 = `340` |
+| `CALENDAR_DELETE_VERIFY_MAX_TIME` | `curl` deadline for the verifying GET (an ordinary 30s-bounded read) | `35` |
+
+**Worst case the script runs for 375s** (340 + 35). The *calling* harness must
+allow at least that — pass a tool timeout of 400s or more. If the caller kills
+the script earlier, it dies before its verification step, which is the one
 part that establishes anything. The script never retries — a retry enqueues a
 second operator approval for the same operation.
 
 **Exit `2` means do not act.** In particular, never create a replacement event
 until a deletion has been observed complete.
+
+> **Deployment note.** This script lives in this repository. The copy the
+> assistant actually runs is the separate whitelisted script in the workspace
+> repo, and the `calendar-delete-event` skill still does `curl -X DELETE | jq .`.
+> Merging this PR changes neither; both must be replaced with this script
+> (and the skill taught the exit codes and the 400s tool timeout) before any
+> of it takes effect operationally.
 
 ### POST /calendars/{calendar_id}/events/{event_id}/respond
 
