@@ -29,10 +29,13 @@ from pydantic import BaseModel, Field, model_validator
 
 from . import __version__
 from .calendar_utils import (
+    READ_RESPONSE_STATUSES,
+    RSVP_RESPONSES,
     RsvpResponse,
     RsvpState,
     calendar_perspective,
     find_free_slots,
+    get_event_time,
     get_time_range_rfc3339,
 )
 from .exceptions import (
@@ -130,6 +133,12 @@ class EventPatchRequest(BaseModel):
     colorId: str | None = None
 
 
+# Rendered into the field descriptions below so /openapi.json lists exactly
+# the vocabularies the code enforces.
+_RSVP_RESPONSE_LIST = ", ".join(f"'{v}'" for v in RSVP_RESPONSES)
+_READ_STATUS_LIST = ", ".join(f"'{v}'" for v in READ_RESPONSE_STATUSES)
+
+
 class RespondRequest(BaseModel):
     """Request body for RSVPing to an event.
 
@@ -141,9 +150,10 @@ class RespondRequest(BaseModel):
     response_status: RsvpResponse = Field(
         ...,
         description=(
-            "'accepted', 'declined', or 'tentative' -- the writable subset of "
-            "EventSummary.calendar_response_status ('needsAction' cannot be "
-            "written back)."
+            f"One of {_RSVP_RESPONSE_LIST}: the values of "
+            "EventSummary.calendar_rsvp_state that can be written back "
+            "('needsAction' and the derived states cannot). Written to the "
+            "AUTHENTICATED USER's own attendee entry, whatever calendar_id is."
         ),
     )
 
@@ -286,15 +296,17 @@ class CalendarDetailResponse(BaseModel):
 
 
 class EventSummary(BaseModel):
-    """Summary of an event: metadata, organizer/creator addresses, no body.
+    """Summary of an event: metadata plus the organizer's and creator's
+    addresses; no description and no attendee list.
 
     The ``calendar_*`` fields describe the calendar named by ``calendar_id``,
     because Google's ``organizer.self`` / ``attendees[].self`` flags mark
     "the calendar on which this copy of the event appears" -- not the
     caller. They describe the authenticated user only when reading the
     user's own calendar (``primary`` or its own address); on a colleague's
-    or group calendar they describe that calendar. See the README section
-    on ``GET /calendars/{calendar_id}/events`` for the full semantics.
+    or group calendar they describe that calendar. POST .../respond takes
+    the opposite perspective: it always writes the authenticated user's own
+    entry, whatever calendar_id is.
     """
     id: str
     calendar_id: str
@@ -336,35 +348,30 @@ class EventSummary(BaseModel):
         ),
     )
     calendar_is_organizer: bool = Field(
-        False,
+        ...,
         description=(
-            "Whether the calendar named by calendar_id is this event's "
-            "organizer (Google's organizer.self). This is the authenticated "
-            "user only when calendar_id is the user's own calendar."
-        ),
-    )
-    calendar_response_status: str | None = Field(
-        None,
-        description=(
-            "The raw responseStatus of the attendee entry belonging to the "
-            "calendar named by calendar_id (Google's attendees[].self): "
-            "'accepted', 'declined', 'tentative', 'needsAction', or null when "
-            "that calendar has no attendee entry or the entry has no value. "
-            "On a colleague's calendar this is the colleague's RSVP, not the "
-            "authenticated user's. Read calendar_rsvp_state to interpret null."
+            "Whether the calendar named by calendar_id organizes this event "
+            "(Google's organizer.self). On a colleague's calendar this is "
+            "about the colleague; it is about the authenticated user only "
+            "when calendar_id is the user's own calendar."
         ),
     )
     calendar_rsvp_state: RsvpState = Field(
         ...,
         description=(
-            "calendar_response_status interpreted: 'accepted', 'declined', "
-            "'tentative' or 'needsAction' when the calendar has an RSVP; "
-            "'organizer_no_rsvp' when the calendar organizes the event and has "
-            "no RSVP value (its own event, nothing to answer); 'not_attendee' "
-            "when the calendar neither organizes nor is invited; 'unknown' when "
-            "the calendar's entry has no recognisable value, or the event has "
-            "no organizer and no attendees at all. Only the first three values "
-            "can be sent back to POST .../respond."
+            "The RSVP of the attendee entry belonging to the calendar named "
+            "by calendar_id (Google's attendees[].self), classified. "
+            f"{_READ_STATUS_LIST}: Google's responseStatus, verbatim. "
+            "'organizer_no_rsvp': the calendar organizes the event and has no "
+            "responseStatus (no entry of its own, or an entry without one) -- "
+            "its own event, nothing to answer. 'not_attendee': the calendar "
+            "neither organizes the event nor appears in its attendee list. "
+            "'unknown': the calendar's entry carries a responseStatus this "
+            "service does not recognise (organizer or not), or the event has "
+            "no organizer and no attendees at all (cancelled recurring-instance "
+            "stubs). On a colleague's calendar this is the colleague's RSVP, "
+            f"not the authenticated user's. Only {_RSVP_RESPONSE_LIST} can be "
+            "sent back to POST .../respond."
         ),
     )
 
@@ -672,32 +679,29 @@ def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
     describe ``calendar_id`` -- the calendar this copy of the event sits on.
     """
     start = event.get("start") or {}
-    end = event.get("end") or {}
-    attendees = event.get("attendees") or []
-    organizer = event.get("organizer") or {}
-    creator = event.get("creator") or {}
+    attendees = event.get("attendees")
+    organizer = event.get("organizer")
+    creator = event.get("creator")
     perspective = calendar_perspective(event)
-
-    # Get time string (prefer dateTime, fall back to date for all-day)
-    start_str = start.get("dateTime") or start.get("date") or ""
-    end_str = end.get("dateTime") or end.get("date") or ""
-    is_all_day = "date" in start and "dateTime" not in start
 
     return EventSummary(
         id=event.get("id", ""),
         calendar_id=calendar_id,
         summary=event.get("summary", "Untitled Event"),
-        start=start_str,
-        end=end_str,
+        start=get_event_time(start),
+        end=get_event_time(event.get("end")),
         location=event.get("location"),
-        attendee_count=len(attendees),
-        is_all_day=is_all_day,
+        # Non-dict organizer/creator/attendee values read as absent rather
+        # than raising, so one malformed row cannot 500 a whole page.
+        attendee_count=len(attendees) if isinstance(attendees, list) else 0,
+        # Not calendar_utils.is_all_day_event(): that assumes a start dict and
+        # raises on a missing start, which a cancelled stub has.
+        is_all_day="date" in start and "dateTime" not in start,
         status=event.get("status"),
         html_link=event.get("htmlLink"),
-        organizer_email=organizer.get("email"),
-        creator_email=creator.get("email"),
+        organizer_email=organizer.get("email") if isinstance(organizer, dict) else None,
+        creator_email=creator.get("email") if isinstance(creator, dict) else None,
         calendar_is_organizer=perspective.is_organizer,
-        calendar_response_status=perspective.response_status,
         calendar_rsvp_state=perspective.rsvp_state,
     )
 

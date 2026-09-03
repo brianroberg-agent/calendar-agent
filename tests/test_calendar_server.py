@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from calendar_agent.calendar_server import event_to_summary
+from calendar_agent.calendar_server import app, event_to_summary
 from calendar_agent.exceptions import (
     ProxyAuthError,
     ProxyConfigError,
@@ -139,8 +139,7 @@ class TestEventToSummary:
         summary = event_to_summary(self._carols_copy(), "carol@example.com")
         assert summary.calendar_id == "carol@example.com"
         assert summary.calendar_is_organizer is False
-        assert summary.calendar_response_status == "accepted"  # Carol's RSVP, not me@'s
-        assert summary.calendar_rsvp_state == "accepted"
+        assert summary.calendar_rsvp_state == "accepted"  # Carol's RSVP, not me@'s
         assert summary.organizer_email == "dave@example.com"
         assert summary.creator_email == "dave@example.com"
 
@@ -151,7 +150,30 @@ class TestEventToSummary:
         dumped = event_to_summary(self._carols_copy(), "carol@example.com").model_dump()
         assert "is_organizer" not in dumped
         assert "response_status" not in dumped
+        assert "calendar_response_status" not in dumped  # dropped in round 3 (redundant)
         assert not any(k.startswith("user_") for k in dumped)
+
+    def test_perspective_fields_are_required_in_the_openapi_schema(self):
+        """Both perspective fields are always emitted, so the schema must not
+        mark either optional (finding 15, round 3)."""
+        schema = app.openapi()["components"]["schemas"]["EventSummary"]
+        assert {"calendar_is_organizer", "calendar_rsvp_state"} <= set(schema["required"])
+        assert "calendar_response_status" not in schema["properties"]
+
+    def test_malformed_organizer_or_attendees_degrade_instead_of_raising(self):
+        """Finding 8 (round 3): a non-dict organizer/creator or attendee row
+        must not raise (which would 500 the whole page); it reads as absent."""
+        event = make_event(organizer=None, attendees=None)
+        event["organizer"] = "dave@example.com"
+        event["creator"] = ["dave@example.com"]
+        event["attendees"] = [None, "bob@example.com"]
+        summary = event_to_summary(event, "primary")
+        assert summary.organizer_email is None
+        assert summary.creator_email is None
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_rsvp_state == "unknown"
+        event["attendees"] = "not-a-list"
+        assert event_to_summary(event, "primary").attendee_count == 0
 
     def test_pending_invitation_on_own_calendar(self):
         event = make_event(
@@ -160,7 +182,6 @@ class TestEventToSummary:
         )
         summary = event_to_summary(event, "primary")
         assert summary.calendar_is_organizer is False
-        assert summary.calendar_response_status == "needsAction"
         assert summary.calendar_rsvp_state == "needsAction"
 
     def test_own_event_with_attendees_but_no_own_entry(self):
@@ -178,7 +199,6 @@ class TestEventToSummary:
         summary = event_to_summary(event, "primary")
         assert summary.attendee_count == 2
         assert summary.calendar_is_organizer is True
-        assert summary.calendar_response_status is None
         assert summary.calendar_rsvp_state == "organizer_no_rsvp"
 
     def test_group_calendar_native_event_names_the_calendar_and_the_creator(self):
@@ -192,6 +212,7 @@ class TestEventToSummary:
             attendees=None,
         )
         summary = event_to_summary(event, group)
+        assert summary.attendee_count == 0
         assert summary.calendar_is_organizer is True
         assert summary.calendar_rsvp_state == "organizer_no_rsvp"
         assert summary.organizer_email == group
@@ -204,13 +225,13 @@ class TestEventToSummary:
         )
         summary = event_to_summary(event, "primary")
         assert summary.calendar_is_organizer is False
-        assert summary.calendar_response_status is None
         assert summary.calendar_rsvp_state == "not_attendee"
 
     def test_cancelled_recurring_stub_is_unknown_not_own_event(self):
         event = make_event(organizer=None, attendees=None, status="cancelled")
         summary = event_to_summary(event, "primary")
         assert summary.status == "cancelled"
+        assert summary.attendee_count == 0
         assert summary.calendar_is_organizer is False
         assert summary.calendar_rsvp_state == "unknown"
         assert summary.organizer_email is None
@@ -260,6 +281,26 @@ class TestEventsListEndpoint:
         call_kwargs = mock_proxy_client.list_events.call_args.kwargs
         assert call_kwargs["single_events"] is True
 
+    def test_list_event_without_attendees_counts_zero(self, client, mock_proxy_client):
+        """An event with no attendees key is a count of 0 on the wire, not an
+        error and not a phantom count (finding 9, round 3)."""
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["all_day_event"]]}
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 200
+        assert response.json()["events"][0]["attendee_count"] == 0
+
+    def test_list_survives_a_malformed_event_row(self, client, mock_proxy_client):
+        """One malformed row must not 500 the whole page (finding 8, round 3)."""
+        bad = {**SAMPLE_EVENTS["basic_meeting"], "organizer": "dave@example.com",
+               "attendees": [None]}
+        mock_proxy_client.list_events.return_value = {"items": [bad]}
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert len(data["events"]) == 1
+        assert data["events"][0]["calendar_rsvp_state"] == "unknown"
+
     def test_list_events_empty(self, client, mock_proxy_client):
         """List events handles empty results."""
         mock_proxy_client.list_events.return_value = {"items": []}
@@ -290,11 +331,11 @@ class TestRsvpFieldsOnTheWire:
         assert event["organizer_email"] == "dave@example.com"
         assert event["creator_email"] == "dave@example.com"
         assert event["calendar_is_organizer"] is False
-        assert event["calendar_response_status"] == "needsAction"
         assert event["calendar_rsvp_state"] == "needsAction"
         assert event["status"] == "confirmed"
         assert "is_organizer" not in event
         assert "response_status" not in event
+        assert "calendar_response_status" not in event
 
     def test_list_on_colleague_calendar_reports_the_colleagues_rsvp(
         self, client, mock_proxy_client
@@ -317,7 +358,6 @@ class TestRsvpFieldsOnTheWire:
         assert response.status_code == 200
         event = response.json()["events"][0]
         assert event["calendar_is_organizer"] is False
-        assert event["calendar_response_status"] == "accepted"
         assert event["calendar_rsvp_state"] == "accepted"
 
     def test_read_needs_no_extra_proxy_call(self, client, mock_proxy_client):

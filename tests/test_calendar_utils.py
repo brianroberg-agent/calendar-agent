@@ -453,22 +453,21 @@ class TestCalendarPerspective:
     def test_self_flags_describe_the_calendar_being_read(self):
         p = calendar_perspective(_invitation())
         assert p.is_organizer is False
-        assert p.response_status == "accepted"  # Carol's entry, not me@'s "declined"
-        assert p.rsvp_state == "accepted"
+        assert p.rsvp_state == "accepted"  # Carol's entry, not me@'s "declined"
 
     def test_is_a_plain_tuple_too(self):
-        assert calendar_perspective(_invitation()) == (False, "accepted", "accepted")
+        assert calendar_perspective(_invitation()) == (False, "accepted")
 
     def test_calendar_organizes_with_no_attendees(self):
         event = {"organizer": {"email": "carol@example.com", "self": True}}
-        assert calendar_perspective(event) == (True, None, "organizer_no_rsvp")
+        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
 
     def test_calendar_organizes_but_is_not_in_attendee_list(self):
         event = {
             "organizer": {"email": "carol@example.com", "self": True},
             "attendees": [{"email": "alice@example.com", "responseStatus": "needsAction"}],
         }
-        assert calendar_perspective(event) == (True, None, "organizer_no_rsvp")
+        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
 
     def test_organizer_as_attendee_without_response_status_is_organizer_no_rsvp(self):
         # The organizer's own attendee entry exists but Google omitted the
@@ -480,7 +479,20 @@ class TestCalendarPerspective:
                 {"email": "alice@example.com", "responseStatus": "accepted"},
             ],
         }
-        assert calendar_perspective(event) == (True, None, "organizer_no_rsvp")
+        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
+
+    def test_organizer_with_unrecognised_own_response_status_is_unknown(self):
+        # Finding 6 (round 3): an organizer whose own entry carries a value
+        # this service does not recognise is NOT "own event, no RSVP value";
+        # there is a value, we just cannot classify it.
+        event = {
+            "organizer": {"email": "carol@example.com", "self": True},
+            "attendees": [
+                {"email": "carol@example.com", "self": True, "organizer": True,
+                 "responseStatus": "somethingNew"},
+            ],
+        }
+        assert calendar_perspective(event) == (True, "unknown")
 
     def test_organizer_as_attendee_with_status_reports_the_status(self):
         event = {
@@ -490,14 +502,14 @@ class TestCalendarPerspective:
                  "responseStatus": "accepted"},
             ],
         }
-        assert calendar_perspective(event) == (True, "accepted", "accepted")
+        assert calendar_perspective(event) == (True, "accepted")
 
     def test_attendee_entry_without_response_status_is_unknown(self):
         event = {
             "organizer": {"email": "dave@example.com", "self": False},
             "attendees": [{"email": "carol@example.com", "self": True}],
         }
-        assert calendar_perspective(event) == (False, None, "unknown")
+        assert calendar_perspective(event) == (False, "unknown")
 
     def test_not_organizer_and_not_attendee(self):
         # The fourth null cause the PR's docs missed: neither organizer nor
@@ -507,27 +519,41 @@ class TestCalendarPerspective:
             "organizer": {"email": "dave@example.com", "self": False},
             "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
         }
-        assert calendar_perspective(event) == (False, None, "not_attendee")
+        assert calendar_perspective(event) == (False, "not_attendee")
 
     def test_cancelled_stub_with_no_organizer_or_attendees_is_unknown(self):
         # A plain list with singleEvents=false returns cancelled recurring-
         # instance stubs that carry neither organizer nor attendees; nothing
         # to classify from.
-        assert calendar_perspective({"status": "cancelled"}) == (False, None, "unknown")
+        assert calendar_perspective({"status": "cancelled"}) == (False, "unknown")
 
     def test_needs_action_passes_through(self):
         event = _invitation(calendar_entry_status="needsAction")
-        assert calendar_perspective(event) == (False, "needsAction", "needsAction")
+        assert calendar_perspective(event) == (False, "needsAction")
 
-    def test_unrecognised_response_status_is_unknown_but_raw_value_is_kept(self):
+    def test_unrecognised_response_status_is_unknown(self):
         # A value this service does not know is not an error: the derived
-        # state says "unknown" and the raw value is still reported verbatim.
+        # state says "unknown" rather than raising or guessing.
         event = _invitation(calendar_entry_status="somethingNew")
-        assert calendar_perspective(event) == (False, "somethingNew", "unknown")
+        assert calendar_perspective(event) == (False, "unknown")
 
-    def test_non_string_response_status_is_reported_as_none(self):
+    def test_non_string_response_status_is_unknown(self):
         event = _invitation(calendar_entry_status=42)
-        assert calendar_perspective(event) == (False, None, "unknown")
+        assert calendar_perspective(event) == (False, "unknown")
+
+    def test_malformed_organizer_and_attendee_entries_do_not_raise(self):
+        # Finding 8 (round 3): a non-dict organizer or attendee element is
+        # not something a Google-conformant proxy sends, but one bad row
+        # must not turn a whole page of results into a 500. It degrades to
+        # "nothing recognisable here".
+        assert calendar_perspective({"organizer": "dave@example.com"}) == (False, "unknown")
+        assert calendar_perspective({"attendees": [None, "bob@example.com"]}) == (False, "unknown")
+        assert calendar_perspective({"attendees": "not-a-list"}) == (False, "unknown")
+        event = {
+            "organizer": "dave@example.com",
+            "attendees": [None, {"email": "alice@example.com", "responseStatus": "accepted"}],
+        }
+        assert calendar_perspective(event) == (False, "not_attendee")
 
 
 class TestResponseStatusVocabularies:

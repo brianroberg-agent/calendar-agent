@@ -218,7 +218,6 @@ Response:
       "organizer_email": "alice@example.com",
       "creator_email": "alice@example.com",
       "calendar_is_organizer": false,
-      "calendar_response_status": "accepted",
       "calendar_rsvp_state": "accepted"
     }
   ],
@@ -240,7 +239,7 @@ appears**". So:
 - Reading your own calendar (`primary`, or your own address), they describe
   you.
 - Reading a colleague's calendar (`GET /calendars/colleague@example.com/events`),
-  they describe **the colleague**: `calendar_response_status` is *their* RSVP,
+  they describe **the colleague**: `calendar_rsvp_state` is *their* RSVP,
   and `calendar_is_organizer` says whether *they* organize it. Your own RSVP
   on that event is not reported -- it is only knowable from your own calendar.
 - Reading a group calendar, they describe the group calendar: an event
@@ -248,7 +247,9 @@ appears**". So:
   (`organizer_email` is the calendar's id, `calendar_is_organizer` is `true`).
   `creator_email` is then the person who created it.
 
-Fields:
+Fields (the authoritative per-value descriptions are the `EventSummary`
+schema in `/docs` / `/openapi.json`, generated from the code; this list is
+the short form):
 
 - `organizer_email`: the organizer's address as Google reports it. For an
   event created on a group calendar this is the group calendar's id. `null`
@@ -259,26 +260,17 @@ Fields:
   and for events moved between calendars. `null` when absent.
 - `calendar_is_organizer`: Google's `organizer.self` -- the calendar being
   read organizes this event.
-- `calendar_response_status`: the raw `responseStatus` of the attendee entry
-  Google marks `self` on this copy -- the calendar's own entry. One of
-  `"accepted"`, `"declined"`, `"tentative"`, `"needsAction"`, or `null` when
-  the calendar has no attendee entry of its own or the entry carries no
-  value. Do not read `null` as "hasn't responded"; read
-  `calendar_rsvp_state` instead.
-- `calendar_rsvp_state`: `calendar_response_status` interpreted, so the
-  caller never has to decode a `null`:
-  - `"accepted"` / `"declined"` / `"tentative"` / `"needsAction"`: the
-    calendar's RSVP, verbatim from Google.
-  - `"organizer_no_rsvp"`: the calendar organizes the event and has no RSVP
-    value -- either it has no attendee entry of its own (an event created
-    for oneself, with or without other guests) or its entry has no
-    `responseStatus`. Its own event; nothing to answer.
-  - `"not_attendee"`: the calendar neither organizes the event nor appears
-    in its attendee list (e.g. an event copied or shared onto it, or an
-    invitation addressed to a group rather than to the calendar).
-  - `"unknown"`: the calendar's attendee entry exists but carries no
-    recognisable `responseStatus`, or the event carries no organizer and no
-    attendees at all (cancelled recurring-instance stubs look like this).
+- `calendar_rsvp_state`: the RSVP of the attendee entry Google marks `self`
+  on this copy -- the calendar's own entry -- classified so the caller never
+  has to decode a missing value. Either one of Google's four values
+  (`"accepted"`, `"declined"`, `"tentative"`, `"needsAction"`) verbatim, or
+  one of this service's own: `"organizer_no_rsvp"` (the calendar's own
+  event, nothing to answer), `"not_attendee"` (neither organizer nor
+  invited -- e.g. an event copied onto the calendar, or an invitation
+  addressed to a group), `"unknown"` (a `responseStatus` this service does
+  not recognise, or a stub with no organizer and no attendees). The raw
+  Google string is not exposed separately: it is either one of the four
+  values above or something this service cannot classify.
 - `status`: Google's event status -- `"confirmed"`, `"tentative"`, or
   `"cancelled"`. Cancelled rows are the stubs Google keeps for deleted
   instances of a recurring series. They are returned by a plain `GET` with
@@ -788,7 +780,6 @@ Response:
       "organizer_email": "john.doe@example.com",
       "creator_email": "john.doe@example.com",
       "calendar_is_organizer": true,
-      "calendar_response_status": null,
       "calendar_rsvp_state": "organizer_no_rsvp"
     }
   ],

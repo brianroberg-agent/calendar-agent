@@ -6,18 +6,12 @@ from typing import Any, Literal, NamedTuple, get_args
 # ============================================================================
 # Organizer / RSVP perspective
 #
-# Google's Events reference defines the ``self`` flags relative to the
-# CALENDAR, not the caller:
-#
-#   attendees[].self  "Whether this entry represents the calendar on which
-#                      this copy of the event appears."
-#   organizer.self    "Whether the organizer corresponds to the calendar on
-#                      which this copy of the event appears."
-#
-# So on ``GET /calendars/{calendar_id}/events`` they describe *calendar_id*.
-# Reading a colleague's calendar, they describe the colleague; reading a
-# group calendar, they describe the group calendar. They describe the
-# authenticated user only when the calendar being read is the user's own.
+# Google's ``organizer.self`` / ``attendees[].self`` flags describe the
+# CALENDAR the event copy sits on, so on GET /calendars/{calendar_id}/events
+# they describe calendar_id, not the caller. The meaning of every value
+# below is spelled out once, in the ``EventSummary`` field descriptions in
+# calendar_server.py (they are what /openapi.json shows); the README carries
+# the narrative.
 # ============================================================================
 
 # The three values a caller may write via POST .../respond.
@@ -25,18 +19,8 @@ RsvpResponse = Literal["accepted", "declined", "tentative"]
 # What Google reports on an attendee entry (Google's spelling, kept verbatim
 # so the writable subset round-trips to /respond unchanged).
 ReadResponseStatus = Literal[RsvpResponse, "needsAction"]
-# The derived state this service reports. The first four are Google's own
-# values; the snake_case three are this service's classification of "no
-# response status to report":
-#   organizer_no_rsvp  the calendar organizes the event and has no RSVP
-#                      value (no entry of its own, or an entry without a
-#                      responseStatus) -- its own event, not an unanswered
-#                      invitation.
-#   not_attendee       neither organizer nor in the attendee list.
-#   unknown            an entry exists but carries no recognisable
-#                      responseStatus, or the event carries no organizer and
-#                      no attendees at all (e.g. a cancelled recurring-
-#                      instance stub, returned when singleEvents=false).
+# What this service reports: Google's four values, or one of three snake_case
+# classifications of "no response status to report".
 RsvpState = Literal[ReadResponseStatus, "organizer_no_rsvp", "not_attendee", "unknown"]
 
 RSVP_RESPONSES: tuple[str, ...] = get_args(RsvpResponse)
@@ -45,45 +29,48 @@ RSVP_STATES: tuple[str, ...] = get_args(RsvpState)
 
 
 class CalendarPerspective(NamedTuple):
-    """What an event copy says about the calendar it sits on."""
+    """What an event copy says about the calendar it sits on.
+
+    ``is_organizer`` is Google's ``organizer.self``; ``rsvp_state`` is the
+    calendar's own (``self``) attendee entry classified into ``RsvpState``.
+    """
 
     is_organizer: bool
-    """Google's ``organizer.self``: the calendar organizes this event."""
-    response_status: str | None
-    """The raw ``responseStatus`` of the calendar's own (``self``) attendee
-    entry, verbatim; None when there is no such entry or no string value."""
-    rsvp_state: str
-    """``response_status`` classified into the ``RsvpState`` vocabulary."""
-
-
-def _derive_rsvp_state(
-    event: dict[str, Any], own_entry: dict[str, Any] | None, is_organizer: bool
-) -> str:
-    if own_entry is not None and own_entry.get("responseStatus") in READ_RESPONSE_STATUSES:
-        return own_entry["responseStatus"]
-    if is_organizer:
-        return "organizer_no_rsvp"
-    if own_entry is not None:
-        return "unknown"
-    if not event.get("organizer") and not event.get("attendees"):
-        return "unknown"
-    return "not_attendee"
+    rsvp_state: RsvpState
 
 
 def calendar_perspective(event: dict[str, Any]) -> CalendarPerspective:
-    """Organizer flag and RSVP of the calendar this event copy sits on.
+    """Organizer flag and RSVP state of the calendar this event copy sits on.
 
     Uses Google's ``organizer.self`` and the ``self: true`` attendee entry,
-    which by Google's definition describe the calendar being read.
+    which by Google's definition describe the calendar being read. A
+    malformed organizer or attendee row (not a dict) is treated as absent
+    rather than raised on, so one bad row cannot fail a whole page.
     """
-    organizer = event.get("organizer") or {}
+    organizer = event.get("organizer")
+    organizer = organizer if isinstance(organizer, dict) else {}
+    attendees = event.get("attendees")
+    attendees = [a for a in attendees if isinstance(a, dict)] if isinstance(attendees, list) else []
     is_organizer = bool(organizer.get("self"))
-    own_entry = next((a for a in event.get("attendees") or [] if a.get("self")), None)
-    raw = own_entry.get("responseStatus") if own_entry is not None else None
-    response_status = raw if isinstance(raw, str) else None
-    return CalendarPerspective(
-        is_organizer, response_status, _derive_rsvp_state(event, own_entry, is_organizer)
-    )
+    own_entry = next((a for a in attendees if a.get("self")), None)
+    own_status = own_entry.get("responseStatus") if own_entry is not None else None
+
+    rsvp_state: RsvpState
+    if own_status in READ_RESPONSE_STATUSES:
+        rsvp_state = own_status
+    elif own_status is not None:
+        # A value this service cannot classify (or a non-string) is
+        # "unknown" even when the calendar is the organizer: there IS a
+        # value, so this is not "own event, no RSVP recorded".
+        rsvp_state = "unknown"
+    elif is_organizer:
+        rsvp_state = "organizer_no_rsvp"
+    elif own_entry is not None or (not organizer and not attendees):
+        # An entry with no responseStatus at all, or nothing to classify from.
+        rsvp_state = "unknown"
+    else:
+        rsvp_state = "not_attendee"
+    return CalendarPerspective(is_organizer, rsvp_state)
 
 
 def get_event_time(event_datetime: dict[str, Any] | None) -> str:
