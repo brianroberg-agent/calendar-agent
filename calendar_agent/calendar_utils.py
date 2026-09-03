@@ -1,7 +1,124 @@
 """Utility functions for calendar operations."""
 
+import string
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal, get_args
+
+# ============================================================================
+# Organizer / RSVP perspective
+#
+# Google's Events reference defines the ``self`` flags relative to the
+# CALENDAR, not the caller:
+#
+#   attendees[].self  "Whether this entry represents the calendar on which
+#                      this copy of the event appears."
+#   organizer.self    "Whether the organizer corresponds to the calendar on
+#                      which this copy of the event appears."
+#
+# So on ``GET /calendars/{calendar_id}/events`` they describe *calendar_id*.
+# Reading a colleague's calendar, they describe the colleague; reading a
+# group calendar, they describe the group calendar. The authenticated
+# user's own view is only the same thing on the user's own calendar; on
+# any other calendar it has to be derived by email (``user_perspective``).
+# ============================================================================
+
+# The three values a caller may write via POST .../respond.
+RsvpResponse = Literal["accepted", "declined", "tentative"]
+# What Google reports on an attendee entry (Google's spelling, kept verbatim
+# so the writable subset round-trips to /respond unchanged).
+ReadResponseStatus = Literal[RsvpResponse, "needsAction"]
+# The derived state this service reports. The first four are Google's own
+# values; the snake_case three are this service's classification of "no
+# response status to report":
+#   organizer_no_rsvp  the perspective organizes the event and has no RSVP
+#                      value (no entry of its own, or an entry without a
+#                      responseStatus) -- its own event, not an unanswered
+#                      invitation.
+#   not_attendee       neither organizer nor in the attendee list.
+#   unknown            an entry exists but carries no recognisable
+#                      responseStatus, or the event carries no organizer and
+#                      no attendees at all (e.g. a cancelled recurring-
+#                      instance stub returned under showDeleted=true).
+RsvpState = Literal[ReadResponseStatus, "organizer_no_rsvp", "not_attendee", "unknown"]
+
+RSVP_RESPONSES: tuple[str, ...] = get_args(RsvpResponse)
+READ_RESPONSE_STATUSES: tuple[str, ...] = get_args(ReadResponseStatus)
+RSVP_STATES: tuple[str, ...] = get_args(RsvpState)
+
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def normalize_email(value: Any) -> str:
+    """Trim and ASCII-lowercase an address for comparison.
+
+    Only ASCII case is folded (``str.lower`` would also map e.g. U+212A
+    KELVIN SIGN to ``k``, letting a crafted attendee address collide with a
+    real one). Non-strings normalise to ``""``, which never matches.
+    """
+    if not isinstance(value, str):
+        return ""
+    return value.strip().translate(_ASCII_LOWER)
+
+
+def _derive_rsvp_state(
+    event: dict[str, Any], own_entry: dict[str, Any] | None, is_organizer: bool
+) -> str:
+    if own_entry is not None:
+        status = own_entry.get("responseStatus")
+        if status in READ_RESPONSE_STATUSES:
+            return status
+    if is_organizer:
+        return "organizer_no_rsvp"
+    if own_entry is not None:
+        return "unknown"
+    if not event.get("organizer") and not event.get("attendees"):
+        return "unknown"
+    return "not_attendee"
+
+
+def calendar_perspective(event: dict[str, Any]) -> tuple[bool, str]:
+    """(is_organizer, rsvp_state) for the calendar this event copy sits on.
+
+    Uses Google's ``organizer.self`` and the ``self: true`` attendee entry,
+    which by Google's definition describe the calendar being read.
+    """
+    organizer = event.get("organizer") or {}
+    is_organizer = bool(organizer.get("self"))
+    own_entry = next((a for a in event.get("attendees") or [] if a.get("self")), None)
+    return is_organizer, _derive_rsvp_state(event, own_entry, is_organizer)
+
+
+def user_perspective(event: dict[str, Any], user_email: str) -> tuple[bool, str]:
+    """(is_organizer, rsvp_state) for ``user_email``, matched by address.
+
+    For reading a calendar that is not the user's own: the ``self`` flags
+    describe that calendar, so the user's organizer/attendee entries are
+    found by (normalised) email instead. An empty ``user_email`` matches
+    nothing.
+    """
+    target = normalize_email(user_email)
+    organizer = event.get("organizer") or {}
+    is_organizer = bool(target) and normalize_email(organizer.get("email")) == target
+    own_entry = None
+    if target:
+        own_entry = next(
+            (a for a in event.get("attendees") or [] if normalize_email(a.get("email")) == target),
+            None,
+        )
+    return is_organizer, _derive_rsvp_state(event, own_entry, is_organizer)
+
+
+def is_own_calendar(calendar_id: str, user_email: str | None) -> bool:
+    """Whether ``calendar_id`` is the authenticated user's own calendar.
+
+    ``"primary"`` always is. An address is only recognised as the user's
+    own when ``user_email`` has actually been resolved -- an unresolved
+    identity must not claim an address.
+    """
+    if calendar_id == "primary":
+        return True
+    target = normalize_email(user_email)
+    return bool(target) and normalize_email(calendar_id) == target
 
 
 def get_event_time(event_datetime: dict[str, Any] | None) -> str:
