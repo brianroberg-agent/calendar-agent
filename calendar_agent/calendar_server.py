@@ -319,9 +319,44 @@ class SearchFilters(StrictRequestModel):
 
 
 class SearchRequest(StrictRequestModel):
-    """Request to search events."""
+    """Request to search events.
+
+    Accepts the filter keys either nested under `filters` (the shape
+    /openapi.json describes) or flat at the top level (the shape the calendar
+    skills document); see `_fold_flat_filter_keys`.
+    """
     calendar_id: str = Field(..., description="Calendar ID to search")
     filters: SearchFilters = Field(default_factory=SearchFilters)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_flat_filter_keys(cls, data: Any) -> Any:
+        """Move top-level filter keys into `filters` (issue #8, items 2-4).
+
+        - The allowlist is `SearchFilters.model_fields`, never a hand copy,
+          so adding a filter field keeps the flat shape working.
+        - Folded keys are consumed from the top level; anything else left
+          there still hits extra="forbid", so a true typo (`timeMin`) is a 422.
+        - Merge is per field, nested wins: a key present in `filters` beats
+          the same key at the top level.
+        - An explicit null at the top level means "not supplied".
+        - `filters` is only touched when it is absent/null or a mapping; any
+          other value is left for SearchFilters to reject cleanly (no 500).
+        """
+        if not isinstance(data, dict):
+            return data
+        flat = {k: v for k, v in data.items() if k in SearchFilters.model_fields}
+        if not flat:
+            return data
+        rest = {k: v for k, v in data.items() if k not in flat}
+        nested = rest.get("filters")
+        if nested is None:
+            nested = {}
+        elif not isinstance(nested, dict):
+            return data  # let the field validator report the bad `filters`
+        merged = {k: v for k, v in flat.items() if v is not None}
+        merged.update(nested)
+        return {**rest, "filters": merged}
 
 
 class BulkOperationType(str, Enum):

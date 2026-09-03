@@ -2406,3 +2406,124 @@ class TestBulkUpdatesAreTyped:
         assert data["error_count"] == 1
         assert "No update data" in data["results"][0]["error"]
         mock_proxy_client.update_event.assert_not_called()
+
+
+# ============================================================================
+# /search flat-shape fold (issue #8 "shape of the fix" items 2-4)
+#
+# The installed calendar skills document /search with the filter keys at the
+# top level ({"calendar_id": ..., "query": ..., "time_min": ...}) rather than
+# nested under "filters". With extra="forbid" alone that shape went from
+# 200-with-wrong-answer to hard 422. A before-validator folds exactly the
+# keys SearchFilters declares into "filters" (consuming them, so a true typo
+# still 422s); the allowlist is derived from SearchFilters.model_fields, so
+# adding a filter field keeps the flat path working with no test change.
+# ============================================================================
+
+
+NESTED_SEARCH = {
+    "calendar_id": "primary",
+    "filters": {
+        "query": "project",
+        "time_min": "2024-01-01T00:00:00Z",
+        "time_max": "2024-03-31T23:59:59Z",
+        "max_results": 20,
+        "order_by": "startTime",
+    },
+}
+FLAT_SEARCH = {"calendar_id": "primary", **NESTED_SEARCH["filters"]}
+
+
+class TestSearchFlatShapeFold:
+    """The flat /search shape the skills document works, and only that shape."""
+
+    def test_flat_shape_gives_the_same_proxy_call_as_nested(self, client, mock_proxy_client):
+        client.post("/search", json=NESTED_SEARCH)
+        nested_call = mock_proxy_client.list_events.call_args.kwargs
+        mock_proxy_client.list_events.reset_mock()
+
+        response = client.post("/search", json=FLAT_SEARCH)
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.list_events.call_args.kwargs == nested_call
+        assert nested_call["time_min"] == "2024-01-01T00:00:00Z"
+        assert nested_call["max_results"] == 20
+
+    def test_flat_shape_with_typo_is_rejected(self, client, mock_proxy_client):
+        """The fold consumes only declared keys: Google-style timeMin is still a 422."""
+        response = client.post(
+            "/search",
+            json={"calendar_id": "primary", "query": "project", "timeMin": "2024-01-01T00:00:00Z"},
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == [
+            {
+                "type": "extra_forbidden",
+                "loc": ["body", "timeMin"],
+                "msg": "Extra inputs are not permitted",
+                "input": "2024-01-01T00:00:00Z",
+            }
+        ]
+        mock_proxy_client.list_events.assert_not_called()
+
+    @pytest.mark.parametrize("field", list(__import__(
+        "calendar_agent.calendar_server", fromlist=["SearchFilters"]
+    ).SearchFilters.model_fields))
+    def test_every_search_filter_field_is_accepted_flat(self, client, mock_proxy_client, field):
+        """Derived from SearchFilters.model_fields: a new filter field is
+        covered here automatically, with no allowlist to update."""
+        from calendar_agent.calendar_server import SearchFilters
+
+        value = {"query": "x", "time_min": "2024-01-01T00:00:00Z",
+                 "time_max": "2024-01-02T00:00:00Z", "order_by": "updated"}.get(field)
+        if value is None:
+            annotation = SearchFilters.model_fields[field].annotation
+            value = 7 if annotation is int else True
+        response = client.post("/search", json={"calendar_id": "primary", field: value})
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.list_events.call_args.kwargs
+        # the flat key reached the proxy call under its SearchFilters name
+        proxy_key = {"query": "q"}.get(field, field)
+        assert forwarded[proxy_key] == value
+
+    def test_nested_wins_per_field_on_conflict(self, client, mock_proxy_client):
+        response = client.post(
+            "/search",
+            json={
+                "calendar_id": "primary",
+                "time_min": "FLAT-MIN",
+                "time_max": "FLAT-MAX",
+                "filters": {"time_min": "NESTED-MIN"},
+            },
+        )
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.list_events.call_args.kwargs
+        assert forwarded["time_min"] == "NESTED-MIN"
+        assert forwarded["time_max"] == "FLAT-MAX"
+
+    def test_explicit_null_flat_keys_mean_not_supplied(self, client, mock_proxy_client):
+        """A client that serializes every optional field as null gets defaults, not a 422."""
+        response = client.post(
+            "/search",
+            json={"calendar_id": "primary", "query": None, "time_min": None,
+                  "max_results": None, "order_by": None, "show_deleted": None},
+        )
+        assert response.status_code == 200, response.text
+        forwarded = mock_proxy_client.list_events.call_args.kwargs
+        assert forwarded["max_results"] == 100
+        assert forwarded["show_deleted"] is False
+
+    @pytest.mark.parametrize("bad_filters", ["oops", [], 0, ""])
+    def test_malformed_filters_with_flat_keys_is_a_clean_422(
+        self, client, mock_proxy_client, bad_filters
+    ):
+        """PR #1's regressions: a non-mapping `filters` alongside a flat key
+        was a 500 (TypeError), and `or {}` turned []/""/0 into defaults."""
+        response = client.post(
+            "/search",
+            json={"calendar_id": "primary", "time_min": "2024-01-01T00:00:00Z",
+                  "filters": bad_filters},
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["success"] is False
+        assert ["body", "filters"] in [err["loc"][:2] for err in response.json()["detail"]]
+        mock_proxy_client.list_events.assert_not_called()
