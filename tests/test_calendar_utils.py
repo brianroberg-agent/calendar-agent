@@ -6,6 +6,7 @@ from calendar_agent.calendar_utils import (
     READ_RESPONSE_STATUSES,
     RSVP_RESPONSES,
     RSVP_STATES,
+    attendee_entries,
     calendar_perspective,
     find_free_slots,
     format_attendees,
@@ -183,6 +184,32 @@ def test_format_attendees_empty_list():
 def test_format_attendees_none():
     """Test formatting None attendees."""
     assert format_attendees(None) == "No attendees"
+
+
+def test_format_attendees_skips_non_dict_rows():
+    """A non-dict row is skipped, not raised on (finding 7, round 4)."""
+    attendees = [None, "bob@example.com", {"email": "alice@example.com", "responseStatus": "accepted"}]
+    assert format_attendees(attendees) == "alice@example.com (accepted)"
+
+
+def test_format_attendees_only_non_dict_rows_reads_as_none():
+    assert format_attendees([None]) == "No attendees"
+
+
+# ============================================================================
+# Tests for attendee_entries
+# ============================================================================
+
+
+def test_attendee_entries_keeps_only_dict_rows():
+    event = {"attendees": [None, "bob@example.com", {"email": "alice@example.com"}]}
+    assert attendee_entries(event) == [{"email": "alice@example.com"}]
+
+
+def test_attendee_entries_non_list_or_missing_is_empty():
+    assert attendee_entries({"attendees": "not-a-list"}) == []
+    assert attendee_entries({"attendees": None}) == []
+    assert attendee_entries({}) == []
 
 
 # ============================================================================

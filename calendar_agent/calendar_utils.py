@@ -39,18 +39,36 @@ class CalendarPerspective(NamedTuple):
     rsvp_state: RsvpState
 
 
+def _dict_rows(rows: Any) -> list[dict[str, Any]]:
+    """The dict elements of ``rows``; ``[]`` when ``rows`` is not a list."""
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def attendee_entries(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """The event's attendee rows that are dicts.
+
+    The one definition of "an attendee" shared by attendee_count, the
+    perspective classifier, the briefing prompt and format_attendees, so a
+    non-dict row (not something a Google-conformant proxy sends) is skipped
+    the same way everywhere instead of being counted in one place and
+    ignored in another. A missing or non-list ``attendees`` is ``[]``.
+    """
+    return _dict_rows(event.get("attendees"))
+
+
 def calendar_perspective(event: dict[str, Any]) -> CalendarPerspective:
     """Organizer flag and RSVP state of the calendar this event copy sits on.
 
     Uses Google's ``organizer.self`` and the ``self: true`` attendee entry,
     which by Google's definition describe the calendar being read. A
-    malformed organizer or attendee row (not a dict) is treated as absent
-    rather than raised on, so one bad row cannot fail a whole page.
+    non-dict organizer is treated as absent and non-dict attendee rows are
+    skipped (attendee_entries), rather than raised on.
     """
     organizer = event.get("organizer")
     organizer = organizer if isinstance(organizer, dict) else {}
-    attendees = event.get("attendees")
-    attendees = [a for a in attendees if isinstance(a, dict)] if isinstance(attendees, list) else []
+    attendees = attendee_entries(event)
     is_organizer = bool(organizer.get("self"))
     own_entry = next((a for a in attendees if a.get("self")), None)
     own_status = own_entry.get("responseStatus") if own_entry is not None else None
@@ -144,7 +162,8 @@ def get_event_duration_minutes(
 
 
 def format_attendees(attendees: list[dict[str, Any]] | None) -> str:
-    """Format attendee list for display."""
+    """Format attendee list for display. Non-dict rows are skipped."""
+    attendees = _dict_rows(attendees)
     if not attendees:
         return "No attendees"
 
@@ -184,7 +203,7 @@ def get_event_summary_text(event: dict[str, Any]) -> str:
     location = event.get("location", "")
     start = event.get("start", {})
     end = event.get("end", {})
-    attendees = event.get("attendees", [])
+    attendees = attendee_entries(event)
 
     parts = [
         f"Title: {summary}",

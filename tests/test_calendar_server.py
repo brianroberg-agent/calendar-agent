@@ -167,6 +167,9 @@ class TestEventToSummary:
         assert summary.creator_email is None
         assert summary.calendar_is_organizer is False
         assert summary.calendar_rsvp_state == "unknown"
+        # attendee_count agrees with the perspective: the non-dict rows are
+        # not attendees, so the count is 0, not 2 (finding 7, round 4).
+        assert summary.attendee_count == 0
         event["attendees"] = "not-a-list"
         assert event_to_summary(event, "primary").attendee_count == 0
 
@@ -312,6 +315,7 @@ class TestEventsListEndpoint:
         assert data["success"] is True
         assert len(data["events"]) == 1
         assert data["events"][0]["calendar_rsvp_state"] == "unknown"
+        assert data["events"][0]["attendee_count"] == 0
 
     def test_list_serves_a_bare_cancelled_stub(self, client, mock_proxy_client):
         """A plain GET with single_events=false returns stubs without

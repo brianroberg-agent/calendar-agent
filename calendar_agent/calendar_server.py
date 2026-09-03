@@ -33,6 +33,7 @@ from .calendar_utils import (
     RSVP_RESPONSES,
     RsvpResponse,
     RsvpState,
+    attendee_entries,
     calendar_perspective,
     find_free_slots,
     get_event_time,
@@ -687,7 +688,6 @@ def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
     The ``calendar_*`` fields are derived from Google's ``self`` flags and so
     describe ``calendar_id`` -- the calendar this copy of the event sits on.
     """
-    attendees = event.get("attendees")
     organizer = event.get("organizer")
     creator = event.get("creator")
     perspective = calendar_perspective(event)
@@ -700,9 +700,10 @@ def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
         start=get_event_time(event.get("start")),
         end=get_event_time(event.get("end")),
         location=event.get("location"),
-        # Non-dict organizer/creator/attendee values read as absent rather
-        # than raising, so one malformed row cannot 500 a whole page.
-        attendee_count=len(attendees) if isinstance(attendees, list) else 0,
+        # A non-dict organizer/creator reads as absent and non-dict attendee
+        # rows are skipped, rather than raising; the count uses the same
+        # definition of "attendee" as calendar_rsvp_state.
+        attendee_count=len(attendee_entries(event)),
         is_all_day=is_all_day_event(event),
         status=event.get("status"),
         html_link=event.get("htmlLink"),
