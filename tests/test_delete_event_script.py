@@ -24,6 +24,7 @@ SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "calendar-delete-e
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_UNKNOWN = 2
+EXIT_NOT_FOUND = 3
 
 
 class _FakeAgentHandler(BaseHTTPRequestHandler):
@@ -195,6 +196,46 @@ class TestUnknownOutcome:
         result = run_script(fake_agent)
         assert result.returncode == EXIT_UNKNOWN
         assert "RESULT: UNKNOWN" in result.stdout
+
+
+class TestNotFound:
+    """Exit 3 means the id never existed; a 404 delete is not evidence of work.
+
+    A DELETE that itself 404s is indistinguishable, by exit-0 SUCCESS alone,
+    from a completed deletion of a real event: both re-reads come back 404.
+    A mistyped or already-gone event id must not be reported as success.
+    """
+
+    def test_delete_404_with_get_404_is_not_found(self, fake_agent):
+        fake_agent.script["delete"] = {
+            "status": 404,
+            "body": {"success": False, "message": "Event not found"},
+        }
+        result = run_script(fake_agent)
+        assert result.returncode == EXIT_NOT_FOUND
+        assert "RESULT: NOT FOUND" in result.stdout
+        assert "RESULT: SUCCESS" not in result.stdout
+
+    def test_delete_410_with_get_404_is_not_found(self, fake_agent):
+        fake_agent.script["delete"] = {
+            "status": 410,
+            "body": {"success": False, "message": "Event gone"},
+        }
+        result = run_script(fake_agent)
+        assert result.returncode == EXIT_NOT_FOUND
+        assert "RESULT: NOT FOUND" in result.stdout
+
+    def test_delete_404_but_get_still_present_is_failure(self, fake_agent):
+        """A 404 delete followed by a present re-read is the FAILURE path,
+        not NOT FOUND — the claim only matters when verify says gone."""
+        fake_agent.script["delete"] = {
+            "status": 404,
+            "body": {"success": False, "message": "Event not found"},
+        }
+        fake_agent.script["get"] = confirmed_event()
+        result = run_script(fake_agent)
+        assert result.returncode == EXIT_FAILURE
+        assert "RESULT: FAILURE" in result.stdout
 
 
 class TestNoRetryOnItsOwn:

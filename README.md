@@ -357,6 +357,7 @@ the delete's own answer, and reports three outcomes through its exit status:
 | `0` | `SUCCESS` | The event is gone — re-read returned `404`, or `status: cancelled` |
 | `1` | `FAILURE` | The event is still there and nothing is outstanding (rejected, or `success: false`) |
 | `2` | `UNKNOWN` | The event is still there but the deletion may yet be applied, or the re-read established nothing |
+| `3` | `NOT FOUND` | The DELETE itself answered `404`/`410` — the event id (or calendar id) didn't exist before this ran, so nothing was deleted. Check the id; a re-read that also 404s is not evidence of a completed deletion |
 
 ```bash
 CALENDAR_AGENT_URL=http://localhost:8082 \

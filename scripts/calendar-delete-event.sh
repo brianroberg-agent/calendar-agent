@@ -13,10 +13,14 @@
 # going to happen. This script therefore decides by re-reading the event, and
 # reports three distinct outcomes (issue #4):
 #
-#   exit 0  SUCCESS  the event is gone (404, or status "cancelled")
-#   exit 1  FAILURE  the event is still there and nothing is outstanding
-#   exit 2  UNKNOWN  the event is still there but the deletion may yet land,
-#                    or the re-read could not establish either
+#   exit 0  SUCCESS   the event is gone (404, or status "cancelled")
+#   exit 1  FAILURE   the event is still there and nothing is outstanding
+#   exit 2  UNKNOWN   the event is still there but the deletion may yet land,
+#                     or the re-read could not establish either
+#   exit 3  NOT FOUND the DELETE itself answered 404/410 - the event id (or
+#                     calendar id) did not exist before this script ran, so
+#                     nothing was deleted. A re-read that also 404s is not
+#                     evidence of a completed deletion; check the id.
 #
 # Callers must treat exit 2 as "do not act": in particular, never create a
 # replacement event until a delete is observed complete.
@@ -82,6 +86,7 @@ else
         204)                    claim="deleted" ;;
         200) [ "$body_success" = "true" ] && claim="deleted" || claim="failed" ;;
         408|504)                claim="unknown" ;;
+        404|410)                claim="absent" ;;
         *)                      claim="failed" ;;
     esac
 fi
@@ -119,6 +124,11 @@ fi
 # ---------------------------------------------------------------------------
 case "$verify" in
     gone)
+        if [ "$claim" = "absent" ]; then
+            echo "RESULT: NOT FOUND - no such event before the delete was" \
+                 "attempted (nothing was deleted)"
+            exit 3
+        fi
         echo "RESULT: SUCCESS - event no longer present"
         exit 0
         ;;

@@ -97,8 +97,10 @@ uv run pytest --cov=calendar_agent  # With coverage
 
 - `scripts/calendar-delete-event.sh` is the supported way to delete an event
   from a script. It re-reads the event to decide, and exits `0` success /
-  `1` failure / `2` unknown. Exit `2` means do not act — never create a
-  replacement event until a deletion has been observed complete
+  `1` failure / `2` unknown / `3` not found (the DELETE itself 404/410'd —
+  the id never existed, nothing was deleted). Exit `2` means do not act —
+  never create a replacement event until a deletion has been observed
+  complete
 - It is covered end to end by `tests/test_delete_event_script.py`, which runs
   the real script against a loopback stub of calendar-agent
 
