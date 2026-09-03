@@ -2123,3 +2123,57 @@ class TestUnknownFieldsRejected:
             },
         )
         assert response.status_code == 422
+
+
+# ============================================================================
+# Validation-Error Envelope Tests (issue #8, second review round)
+#
+# With extra="forbid", a 422 is now the main way a misnamed field fails. The
+# briefing skills pipe responses through
+#   jq 'if .success then .briefing else "Error: " + .error end'
+# so a 422 that carries only FastAPI's default {"detail": [...]} renders as a
+# blank "Error: ". Every 422 must carry the same success/error envelope as
+# every other failure; `detail` is kept for clients that read it.
+# ============================================================================
+
+
+class TestValidationErrorEnvelope:
+    """A 422 carries {"success": false, "error": "..."} plus FastAPI's `detail`."""
+
+    def test_unknown_field_422_carries_envelope(self, client):
+        response = client.post("/calendars/primary/events", json={"title": "Standup"})
+        assert response.status_code == 422
+        data = response.json()
+        assert data["success"] is False
+        assert "title" in data["error"]
+        assert "Extra inputs are not permitted" in data["error"]
+        assert data["detail"][0]["type"] == "extra_forbidden"
+        assert data["detail"][0]["loc"] == ["body", "title"]
+
+    def test_missing_field_422_carries_envelope(self, client):
+        response = client.post(
+            "/ask-about", json={"calendar_id": "primary", "event_id": "event_123"}
+        )
+        assert response.status_code == 422
+        data = response.json()
+        assert data["success"] is False
+        assert "question" in data["error"]
+        assert "Field required" in data["error"]
+
+    def test_multiple_errors_are_all_named(self, client):
+        response = client.post(
+            "/find-free-time",
+            json={
+                "calendar_id": "primary",
+                "time_min": "2024-01-15T09:00:00Z",
+                "time_max": "2024-01-15T17:00:00Z",
+                "duration_minutes": 0,
+                "preferMorning": True,
+            },
+        )
+        assert response.status_code == 422
+        data = response.json()
+        assert data["success"] is False
+        assert "duration_minutes" in data["error"]
+        assert "preferMorning" in data["error"]
+        assert len(data["detail"]) == 2

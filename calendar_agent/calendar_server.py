@@ -25,7 +25,9 @@ from enum import Enum
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -67,6 +69,28 @@ app = FastAPI(
     description="A privacy-focused FastAPI server for Google Calendar operations with AI agents",
     version=__version__,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_envelope(request: Request, exc: RequestValidationError):
+    """Return 422s in the same success/error envelope as every other failure.
+
+    FastAPI's default 422 body is {"detail": [...]} with no `success` or
+    `error` key. With unknown fields rejected (issue #8) a 422 is the main way
+    a misnamed field now fails, and callers that read the envelope (e.g. the
+    briefing skills' `jq 'if .success then .briefing else "Error: " + .error
+    end'`) would render a blank error. `detail` is kept for clients that read
+    FastAPI's structure.
+    """
+    errors = jsonable_encoder(exc.errors())
+    message = "; ".join(
+        f"{'.'.join(str(part) for part in err.get('loc', ()))}: {err.get('msg', '')}"
+        for err in errors
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "error": message, "detail": errors},
+    )
 
 
 # ============================================================================
