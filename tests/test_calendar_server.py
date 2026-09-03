@@ -2527,3 +2527,89 @@ class TestSearchFlatShapeFold:
         assert response.json()["success"] is False
         assert ["body", "filters"] in [err["loc"][:2] for err in response.json()["detail"]]
         mock_proxy_client.list_events.assert_not_called()
+
+
+# ============================================================================
+# Unknown query-string keys (C2)
+#
+# Body fields are strict, but FastAPI ignores undeclared query parameters:
+# GET /calendars/x/events?timeMin=..&timeMax=.. ran an unbounded list, and
+# ?sendUpdates=all on a write meant nobody was emailed while the caller was
+# told success. A shared dependency now 422s any query key the route does
+# not declare.
+# ============================================================================
+
+
+class TestUnknownQueryParamsRejected:
+    """An undeclared query-string key is a 422, not silently ignored."""
+
+    def test_google_style_time_bounds_on_list_events(self, client, mock_proxy_client):
+        response = client.get(
+            "/calendars/primary/events",
+            params={"timeMin": "2026-01-01T00:00:00Z", "timeMax": "2026-02-01T00:00:00Z",
+                    "maxResults": 5},
+        )
+        assert response.status_code == 422, response.text
+        data = response.json()
+        assert data["success"] is False
+        assert [err["loc"] for err in data["detail"]] == [
+            ["query", "timeMin"], ["query", "timeMax"], ["query", "maxResults"]
+        ]
+        assert all(err["type"] == "extra_forbidden" for err in data["detail"])
+        assert "timeMin" in data["error"]
+        mock_proxy_client.list_events.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "method,path,body",
+        [
+            pytest.param("post", "/calendars/primary/events", {"summary": "s"}, id="POST create"),
+            pytest.param("put", "/calendars/primary/events/e1", {"summary": "s"}, id="PUT update"),
+            pytest.param("patch", "/calendars/primary/events/e1", {"summary": "s"}, id="PATCH patch"),
+            pytest.param("delete", "/calendars/primary/events/e1", None, id="DELETE delete"),
+        ],
+    )
+    def test_camelcase_send_updates_on_writes(self, client, mock_proxy_client, method, path, body):
+        kwargs = {"json": body} if body is not None else {}
+        response = getattr(client, method)(path, params={"sendUpdates": "all"}, **kwargs)
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["loc"] == ["query", "sendUpdates"]
+        for forwarder in ("create_event", "update_event", "patch_event", "delete_event"):
+            getattr(mock_proxy_client, forwarder).assert_not_called()
+
+    def test_declared_query_params_still_accepted(self, client, mock_proxy_client):
+        response = client.get(
+            "/calendars/primary/events",
+            params={"time_min": "2026-01-01T00:00:00Z", "max_results": 5, "q": "x",
+                    "single_events": "false", "order_by": "updated", "page_token": "t",
+                    "time_max": "2026-02-01T00:00:00Z"},
+        )
+        assert response.status_code == 200, response.text
+        response = client.post(
+            "/calendars/primary/events", params={"send_updates": "all"}, json={"summary": "s"}
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.create_event.call_args.kwargs["send_updates"] == "all"
+
+    def test_route_with_no_query_params_rejects_any_key(self, client, mock_proxy_client):
+        response = client.post(
+            "/search", params={"max_results": 5}, json={"calendar_id": "primary"}
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["loc"] == ["query", "max_results"]
+        mock_proxy_client.list_events.assert_not_called()
+
+    def test_every_route_is_guarded(self, client, subtests):
+        """Walk the app's own routes: none of them may accept a bogus query key."""
+        from tests.test_readme_documentation import get_all_endpoints
+
+        for method, path in get_all_endpoints():
+            with subtests.test(endpoint=f"{method} {path}"):
+                url = path.replace("{calendar_id}", "primary").replace("{event_id}", "e1")
+                kwargs = {"json": {}} if method in ("POST", "PUT", "PATCH") else {}
+                response = getattr(client, method.lower())(
+                    url, params={"bogus_query_key": "x"}, **kwargs
+                )
+                assert response.status_code == 422, f"{method} {path}: {response.text}"
+                assert ["query", "bogus_query_key"] in [
+                    err["loc"] for err in response.json()["detail"]
+                ]

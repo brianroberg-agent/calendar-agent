@@ -25,7 +25,7 @@ from enum import Enum
 from typing import Annotated, Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -64,10 +64,38 @@ load_dotenv()
 # FastAPI App Setup
 # ============================================================================
 
+async def reject_unknown_query_params(request: Request) -> None:
+    """422 any query-string key the matched route does not declare.
+
+    FastAPI ignores undeclared query parameters, which is the same silent
+    wrong answer as an ignored body field (issue #8): `?timeMin=..` on the
+    events list ran an unbounded list, `?sendUpdates=all` on a write emailed
+    nobody while reporting success. The allowed set is derived from the
+    route's own declared query parameters, so there is no list to maintain.
+    Applied to every route via the app-level dependency below.
+    """
+    route = request.scope.get("route")
+    if route is None:
+        return
+    allowed = {param.alias for param in route.dependant.query_params}
+    unknown = [key for key in request.query_params if key not in allowed]
+    if unknown:
+        raise RequestValidationError([
+            {
+                "type": "extra_forbidden",
+                "loc": ("query", key),
+                "msg": "Extra inputs are not permitted",
+                "input": request.query_params[key],
+            }
+            for key in unknown
+        ])
+
+
 app = FastAPI(
     title="Calendar Agent",
     description="A privacy-focused FastAPI server for Google Calendar operations with AI agents",
     version=__version__,
+    dependencies=[Depends(reject_unknown_query_params)],
 )
 
 
