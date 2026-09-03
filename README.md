@@ -102,10 +102,11 @@ Every endpoint returns a body with a `success` field, and on failure an
 | Status | Meaning |
 |--------|---------|
 | `200` | The operation succeeded (`success: true`) |
+| `400` | The proxy rejected the request as malformed or not applicable; the proxy's message is in `error` (e.g. `/respond` when the authenticated user is not an attendee of the event) |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
-| `404` | The calendar or event does not exist. When verifying a deletion this is the *expected* answer: the event is gone |
+| `404` | The calendar or event does not exist (the proxy's message is in `error`). When verifying a deletion this is the *expected* answer: the event is gone |
 | `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) — nothing was sent upstream. A bulk `update`/`patch` with no `updates` payload rejects the **whole batch** this way, before any operation runs |
-| `502` | The proxy or LLM backend failed; the proxy refused the request with a 4xx other than 401/403/404 (its message is carried in `error`; e.g. `/respond` when the authenticated user is not an attendee); or, on a delete, the proxy claimed success for an event that is still present on re-read |
+| `502` | The proxy or LLM backend failed; the proxy answered 401 (this service's own key was rejected) or a 4xx other than 400/403/404 (its message is in `error`); or, on a delete, the proxy claimed success for an event that is still present on re-read |
 | `504` | **The outcome is unknown**: no response before this server's timeout and the resource is still present, or the verifying re-read itself failed. A confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
 
 Mutation envelopes (`DELETE …/events/{id}` and each `/bulk-actions` result)
@@ -516,8 +517,8 @@ only that entry, and sends no invitations or notifications.
 >
 > If the authenticated user is not an attendee, the proxy answers
 > `400 You are not an attendee of this event; cannot RSVP.` This service
-> surfaces that as **`502`** with the proxy's message in `error` (every proxy
-> 4xx other than 401/403 maps to 502 here -- see Error Responses).
+> passes that through as **`400`** with the proxy's message in `error` (see
+> Error Responses for which proxy statuses pass through and which map to 502).
 
 Request body:
 - `response_status` (string): one of `accepted`, `declined`, `tentative`

@@ -77,16 +77,21 @@ uv run pytest --cov=calendar_agent  # With coverage
   it must not be folded into the generic upstream-error bucket)
 - Use `ProxyTimeoutError` when the proxy doesn't answer before the client
   timeout (outcome unknown — the mutation may still complete if approved)
+- Use `ProxyRequestError` for any other 4xx (it carries the proxy's status
+  and message; `error_status_code` passes 400 through and maps the rest to
+  502 — 404/410 never reach it, they are `ProxyNotFoundError`)
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
 - Always return the `{"success": false, "error": "..."}` envelope via
   `error_response(...)` so the HTTP status agrees with the body (issue #4):
-  403 forbidden/rejected, 404 absent, 504 outcome unknown, 502 upstream
-  proxy/LLM failure (or a delete the proxy claimed but the re-read
-  contradicts), 500 unexpected — never 200 for a failure. Caller errors are
-  422 from request validation (no envelope), raised *before* anything is
-  sent upstream — e.g. `BulkOperation`'s validator requiring `updates` for
-  update/patch. Nothing returns 400
+  400 passed through from a proxy 400 (`ProxyRequestError`; e.g. `/respond`
+  when the authenticated user is not an attendee), 403 forbidden/rejected,
+  404 absent (`ProxyNotFoundError`), 504 outcome unknown, 502 upstream
+  proxy/LLM failure (including a proxy 401 or any other proxy 4xx, or a
+  delete the proxy claimed but the re-read contradicts), 500 unexpected —
+  never 200 for a failure. Caller errors are 422 from request validation
+  (no envelope), raised *before* anything is sent upstream — e.g.
+  `BulkOperation`'s validator requiring `updates` for update/patch
 - Every mutation envelope carries an `outcome` (`OperationOutcome`):
   `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items.
   Never collapse `unknown` into `failed`: a timed-out mutation may still be

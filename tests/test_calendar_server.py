@@ -13,6 +13,7 @@ from calendar_agent.exceptions import (
     ProxyError,
     ProxyForbiddenError,
     ProxyNotFoundError,
+    ProxyRequestError,
     ProxyTimeoutError,
 )
 from calendar_agent.proxy_client import (
@@ -622,6 +623,21 @@ class TestEventRespondEndpoint:
         assert data["success"] is False
         assert "Outcome unknown" in data["error"]
 
+    def test_respond_not_an_attendee_passes_the_proxys_400_through(self, client, mock_proxy_client):
+        """The proxy's 400 ("not an attendee") reaches the caller as 400 with
+        the proxy's message in ``error`` (finding 3, round 4) -- not 502."""
+        mock_proxy_client.respond_to_event.side_effect = ProxyRequestError(
+            400, "You are not an attendee of this event; cannot RSVP."
+        )
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["success"] is False
+        assert "You are not an attendee of this event; cannot RSVP." in data["error"]
+
 
 # ============================================================================
 # Proxy Client Tests
@@ -804,6 +820,48 @@ class TestProxyClientTimeouts:
                 await client.get_event("primary", "e1")
         assert not isinstance(exc_info.value, ProxyTimeoutError)
         assert "Proxy connection failed" in str(exc_info.value)
+
+
+class TestProxyClientRequestErrors:
+    """A proxy 4xx other than 401/403/404/410 raises ProxyRequestError carrying
+    the upstream status and message (finding 3, round 4). 404 and 410 stay
+    ProxyNotFoundError, which delete verification depends on (issue #4)."""
+
+    def _response(self, status: int, detail: str):
+        r = AsyncMock(spec=httpx.Response)
+        r.status_code = status
+        r.json.return_value = {"detail": detail}
+        return r
+
+    def test_400_carries_status_and_message(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyRequestError) as exc_info:
+            client._handle_response(
+                self._response(400, "You are not an attendee of this event; cannot RSVP.")
+            )
+        assert exc_info.value.status_code == 400
+        assert str(exc_info.value) == "You are not an attendee of this event; cannot RSVP."
+
+    def test_404_is_not_found_error_not_request_error(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyNotFoundError) as exc_info:
+            client._handle_response(self._response(404, "Not Found"))
+        assert not isinstance(exc_info.value, ProxyRequestError)
+        assert str(exc_info.value) == "Not Found"
+
+    def test_other_4xx_is_still_a_request_error(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyRequestError) as exc_info:
+            client._handle_response(self._response(409, "conflict"))
+        assert exc_info.value.status_code == 409
+        assert isinstance(exc_info.value, ProxyError)
+
+    def test_401_and_403_keep_their_own_types(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyAuthError):
+            client._handle_response(self._response(401, "bad key"))
+        with pytest.raises(ProxyForbiddenError):
+            client._handle_response(self._response(403, "rejected"))
 
 
 # ============================================================================
@@ -1215,6 +1273,35 @@ class TestProxyErrorHandling:
         data = response.json()
         assert data["success"] is False
         assert "Proxy error" in data["error"]
+
+    def test_proxy_404_passes_message_through_as_404(self, client, mock_proxy_client):
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
+        response = client.get("/calendars/primary/events/nope")
+        assert response.status_code == 404
+        data = response.json()
+        assert data["success"] is False
+        assert "Not Found" in data["error"]
+
+    def test_proxy_400_passes_through_as_400(self, client, mock_proxy_client):
+        mock_proxy_client.list_events.side_effect = ProxyRequestError(400, "Bad Request")
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 400
+        assert response.json()["success"] is False
+
+    def test_other_proxy_4xx_still_maps_to_502(self, client, mock_proxy_client):
+        """Only 400 passes through (404 is ProxyNotFoundError); any other proxy
+        4xx is still 502."""
+        mock_proxy_client.get_event.side_effect = ProxyRequestError(409, "conflict")
+        response = client.get("/calendars/primary/events/e1")
+        assert response.status_code == 502
+        assert "conflict" in response.json()["error"]
+
+    def test_proxy_401_maps_to_502(self, client, mock_proxy_client):
+        """A proxy 401 (this service's own key rejected) is an upstream
+        failure from the caller's point of view: 502, not 401."""
+        mock_proxy_client.get_event.side_effect = ProxyAuthError("Invalid API key")
+        response = client.get("/calendars/primary/events/e1")
+        assert response.status_code == 502
 
 
 # ============================================================================

@@ -44,6 +44,7 @@ from .exceptions import (
     ProxyError,
     ProxyForbiddenError,
     ProxyNotFoundError,
+    ProxyRequestError,
     ProxyTimeoutError,
 )
 from .llm_service import get_llm_service
@@ -467,6 +468,8 @@ def format_proxy_error(e: Exception) -> str:
         return f"Not found: {e}"
     if isinstance(e, ProxyTimeoutError):
         return f"Outcome unknown: {e}"
+    if isinstance(e, ProxyRequestError):
+        return f"Proxy rejected the request ({e.status_code}): {e}"
     if isinstance(e, ProxyError):
         return f"Proxy error: {e}"
     return str(e)
@@ -477,14 +480,19 @@ def error_status_code(e: Exception) -> int:
 
     The success/error envelope stays in the body; the status code must agree
     with it (issue #4): 403 passes through an operator rejection or policy
-    block, 404 an absent calendar or event, 504 marks a timed-out call whose
-    outcome is unknown, 502 covers upstream proxy/LLM failures, 500 anything
-    unexpected.
+    block; 404 an absent calendar or event (ProxyNotFoundError); 400 passes
+    through a proxy 400 with its message (ProxyRequestError, e.g. /respond
+    when the authenticated user is not an attendee); 504 marks a timed-out
+    call whose outcome is unknown; 502 covers upstream proxy/LLM failures,
+    including a proxy 401 (this service's own key rejected) and any other
+    proxy 4xx; 500 anything unexpected.
     """
     if isinstance(e, ProxyForbiddenError):
         return 403
     if isinstance(e, ProxyNotFoundError):
         return 404
+    if isinstance(e, ProxyRequestError) and e.status_code == 400:
+        return 400
     if isinstance(e, ProxyTimeoutError):
         return 504
     if isinstance(e, ProxyAuthError | ProxyError | LLMError):
@@ -993,7 +1001,7 @@ async def respond_to_event(
 
     If the authenticated user is not an attendee, the proxy answers 400
     ("You are not an attendee of this event; cannot RSVP."), which this
-    server surfaces as 502 with that message in ``error``. Like other
+    server passes through as 400 with that message in ``error``. Like other
     mutations, the proxy blocks while a human operator approves the RSVP:
     403 means it was rejected (or the operator never answered); 504 means
     no response before this server's timeout and the outcome is unknown --

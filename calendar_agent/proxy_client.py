@@ -14,6 +14,7 @@ from .exceptions import (
     ProxyError,
     ProxyForbiddenError,
     ProxyNotFoundError,
+    ProxyRequestError,
     ProxyTimeoutError,
 )
 
@@ -160,8 +161,11 @@ class CalendarProxyClient:
             raise ProxyError(f"Proxy server error: {message}")
 
         if response.status_code >= 400:
+            # Any other 4xx (404/410 were handled above): keep the proxy's status
+            # and message so the server can pass 400 through
+            # (calendar_server.error_status_code).
             message = self._parse_error_message(response, "Bad request")
-            raise ProxyError(f"Proxy error ({response.status_code}): {message}")
+            raise ProxyRequestError(response.status_code, message)
 
         return response.json()
 
