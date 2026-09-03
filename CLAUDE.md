@@ -98,9 +98,12 @@ uv run pytest --cov=calendar_agent  # With coverage
   404 absent (`ProxyNotFoundError`), 504 outcome unknown, 502 upstream
   proxy/LLM failure (including a proxy 401 or any other proxy 4xx, or a
   delete the proxy claimed but the re-read contradicts), 500 unexpected —
-  never 200 for a failure. Caller errors are 422 from request validation
-  (no envelope), raised *before* anything is sent upstream — e.g.
-  `BulkOperation`'s validator requiring `updates` for update/patch
+  never 200 for a failure. Caller errors are 422 from request validation,
+  raised *before* anything is sent upstream — e.g. `_BulkWriteOperation`'s
+  validator requiring a non-empty `updates` for update/patch
+- 422s carry the same envelope: the `RequestValidationError` handler
+  (`validation_error_envelope`) returns `{"success": false, "error":
+  "<loc>: <msg>; ...", "detail": [...]}` — keep `detail`, callers read it
 - Every mutation envelope carries an `outcome` (`OperationOutcome`):
   `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items.
   Never collapse `unknown` into `failed`: a timed-out mutation may still be
@@ -152,6 +155,26 @@ uv run pytest --cov=calendar_agent  # With coverage
   merge for any of this to take effect
 - It is covered end to end by `tests/test_delete_event_script.py`, which runs
   the real script against a loopback stub of calendar-agent
+
+### Request Validation (issue #8)
+
+- Every request body model extends `StrictRequestModel` (`extra="forbid"`),
+  nested ones included; `tests/test_calendar_server.py::TestRequestModelsAreStrict`
+  walks the routes and fails on any model that doesn't, or on any request
+  field typed as a bare `dict` (that would forward unknown keys verbatim)
+- Undeclared query-string keys are a 422 too, via the app-level
+  `reject_unknown_query_params` dependency; the allowed set is the route's
+  own declared parameters, so nothing to maintain when adding one
+- Event write bodies (create / PUT / PATCH / bulk `updates`) share
+  `EventFields`; add a new Google event field there, once. Google's
+  server-populated read-only keys are stripped by the named
+  `GOOGLE_READ_ONLY_EVENT_FIELDS` set so fetched events round-trip — keep
+  that set and the README list in sync
+- `/search` accepts filter keys flat or nested; the fold derives its
+  allowlist from `SearchFilters.model_fields`, so adding a filter field
+  needs no allowlist edit (a test parametrized over `model_fields` covers it)
+- Document every accepted field in README.md — the strict models make the
+  README the contract callers must match
 
 ## Testing Guidelines
 

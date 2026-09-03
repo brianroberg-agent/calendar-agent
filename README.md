@@ -111,7 +111,7 @@ Every endpoint returns a body with a `success` field, and on failure an
 | `400` | The proxy rejected the request as malformed or not applicable, and its message is in `error` (e.g. `/respond` when the authenticated user is not an attendee of the event); also this service's own refusal to RSVP through a calendar that is not the authenticated user's own, which is not forwarded to the proxy at all |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
 | `404` | The calendar or event does not exist (the proxy's message is in `error`). When verifying a deletion this is the *expected* answer: the event is gone |
-| `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) — nothing was sent upstream. A bulk `update`/`patch` with no `updates` payload rejects the **whole batch** this way, before any operation runs |
+| `422` | Request validation failed: an unknown field or query key, a missing required field, or a bad value — nothing was sent upstream. Same `success: false` / `error` envelope as every other failure, plus FastAPI's `detail` list (see below). A bulk `update`/`patch` with a missing or empty `updates` payload rejects the **whole batch** this way, before any operation runs |
 | `502` | The proxy or LLM backend failed; the proxy answered 401 (this service's own key was rejected) or a 4xx other than 400/403/404 (its message is in `error`); or, on a delete, the proxy claimed success for an event that is still present on re-read |
 | `504` | **The outcome is unknown**: no response before this server's timeout and the resource is still present, or the verifying re-read itself failed. A confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
 
@@ -121,15 +121,63 @@ also carry an `outcome` of `succeeded` / `failed` / `unknown` (bulk only:
 "may still apply".
 | `500` | Unexpected internal error |
 
-**Unknown fields are rejected, not ignored.** Every request body model uses
-`extra="forbid"` ([issue #8](https://github.com/brianroberg/calendar-agent/issues/8)):
-a key the model doesn't declare -- a typo, or a Google/JS-style name like
-`timeMin` instead of `time_min`, or `title` instead of `summary` -- is a
-`422`, at any nesting depth (e.g. inside `attendees` or `filters`), not a
-silently-dropped no-op. Before this, such a request could return
-`success: true` while quietly doing something other than what was asked
-(an unbounded search when time bounds were misnamed, an event titled
-"Untitled Event" when `title` was sent instead of `summary`).
+#### Validation: unknown fields are rejected, not ignored
+
+Every request body model uses `extra="forbid"`
+([issue #8](https://github.com/brianroberg/calendar-agent/issues/8)): a key the
+model doesn't declare -- a typo, or a Google/JS-style name like `timeMin`
+instead of `time_min`, or `title` instead of `summary` -- is a `422`, at any
+nesting depth (inside `attendees`, `filters`, a bulk `operation`'s `updates`,
+...), not a silently-dropped no-op. Before this, such a request could return
+`success: true` while quietly doing something other than what was asked (an
+unbounded search when time bounds were misnamed, an event titled "Untitled
+Event" when `title` was sent instead of `summary`).
+
+The same rule covers the **query string**: a query key the route does not
+declare (`?timeMin=...` on the events list, `?sendUpdates=all` on a write) is
+a `422` with `loc: ["query", "<key>"]`, not ignored.
+
+**Which fields are accepted.** Each route accepts exactly the fields its
+section below lists. The three event-write routes -- `POST` create, `PUT`
+update and `PATCH` -- all accept the same set (the one listed under
+`POST /calendars/{calendar_id}/events`), so anything you can create you can
+also update or patch, including `status` (`"cancelled"` is Google's cancel
+path). A bulk `update`/`patch` operation's `updates` object is validated with
+the same model as `PUT`/`PATCH`; a bulk `delete` must not carry `updates`.
+
+**Round-tripping a fetched event.** Google adds server-populated, read-only
+keys to every event it returns. So that fetch -> modify -> write works, the
+event-write routes strip exactly this named set before checking for unknown
+fields, and never forward them:
+
+`kind`, `etag`, `id`, `htmlLink`, `hangoutLink`, `created`, `updated`,
+`creator`, `organizer`, `iCalUID`, `sequence`, `eventType`,
+`recurringEventId`, `originalStartTime`
+
+Anything else undeclared is still rejected. Attendee entries accept
+everything Google returns for an attendee (`id`, `resource`, `comment`,
+`additionalGuests`, `self`, ...).
+
+**`/search` accepts two shapes** -- filter keys nested under `filters`, or the
+same keys flat at the top level -- see its section for the rules.
+
+**What a 422 looks like.** The body carries the standard envelope; `error`
+names every failing field and `detail` is FastAPI's structured list:
+
+```json
+{
+  "success": false,
+  "error": "body.title: Extra inputs are not permitted",
+  "detail": [
+    {
+      "type": "extra_forbidden",
+      "loc": ["body", "title"],
+      "msg": "Extra inputs are not permitted",
+      "input": "Standup"
+    }
+  ]
+}
+```
 
 ### GET /health
 
@@ -315,6 +363,24 @@ group calendar they do not, which is why `/respond` accepts only your own
 
 Create a new event in a calendar.
 
+Accepted fields (the same set applies to `PUT` and `PATCH` below; anything
+else is a `422`, except the read-only keys listed under *Validation* above,
+which are stripped):
+
+| Field | Type |
+|-------|------|
+| `summary`, `description`, `location`, `colorId` | string |
+| `start`, `end` | `{"dateTime": ..., "timeZone": ...}` or `{"date": "YYYY-MM-DD"}` |
+| `attendees` | list of `{"email": ..., "displayName", "responseStatus", "optional", "organizer", "self", "id", "resource", "comment", "additionalGuests"}` |
+| `reminders` | `{"useDefault": bool, "overrides": [{"method": ..., "minutes": ...}]}` |
+| `recurrence` | list of RRULE strings |
+| `status` | `"confirmed"`, `"tentative"` or `"cancelled"` |
+| `transparency` | `"opaque"` or `"transparent"` |
+| `visibility` | `"default"`, `"public"` or `"private"` |
+| `guestsCanInviteOthers`, `guestsCanModify`, `guestsCanSeeOtherGuests` | bool |
+
+Query parameter: `send_updates` (`all`, `externalOnly`, `none`).
+
 ```bash
 curl -X POST http://localhost:8082/calendars/primary/events \
   -H "Content-Type: application/json" \
@@ -372,7 +438,10 @@ Response:
 
 ### PUT /calendars/{calendar_id}/events/{event_id}
 
-Update an event (full replacement).
+Update an event (full replacement). Accepts the same fields as `POST`. A
+fetched event can be sent back as-is with the changes applied -- Google's
+read-only keys (`id`, `etag`, `htmlLink`, ...) are stripped, not rejected.
+Query parameter: `send_updates`.
 
 ```bash
 curl -X PUT http://localhost:8082/calendars/primary/events/event123 \
@@ -398,7 +467,9 @@ Response:
 
 ### PATCH /calendars/{calendar_id}/events/{event_id}
 
-Partially update an event.
+Partially update an event. Accepts every field `POST` does (including
+`status`, `transparency`, `visibility` and the `guestsCan*` flags); only the
+fields sent are changed. Query parameter: `send_updates`.
 
 ```bash
 curl -X PATCH http://localhost:8082/calendars/primary/events/event123 \
@@ -808,6 +879,18 @@ forwards Google's `showDeleted`, so cancelled events come back as
 see `status` under `GET /calendars/{calendar_id}/events`). Recurring events
 are always expanded (`singleEvents=true`).
 
+The filter keys (`query`, `time_min`, `time_max`, `max_results`, `order_by`,
+`show_deleted`) may be nested under `filters` (the shape `/openapi.json`
+describes) **or** sent flat at the top level next to `calendar_id` (the shape
+the calendar skills use). Both requests below are equivalent. Rules for the
+flat shape:
+
+- Only the keys `filters` declares are folded in; anything else at the top
+  level (a typo, `timeMin`) is still a `422`.
+- If a key appears both flat and inside `filters`, the nested value wins,
+  field by field -- the two are merged, not replaced.
+- A flat key sent as `null` means "not supplied" (the default applies).
+
 ```bash
 curl -X POST http://localhost:8082/search \
   -H "Content-Type: application/json" \
@@ -820,6 +903,18 @@ curl -X POST http://localhost:8082/search \
       "max_results": 20,
       "order_by": "startTime"
     }
+  }'
+
+# Equivalent flat shape
+curl -X POST http://localhost:8082/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "calendar_id": "primary",
+    "query": "project review",
+    "time_min": "2024-01-01T00:00:00Z",
+    "time_max": "2024-03-31T23:59:59Z",
+    "max_results": 20,
+    "order_by": "startTime"
   }'
 ```
 
@@ -853,9 +948,16 @@ Response:
 Execute multiple operations on events in a single request.
 
 Supported operations:
-- `update`: Full event replacement
-- `patch`: Partial event update
-- `delete`: Delete event
+- `update`: Full event replacement -- `updates` is validated exactly like a
+  `PUT` body
+- `patch`: Partial event update -- `updates` is validated exactly like a
+  `PATCH` body
+- `delete`: Delete event -- must not carry `updates` (a `422` if it does, so a
+  mis-set operation can't delete while its payload is silently ignored)
+
+An unknown key inside `updates` is a `422` for the whole request; a missing
+or empty `updates` on `update`/`patch` is a per-operation error in `results`.
+Each operation may also carry `send_updates`.
 
 Operations run sequentially. Deletes are verified by re-reading the event,
 exactly as the single-event `DELETE` is. An `update`/`patch` without a
