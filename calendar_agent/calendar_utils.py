@@ -83,8 +83,12 @@ def calendar_perspective(event: dict[str, Any]) -> CalendarPerspective:
         rsvp_state = "unknown"
     elif is_organizer:
         rsvp_state = "organizer_no_rsvp"
-    elif own_entry is not None or (not organizer and not attendees):
-        # An entry with no responseStatus at all, or nothing to classify from.
+    elif own_entry is not None:
+        # The calendar has an entry of its own but no responseStatus, and
+        # does not organize the event: invited, answer not recorded.
+        rsvp_state = "unknown"
+    elif not organizer and not attendees:
+        # Nothing to classify from (a cancelled recurring-instance stub).
         rsvp_state = "unknown"
     else:
         rsvp_state = "not_attendee"

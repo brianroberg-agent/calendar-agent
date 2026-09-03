@@ -269,7 +269,9 @@ the short form):
   event, nothing to answer), `"not_attendee"` (neither organizer nor
   invited -- e.g. an event copied onto the calendar, or an invitation
   addressed to a group), `"unknown"` (a `responseStatus` this service does
-  not recognise, or a stub with no organizer and no attendees). The raw
+  not recognise; or the calendar's own entry has no `responseStatus` and
+  the calendar is not the organizer; or a stub with no organizer and no
+  attendees). The raw
   Google string is not exposed separately: it is either one of the four
   values above or something this service cannot classify.
 - `status`: Google's event status -- `"confirmed"`, `"tentative"`, or
