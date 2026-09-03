@@ -4,14 +4,20 @@ A privacy-focused FastAPI server that wraps the Google Calendar API for use with
 
 ## Overview
 
-Calendar Agent acts as an intermediary between AI orchestrators (like Claude Code) and the Google Calendar API via a proxy server. Calendar event details are processed locally; calling agents receive event metadata, the organizer's and creator's email addresses, and LLM-generated summaries -- never event descriptions or attendee lists (see Key Privacy Features).
+Calendar Agent acts as an intermediary between AI orchestrators (like Claude Code) and the Google Calendar API via a proxy server. Event content is processed locally for the LLM endpoints. The list and search endpoints return `EventSummary` rows -- metadata plus the organizer's and creator's email addresses, no description and no attendee list; the single-event detail routes (`GET`/`POST`/`PUT`/`PATCH .../events/{event_id}` and `POST .../respond`) return the full Google event, including `description` and `attendees[]` with addresses (see Key Privacy Features).
 
 **Key Privacy Features:**
-- Event descriptions never leave the local server
-- Event summaries expose metadata (IDs, dates, titles, location, status,
-  the Google Calendar link, attendee counts) plus the **organizer's and
-  creator's email addresses** -- and nothing else about attendees: no
-  attendee list, no attendee addresses.
+- The LLM endpoints (`/summarize`, `/ask-about`, `/batch-summarize`,
+  `/prepare-briefing`, ...) process event content locally and return only
+  the generated text.
+- List and search rows (`EventSummary`) expose metadata (IDs, dates,
+  titles, location, status, the Google Calendar link, attendee counts) plus
+  the **organizer's and creator's email addresses** -- and nothing else
+  about attendees: no attendee list, no attendee addresses. This is pinned
+  by tests on the `EventSummary` field set.
+- The single-event detail routes are **not** summaries: they return the
+  Google event as the proxy sent it, description and attendee addresses
+  included (see their response examples below).
   The two addresses are included by decision (2026-09-03) because on a
   group calendar Google makes the calendar itself the organizer, so the
   creator's address is the only way to know which person created an event.
@@ -216,6 +222,7 @@ Response:
       "attendee_count": 5,
       "is_all_day": false,
       "status": "confirmed",
+      "html_link": "https://www.google.com/calendar/event?eid=ZXZlbnQxMjM",
       "organizer_email": "alice@example.com",
       "creator_email": "alice@example.com",
       "calendar_is_organizer": false,
@@ -275,11 +282,15 @@ the short form):
   Google string is not exposed separately: it is either one of the four
   values above or something this service cannot classify.
 - `status`: Google's event status -- `"confirmed"`, `"tentative"`, or
-  `"cancelled"`. Cancelled rows are the stubs Google keeps for deleted
-  instances of a recurring series. They are returned by a plain `GET` with
-  `single_events=false` (the default `single_events=true` expansion omits
-  them) and carry empty `start`/`end`, no organizer and no attendees, so
-  they read as `calendar_rsvp_state: "unknown"`.
+  `"cancelled"`. On a plain `GET` with `single_events=false`, cancelled rows
+  are the stubs Google keeps for deleted instances of a recurring series
+  (the default `single_events=true` expansion omits them): empty
+  `start`/`end`, no organizer, no attendees, so `calendar_rsvp_state:
+  "unknown"`. `POST /search` is different: `filters.show_deleted: true`
+  forwards `showDeleted` to Google (with `singleEvents` fixed to `true`
+  there), and the cancelled rows it returns are whatever Google sends for
+  them -- possibly with real times, an organizer and attendees -- classified
+  like any other row.
 
 Only `"accepted"`, `"declined"` and `"tentative"` can be sent back to `POST
 .../respond`; a `"needsAction"` or derived state cannot be echoed to it. Note
@@ -767,7 +778,13 @@ Response:
 
 ### POST /search
 
-Search events in a calendar with structured filters.
+Search events in a calendar with structured filters. `filters` accepts
+`query`, `time_min`, `time_max`, `max_results` (1-500, default 100),
+`order_by` (`startTime` or `updated`) and `show_deleted` (default `false`;
+forwards Google's `showDeleted`, so cancelled events come back as
+`status: "cancelled"` rows with whatever fields Google sends for them --
+see `status` under `GET /calendars/{calendar_id}/events`). Recurring events
+are always expanded (`singleEvents=true`).
 
 ```bash
 curl -X POST http://localhost:8082/search \

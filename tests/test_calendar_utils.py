@@ -1,11 +1,12 @@
 """Tests for calendar_utils module."""
 
 from datetime import datetime
+from typing import get_args
 
 from calendar_agent.calendar_utils import (
     READ_RESPONSE_STATUSES,
     RSVP_RESPONSES,
-    RSVP_STATES,
+    RsvpState,
     attendee_entries,
     calendar_perspective,
     find_free_slots,
@@ -188,7 +189,11 @@ def test_format_attendees_none():
 
 def test_format_attendees_skips_non_dict_rows():
     """A non-dict row is skipped, not raised on (finding 7, round 4)."""
-    attendees = [None, "bob@example.com", {"email": "alice@example.com", "responseStatus": "accepted"}]
+    attendees = [
+        None,
+        "bob@example.com",
+        {"email": "alice@example.com", "responseStatus": "accepted"},
+    ]
     assert format_attendees(attendees) == "alice@example.com (accepted)"
 
 
@@ -467,13 +472,10 @@ def test_find_free_slots_all_day_event():
 
 
 class TestCalendarPerspective:
-    def test_self_flags_describe_the_calendar_being_read(self):
+    def test_perspective_is_the_calendars_own_entry(self):
         p = calendar_perspective(colleague_copy())
         assert p.is_organizer is False
         assert p.rsvp_state == "accepted"  # Carol's entry, not john.doe@'s "declined"
-
-    def test_is_a_plain_tuple_too(self):
-        assert calendar_perspective(colleague_copy()) == (False, "accepted")
 
     def test_calendar_organizes_with_no_attendees(self):
         event = {"organizer": {"email": "carol@example.com", "self": True}}
@@ -568,9 +570,10 @@ class TestCalendarPerspective:
 
     def test_malformed_organizer_and_attendee_entries_do_not_raise(self):
         # Finding 8 (round 3): a non-dict organizer or attendee element is
-        # not something a Google-conformant proxy sends, but one bad row
-        # must not turn a whole page of results into a 500. It degrades to
-        # "nothing recognisable here".
+        # not something a Google-conformant proxy sends. These two fields
+        # degrade to "nothing recognisable here" instead of raising; other
+        # malformed shapes (a non-dict start, a non-string summary) are not
+        # guarded here and will still fail the row.
         assert calendar_perspective({"organizer": "dave@example.com"}) == (False, "unknown")
         assert calendar_perspective({"attendees": [None, "bob@example.com"]}) == (False, "unknown")
         assert calendar_perspective({"attendees": "not-a-list"}) == (False, "unknown")
@@ -582,12 +585,14 @@ class TestCalendarPerspective:
 
 
 class TestResponseStatusVocabularies:
+    RSVP_STATES = get_args(RsvpState)
+
     def test_writable_subset_is_contained_in_read_domain(self):
-        assert set(RSVP_RESPONSES) < set(READ_RESPONSE_STATUSES) < set(RSVP_STATES)
+        assert set(RSVP_RESPONSES) < set(READ_RESPONSE_STATUSES) < set(self.RSVP_STATES)
 
     def test_google_spellings_are_kept_verbatim(self):
         # Keep Google's camelCase "needsAction" so the four RSVP values are
         # exactly what the Calendar API emits; the derived states are
         # snake_case to mark them as this service's own.
         assert "needsAction" in READ_RESPONSE_STATUSES
-        assert {"organizer_no_rsvp", "not_attendee", "unknown"} < set(RSVP_STATES)
+        assert {"organizer_no_rsvp", "not_attendee", "unknown"} < set(self.RSVP_STATES)

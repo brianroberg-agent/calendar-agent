@@ -1,10 +1,12 @@
 """Calendar Agent Server - A privacy-focused FastAPI server for Google Calendar.
 
 This server acts as an intermediary between AI agents (like Claude Code) and the
-Google Calendar API via a proxy server. Calendar event details are processed
-locally; calling agents receive event metadata (including the organizer's and
-creator's email addresses, never descriptions or attendee lists) and
-LLM-generated summaries.
+Google Calendar API via a proxy server. The LLM endpoints process event content
+locally and return generated text. List and search return EventSummary rows:
+metadata plus the organizer's and creator's email addresses, no description and
+no attendee list. The single-event detail routes (.../events/{event_id} and
+.../respond) return the full Google event, description and attendee addresses
+included.
 
 Key features:
 - Calendar and event CRUD operations via proxy
@@ -323,9 +325,15 @@ class EventSummary(BaseModel):
         None,
         description=(
             "Google event status: 'confirmed', 'tentative', or 'cancelled'. "
-            "Cancelled rows are the stubs Google keeps for deleted instances "
-            "of a recurring series; they are returned when single_events is "
-            "false and carry empty start/end, no organizer and no attendees."
+            "On a plain GET .../events with single_events=false, cancelled "
+            "rows are the stubs Google keeps for deleted instances of a "
+            "recurring series: empty start/end, no organizer, no attendees, "
+            "calendar_rsvp_state 'unknown'. POST /search with "
+            "filters.show_deleted=true forwards showDeleted to Google (with "
+            "singleEvents fixed to true); the cancelled rows it returns are "
+            "whatever Google sends for them, and are classified like any "
+            "other row -- they may carry real start/end, an organizer and "
+            "attendees."
         ),
     )
     html_link: str | None = None

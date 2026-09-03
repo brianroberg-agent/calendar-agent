@@ -5,6 +5,7 @@ Import from here (``from tests.factories import ...``) rather than from
 directly is the one pattern the repo otherwise avoids.
 """
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -226,14 +227,15 @@ def colleague_copy(calendar_entry_status: Any = "accepted") -> dict[str, Any]:
     entry is the ``self`` entry (with ``calendar_entry_status``) and the
     authenticated user is a plain attendee with no ``self`` flag.
     """
-    return {
-        **SAMPLE_EVENTS["invitation"],
-        "attendees": [
-            {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
-            {"email": COLLEAGUE_EMAIL, "self": True, "responseStatus": calendar_entry_status},
-            {"email": AUTH_USER_EMAIL, "responseStatus": "declined"},
-        ],
-    }
+    # deepcopy so a test that mutates a nested dict (organizer, start, ...)
+    # of its copy cannot reach into SAMPLE_EVENTS["invitation"].
+    copy = deepcopy(SAMPLE_EVENTS["invitation"])
+    copy["attendees"] = [
+        {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
+        {"email": COLLEAGUE_EMAIL, "self": True, "responseStatus": calendar_entry_status},
+        {"email": AUTH_USER_EMAIL, "responseStatus": "declined"},
+    ]
+    return copy
 
 
 SAMPLE_EVENTS["colleague_copy"] = colleague_copy()

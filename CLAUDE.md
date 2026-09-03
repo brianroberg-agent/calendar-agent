@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-Calendar Agent is a FastAPI server that provides a privacy-focused interface between AI orchestrators and the Google Calendar API. It processes calendar data locally and returns event metadata (including the organizer's and creator's email addresses, but never descriptions or attendee lists) and LLM-generated summaries to calling agents.
+Calendar Agent is a FastAPI server that provides a privacy-focused interface between AI orchestrators and the Google Calendar API. The LLM endpoints process event content locally and return generated text; the list and search endpoints return `EventSummary` rows (metadata plus the organizer's and creator's email addresses, no description, no attendee list); the single-event detail routes (`.../events/{event_id}` and `/respond`) return the full Google event, description and attendee addresses included.
 
 ## Key Architecture Decisions
 
 1. **Minimal Architecture**: Single-module design mirroring the email-agent pattern
 2. **Stateless Operations**: No database; all state lives in the Google Calendar backend
 3. **LLM Abstraction**: Provider interface allows swapping between local MLX and hosted APIs
-4. **Privacy-First**: Event content processed locally; only metadata, organizer/creator addresses and summaries are returned to the cloud -- never descriptions or attendee lists
+4. **Privacy-First**: LLM processing of event content is local; list/search rows carry only metadata and the organizer/creator addresses (no description, no attendee list). The single-event detail routes return the full Google event -- keep that in mind before adding a route that fans a detail response out
 
 ## File Structure
 

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from calendar_agent.calendar_server import app, event_to_summary
+from calendar_agent.calendar_server import EventSummary, app, event_to_summary
 from calendar_agent.exceptions import (
     ProxyAuthError,
     ProxyConfigError,
@@ -138,6 +138,28 @@ class TestEventToSummary:
         assert summary.organizer_email == "dave@example.com"
         assert summary.creator_email == "dave@example.com"
 
+    def test_summary_field_set_is_exactly_the_documented_one(self):
+        """Pins the README's Key Privacy Features claim for list/search rows:
+        these fields and no others -- in particular no description and no
+        attendee list. Adding a field here is a documentation change too."""
+        expected = {
+            "id",
+            "calendar_id",
+            "summary",
+            "start",
+            "end",
+            "location",
+            "attendee_count",
+            "is_all_day",
+            "status",
+            "html_link",
+            "organizer_email",
+            "creator_email",
+            "calendar_is_organizer",
+            "calendar_rsvp_state",
+        }
+        assert set(EventSummary.model_fields) == expected
+
     def test_no_field_claims_to_be_the_authenticated_users_rsvp(self):
         """The old contract (is_organizer / response_status "of the
         authenticated user") is gone: nothing on the wire is named as if it
@@ -157,7 +179,8 @@ class TestEventToSummary:
 
     def test_malformed_organizer_or_attendees_degrade_instead_of_raising(self):
         """Finding 8 (round 3): a non-dict organizer/creator or attendee row
-        must not raise (which would 500 the whole page); it reads as absent."""
+        reads as absent instead of raising. Only these fields are guarded;
+        a malformed start/end or summary is not."""
         event = get_sample_event()
         event["organizer"] = "dave@example.com"
         event["creator"] = ["dave@example.com"]
@@ -305,9 +328,14 @@ class TestEventsListEndpoint:
         assert response.json()["events"][0]["attendee_count"] == 0
 
     def test_list_survives_a_malformed_event_row(self, client, mock_proxy_client):
-        """One malformed row must not 500 the whole page (finding 8, round 3)."""
-        bad = {**SAMPLE_EVENTS["basic_meeting"], "organizer": "dave@example.com",
-               "attendees": [None]}
+        """A row with a non-dict organizer and a non-dict attendee entry is
+        served as null/unknown rather than 500ing the page (finding 8,
+        round 3). Only organizer, creator and attendee rows are guarded."""
+        bad = {
+            **SAMPLE_EVENTS["basic_meeting"],
+            "organizer": "dave@example.com",
+            "attendees": [None],
+        }
         mock_proxy_client.list_events.return_value = {"items": [bad]}
         response = client.get("/calendars/primary/events")
         assert response.status_code == 200
@@ -454,6 +482,15 @@ class TestEventGetEndpoint:
         data = response.json()
         assert data["success"] is True
         assert data["event"]["id"] == "meeting_001"
+
+    def test_get_event_returns_the_full_google_event(self, client, mock_proxy_client):
+        """The detail route is not a summary: description and the attendee
+        list with addresses come back as the proxy sent them (the README's
+        privacy section says exactly this)."""
+        mock_proxy_client.get_event.return_value = SAMPLE_EVENTS["invitation"]
+        event = client.get("/calendars/primary/events/invite_001").json()["event"]
+        assert event["description"] == "Quarterly budget walkthrough"
+        assert any(a["email"] == AUTH_USER_EMAIL for a in event["attendees"])
 
     def test_get_event_detail_has_empty_warnings(self, client, mock_proxy_client):
         """`warnings` is on every EventDetailResponse (added for /respond);
@@ -632,9 +669,7 @@ class TestEventRespondEndpoint:
         assert resp.status_code == 200
         assert resp.json()["warnings"] == []
 
-    def test_respond_on_another_calendar_warns_whose_entry_changed(
-        self, client, mock_proxy_client
-    ):
+    def test_respond_on_another_calendar_warns_whose_entry_changed(self, client, mock_proxy_client):
         """The read fields on carol@ describe Carol; /respond wrote the
         authenticated user's entry. The response says so (finding 9,
         round 4). Emitted for any calendar_id other than the literal
@@ -1213,6 +1248,29 @@ class TestSearchEndpoint:
         }
         response = client.post("/search", json=request_data)
         assert response.status_code == 200
+
+    def test_search_show_deleted_forwards_and_classifies_cancelled_rows(
+        self, client, mock_proxy_client
+    ):
+        """show_deleted is forwarded with single_events fixed to True, and a
+        cancelled row that carries organizer/attendees is classified like
+        any other row -- not blanked to 'unknown' (finding 2, round 4)."""
+        cancelled = colleague_copy()
+        cancelled["status"] = "cancelled"
+        mock_proxy_client.list_events.return_value = {"items": [cancelled]}
+        response = client.post(
+            "/search",
+            json={"calendar_id": COLLEAGUE_EMAIL, "filters": {"show_deleted": True}},
+        )
+        assert response.status_code == 200
+        kwargs = mock_proxy_client.list_events.call_args.kwargs
+        assert kwargs["show_deleted"] is True
+        assert kwargs["single_events"] is True
+        row = response.json()["events"][0]
+        assert row["status"] == "cancelled"
+        assert row["organizer_email"] == "dave@example.com"
+        assert row["calendar_rsvp_state"] == "accepted"
+        assert row["start"] != ""
 
     def test_search_default_filters(self, client, mock_proxy_client):
         """Search with default filters."""

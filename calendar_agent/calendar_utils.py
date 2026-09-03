@@ -8,10 +8,9 @@ from typing import Any, Literal, NamedTuple, get_args
 #
 # Google's ``organizer.self`` / ``attendees[].self`` flags describe the
 # CALENDAR the event copy sits on, so on GET /calendars/{calendar_id}/events
-# they describe calendar_id, not the caller. The meaning of every value
-# below is spelled out once, in the ``EventSummary`` field descriptions in
-# calendar_server.py (they are what /openapi.json shows); the README carries
-# the narrative.
+# they describe calendar_id, not the caller. For what each value below means,
+# see the ``EventSummary`` field descriptions in calendar_server.py (the
+# text /openapi.json shows); this module only defines the vocabularies.
 # ============================================================================
 
 # The three values a caller may write via POST .../respond.
@@ -25,7 +24,6 @@ RsvpState = Literal[ReadResponseStatus, "organizer_no_rsvp", "not_attendee", "un
 
 RSVP_RESPONSES: tuple[str, ...] = get_args(RsvpResponse)
 READ_RESPONSE_STATUSES: tuple[str, ...] = get_args(ReadResponseStatus)
-RSVP_STATES: tuple[str, ...] = get_args(RsvpState)
 
 
 class CalendarPerspective(NamedTuple):
