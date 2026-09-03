@@ -455,6 +455,13 @@ class TestEventGetEndpoint:
         assert data["success"] is True
         assert data["event"]["id"] == "meeting_001"
 
+    def test_get_event_detail_has_empty_warnings(self, client, mock_proxy_client):
+        """`warnings` is on every EventDetailResponse (added for /respond);
+        the other detail routes emit an empty list."""
+        response = client.get("/calendars/primary/events/event_123")
+        assert response.status_code == 200
+        assert response.json()["warnings"] == []
+
     def test_get_event_with_timezone(self, client, mock_proxy_client):
         """Get event with timezone parameter."""
         client.get("/calendars/primary/events/event_123?time_zone=America/New_York")
@@ -616,6 +623,45 @@ class TestEventRespondEndpoint:
         assert data["success"] is True
         assert data["event"]["id"] == "e1"
         mock_proxy_client.respond_to_event.assert_called_once_with("primary", "e1", "accepted")
+
+    def test_respond_on_primary_carries_no_warning(self, client, mock_proxy_client):
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["warnings"] == []
+
+    def test_respond_on_another_calendar_warns_whose_entry_changed(
+        self, client, mock_proxy_client
+    ):
+        """The read fields on carol@ describe Carol; /respond wrote the
+        authenticated user's entry. The response says so (finding 9,
+        round 4). Emitted for any calendar_id other than the literal
+        'primary' -- this service does not resolve the authenticated
+        address, so the user's own address gets the warning too."""
+        mock_proxy_client.respond_to_event.return_value = colleague_copy()
+        resp = client.post(
+            f"/calendars/{COLLEAGUE_EMAIL}/events/invite_001/respond",
+            json={"response_status": "declined"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is True
+        assert len(data["warnings"]) == 1
+        warning = data["warnings"][0]
+        assert COLLEAGUE_EMAIL in warning
+        assert "authenticated user" in warning
+        assert "calendar_rsvp_state" in warning
+
+    def test_respond_error_envelope_has_no_warnings(self, client, mock_proxy_client):
+        mock_proxy_client.respond_to_event.side_effect = ProxyForbiddenError("blocked")
+        resp = client.post(
+            f"/calendars/{COLLEAGUE_EMAIL}/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["warnings"] == []
 
     def test_respond_invalid_status_rejected(self, client, mock_proxy_client):
         """Values outside accepted/declined/tentative are rejected with 422."""

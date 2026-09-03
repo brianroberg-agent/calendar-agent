@@ -517,6 +517,15 @@ only that entry, and sends no invitations or notifications.
 > read-then-respond loop must not treat the value it read as the entry it is
 > about to write.
 >
+> To make that visible in the response, a successful RSVP on any
+> `calendar_id` other than the literal `primary` carries one entry in
+> `warnings` naming the calendar and saying the authenticated user's own
+> entry is what changed. This service does not resolve the authenticated
+> user's address, so passing your own address as `calendar_id` produces the
+> warning as well; on `primary` the list is empty. Whether `/respond`
+> should refuse non-primary calendars outright is an open policy question
+> (see PR #11), not something this service decides.
+>
 > If the authenticated user is not an attendee, the proxy answers
 > `400 You are not an attendee of this event; cannot RSVP.` This service
 > passes that through as **`400`** with the proxy's message in `error` (see
@@ -541,8 +550,17 @@ Response:
       {"email": "you@example.com", "responseStatus": "accepted", "self": true}
     ]
   },
-  "error": null
+  "error": null,
+  "warnings": []
 }
+```
+
+On another calendar (`POST /calendars/carol@example.com/events/event123/respond`),
+`warnings` carries one entry:
+```json
+"warnings": [
+  "RSVP 'accepted' was applied to the authenticated user's own attendee entry on calendar 'carol@example.com'. That calendar's read fields (calendar_rsvp_state, calendar_is_organizer) describe the calendar, not the authenticated user; re-read the user's own calendar to see the entry this changed."
+]
 ```
 
 ---

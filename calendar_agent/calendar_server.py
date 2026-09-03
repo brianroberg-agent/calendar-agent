@@ -390,10 +390,26 @@ class EventsListResponse(BaseModel):
 
 
 class EventDetailResponse(BaseModel):
-    """Full event details (for get/create/update operations)."""
+    """Full event details (for get/create/update/patch/respond).
+
+    ``event`` is the Google event as the proxy returned it, including
+    ``description`` and the ``attendees`` list with addresses -- the
+    summary-only privacy rule applies to list/search rows, not here.
+    """
     success: bool
     event: dict[str, Any] | None = None
     error: str | None = None
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Caveats about a successful result. Currently emitted only by "
+            "POST .../respond when calendar_id is not the literal 'primary': "
+            "the RSVP was written to the authenticated user's own entry on "
+            "that calendar's copy of the event, while that calendar's "
+            "calendar_rsvp_state describes the calendar. Empty on the other "
+            "detail routes."
+        ),
+    )
 
 
 class OperationOutcome(str, Enum):
@@ -1001,6 +1017,11 @@ async def respond_to_event(
     calendar being read. Valid values for response_status are 'accepted',
     'declined', or 'tentative'.
 
+    When ``calendar_id`` is anything other than the literal ``primary``, a
+    successful response carries one entry in ``warnings`` saying whose entry
+    changed. This server does not resolve the authenticated user's address,
+    so the user's own address as ``calendar_id`` gets the warning too.
+
     If the authenticated user is not an attendee, the proxy answers 400
     ("You are not an attendee of this event; cannot RSVP."), which this
     server passes through as 400 with that message in ``error``. Like other
@@ -1016,7 +1037,16 @@ async def respond_to_event(
             event_id,
             request.response_status,
         )
-        return EventDetailResponse(success=True, event=result)
+        warnings: list[str] = []
+        if calendar_id != "primary":
+            warnings.append(
+                f"RSVP '{request.response_status}' was applied to the authenticated "
+                f"user's own attendee entry on calendar '{calendar_id}'. That "
+                "calendar's read fields (calendar_rsvp_state, calendar_is_organizer) "
+                "describe the calendar, not the authenticated user; re-read the "
+                "user's own calendar to see the entry this changed."
+            )
+        return EventDetailResponse(success=True, event=result, warnings=warnings)
     except Exception as e:
         return error_response(
             EventDetailResponse(success=False, event=None, error=format_proxy_error(e)), e
