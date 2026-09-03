@@ -8,7 +8,12 @@ Calendar Agent acts as an intermediary between AI orchestrators (like Claude Cod
 
 **Key Privacy Features:**
 - Event descriptions and details never leave the local server
-- Only metadata (IDs, dates, titles, attendee counts) is exposed to cloud services
+- Event summaries expose metadata (IDs, dates, titles, status, attendee
+  counts) plus the **organizer's and creator's email addresses** -- and
+  nothing else about attendees: no attendee list, no attendee addresses.
+  The two addresses are included by decision (2026-09-03) because on a
+  group calendar Google makes the calendar itself the organizer, so the
+  creator's address is the only way to know which person created an event.
 - LLM processing happens locally via MLX or can use hosted APIs
 
 **Architecture:**
@@ -210,8 +215,10 @@ Response:
       "is_all_day": false,
       "status": "confirmed",
       "organizer_email": "alice@example.com",
-      "is_organizer": false,
-      "response_status": "accepted"
+      "creator_email": "alice@example.com",
+      "calendar_is_organizer": false,
+      "calendar_response_status": "accepted",
+      "calendar_rsvp_state": "accepted"
     }
   ],
   "next_page_token": null,
@@ -219,32 +226,64 @@ Response:
 }
 ```
 
-#### `organizer_email` / `is_organizer` / `response_status`
+#### Organizer and RSVP fields -- whose perspective they report
 
-- `organizer_email`: the event organizer's address. `null` if the event
-  carries no organizer at all (shouldn't happen per the Google API, but the
-  field is defensive).
-- `is_organizer`: `true` when the **authenticated user** is the organizer.
-- `response_status`: the **authenticated user's own RSVP** on this event --
-  not the calendar owner's, even when `calendar_id` names someone else's
-  calendar. One of `"accepted"`, `"declined"`, `"tentative"`,
-  `"needsAction"`, or `null`.
+**The `calendar_*` fields describe the calendar named by `calendar_id`,
+not the authenticated user.** Google's Events reference defines
+`organizer.self` and `attendees[].self` as "whether this entry represents
+**the calendar on which this copy of the event appears**", and those flags
+are what these fields are computed from. So:
 
-  `null` has three different causes, and reading it as "hasn't responded
-  yet" is only safe once you've also checked `is_organizer`:
+- Reading your own calendar (`primary`, or your own address), they describe
+  you.
+- Reading a colleague's calendar (`GET /calendars/colleague@example.com/events`),
+  they describe **the colleague**: `calendar_response_status` is *their* RSVP,
+  and `calendar_is_organizer` says whether *they* organize it. Your own RSVP
+  on that event is not reported -- it is only knowable from your own calendar.
+- Reading a group calendar, they describe the group calendar: an event
+  created directly on one has the calendar itself as organizer
+  (`organizer_email` is the calendar's id, `calendar_is_organizer` is `true`).
+  `creator_email` is then the person who created it.
 
-  1. `attendee_count == 0` -- you created the event for yourself; there's
-     no RSVP to report.
-  2. `is_organizer == true` and `attendee_count > 0`, but you're not
-     yourself in the attendee list -- again, your own event, not an
-     unanswered invitation.
-  3. `is_organizer == false` and you *are* an attendee, but Google omitted
-     the `responseStatus` key for your record -- genuinely unknown.
+Fields:
 
-  Note the read-side domain (above) is larger than what `POST
-  .../respond` accepts (`"accepted"`, `"declined"`, `"tentative"` only --
-  see that endpoint's docs below). A caller cannot echo a `"needsAction"`
-  or `null` `response_status` straight back to `/respond`.
+- `organizer_email`: the organizer's address as Google reports it. For an
+  event created on a group calendar this is the group calendar's id. `null`
+  when the event carries no organizer (e.g. a cancelled recurring-instance
+  stub returned under `show_deleted`).
+- `creator_email`: the address of the account that created the event.
+  Usually the same as `organizer_email`; differs on group calendars (above)
+  and for events moved between calendars. `null` when absent.
+- `calendar_is_organizer`: Google's `organizer.self` -- the calendar being
+  read organizes this event.
+- `calendar_response_status`: the raw `responseStatus` of the attendee entry
+  Google marks `self` on this copy -- the calendar's own entry. One of
+  `"accepted"`, `"declined"`, `"tentative"`, `"needsAction"`, or `null` when
+  the calendar has no attendee entry of its own or the entry carries no
+  value. Do not read `null` as "hasn't responded"; read
+  `calendar_rsvp_state` instead.
+- `calendar_rsvp_state`: `calendar_response_status` interpreted, so the
+  caller never has to decode a `null`:
+  - `"accepted"` / `"declined"` / `"tentative"` / `"needsAction"`: the
+    calendar's RSVP, verbatim from Google.
+  - `"organizer_no_rsvp"`: the calendar organizes the event and has no RSVP
+    value -- either it has no attendee entry of its own (an event created
+    for oneself, with or without other guests) or its entry has no
+    `responseStatus`. Its own event; nothing to answer.
+  - `"not_attendee"`: the calendar neither organizes the event nor appears
+    in its attendee list (e.g. an event copied or shared onto it, or an
+    invitation addressed to a group rather than to the calendar).
+  - `"unknown"`: the calendar's attendee entry exists but carries no
+    recognisable `responseStatus`, or the event carries no organizer and no
+    attendees at all (cancelled recurring-instance stubs look like this).
+- `status`: Google's event status -- `"confirmed"`, `"tentative"`, or
+  `"cancelled"` (the last only under `show_deleted`).
+
+Only `"accepted"`, `"declined"` and `"tentative"` can be sent back to `POST
+.../respond`; a `"needsAction"` or derived state cannot be echoed to it. And
+because `/respond` writes to the same `self` entry these fields read from,
+**it too acts as the calendar, not as you** -- see that endpoint's warning
+below.
 
 ### POST /calendars/{calendar_id}/events
 
@@ -457,9 +496,19 @@ until a deletion has been observed complete.
 
 ### POST /calendars/{calendar_id}/events/{event_id}/respond
 
-RSVP to an event by setting **only your own** response status. Forwards to the
-proxy's dedicated respond route, which changes only the `self` attendee's status
-and sends no invitations or notifications.
+RSVP to an event by setting the response status of **the calendar's own**
+attendee entry. Forwards to the proxy's dedicated respond route, which reads
+the event's attendee list, changes only the entry Google marks `self`, and
+sends no invitations or notifications.
+
+> **Only call this on your own calendar (`primary`).** Google's `self` flag
+> marks the calendar the event copy sits on, not the caller. On a
+> colleague's calendar the `self` entry is the colleague's, so
+> `POST /calendars/colleague@example.com/events/{event_id}/respond` would
+> **RSVP on the colleague's behalf**, silently and without notification.
+> A read-then-respond loop must not carry a colleague's `calendar_id` into
+> this call. The proxy returns `400` if the calendar has no attendee entry
+> of its own to update.
 
 Request body:
 - `response_status` (string): one of `accepted`, `declined`, `tentative`
@@ -718,9 +767,12 @@ Response:
       "end": "2024-01-20T15:00:00Z",
       "attendee_count": 8,
       "is_all_day": false,
-      "organizer_email": "primary@example.com",
-      "is_organizer": true,
-      "response_status": null
+      "status": "confirmed",
+      "organizer_email": "john.doe@example.com",
+      "creator_email": "john.doe@example.com",
+      "calendar_is_organizer": true,
+      "calendar_response_status": null,
+      "calendar_rsvp_state": "organizer_no_rsvp"
     }
   ],
   "next_page_token": null,

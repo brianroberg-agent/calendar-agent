@@ -144,7 +144,7 @@ uv run pytest --cov=calendar_agent  # With coverage
 - Mock `get_calendar_client()` and `get_llm_service()` in tests
 - Use `subtests` for documentation verification tests
 - Test both success and error paths
-- Sample data is in `tests/conftest.py`
+- Sample data and event factories are in `tests/factories.py` (fixtures in `tests/conftest.py`)
 
 ## Dependencies
 
