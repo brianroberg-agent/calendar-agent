@@ -1,12 +1,14 @@
 """Tests for Calendar Agent server endpoints."""
 
 
+import typing
+from collections.abc import Mapping
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from calendar_agent.calendar_server import EventSummary, app, event_to_summary
+from calendar_agent.calendar_server import EventSummary, SearchFilters, app, event_to_summary
 from calendar_agent.exceptions import (
     ProxyAuthError,
     ProxyConfigError,
@@ -34,6 +36,64 @@ from tests.factories import (
     colleague_copy,
     get_sample_event,
 )
+
+# ============================================================================
+# Minimal valid request bodies, one per request-body route. Shared by the
+# per-route endpoint tests and the unknown-field tables below so there is one
+# copy of "what a valid body looks like".
+# ============================================================================
+
+CREATE_EVENT_BODY = {
+    "summary": "New Meeting",
+    "start": {"dateTime": "2024-01-15T10:00:00Z"},
+    "end": {"dateTime": "2024-01-15T11:00:00Z"},
+}
+UPDATE_EVENT_BODY = {
+    "summary": "Updated Meeting",
+    "start": {"dateTime": "2024-01-15T14:00:00Z"},
+    "end": {"dateTime": "2024-01-15T15:00:00Z"},
+}
+PATCH_EVENT_BODY = {"summary": "Renamed Meeting"}
+RESPOND_BODY = {"response_status": "accepted"}
+SUMMARIZE_BODY = {"calendar_id": "primary", "event_id": "event_123", "format": "brief"}
+ASK_ABOUT_BODY = {
+    "calendar_id": "primary",
+    "event_id": "event_123",
+    "question": "What time is the meeting?",
+}
+BATCH_SUMMARIZE_BODY = {
+    "calendar_id": "primary",
+    "event_ids": ["event_1", "event_2", "event_3"],
+    "triage": False,
+}
+FIND_FREE_TIME_BODY = {
+    "calendar_id": "primary",
+    "time_min": "2024-01-15T09:00:00Z",
+    "time_max": "2024-01-15T17:00:00Z",
+    "duration_minutes": 30,
+}
+ANALYZE_SCHEDULE_BODY = {
+    "calendar_id": "primary",
+    "time_min": "2024-01-15T00:00:00Z",
+    "time_max": "2024-01-22T00:00:00Z",
+    "analysis_type": "overview",
+}
+PREPARE_BRIEFING_BODY = {"calendar_id": "primary", "briefing_type": "daily"}
+SEARCH_BODY = {
+    "calendar_id": "primary",
+    "filters": {
+        "query": "meeting",
+        "time_min": "2024-01-01T00:00:00Z",
+        "time_max": "2024-01-31T23:59:59Z",
+    },
+}
+BULK_DELETE_BODY = {
+    "operations": [
+        {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
+        {"operation": "delete", "event_id": "event_2", "calendar_id": "primary"},
+    ]
+}
+
 
 # ============================================================================
 # Health Endpoint Tests
@@ -430,12 +490,7 @@ class TestEventCreateEndpoint:
 
     def test_create_event_success(self, client, mock_proxy_client):
         """Create event returns created event."""
-        event_data = {
-            "summary": "New Meeting",
-            "start": {"dateTime": "2024-01-15T10:00:00Z"},
-            "end": {"dateTime": "2024-01-15T11:00:00Z"},
-        }
-        response = client.post("/calendars/primary/events", json=event_data)
+        response = client.post("/calendars/primary/events", json=CREATE_EVENT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -519,12 +574,7 @@ class TestEventUpdateEndpoint:
 
     def test_update_event_success(self, client, mock_proxy_client):
         """Update event returns updated event."""
-        event_data = {
-            "summary": "Updated Meeting",
-            "start": {"dateTime": "2024-01-15T14:00:00Z"},
-            "end": {"dateTime": "2024-01-15T15:00:00Z"},
-        }
-        response = client.put("/calendars/primary/events/event_123", json=event_data)
+        response = client.put("/calendars/primary/events/event_123", json=UPDATE_EVENT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -535,8 +585,7 @@ class TestEventPatchEndpoint:
 
     def test_patch_event_success(self, client, mock_proxy_client):
         """Patch event with partial update."""
-        patch_data = {"summary": "Renamed Meeting"}
-        response = client.patch("/calendars/primary/events/event_123", json=patch_data)
+        response = client.patch("/calendars/primary/events/event_123", json=PATCH_EVENT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -652,10 +701,7 @@ class TestEventRespondEndpoint:
     def test_respond_success(self, client, mock_proxy_client):
         """RSVP forwards to the proxy client and returns the updated event."""
         mock_proxy_client.respond_to_event.return_value = {"id": "e1", "summary": "GMDM"}
-        resp = client.post(
-            "/calendars/primary/events/e1/respond",
-            json={"response_status": "accepted"},
-        )
+        resp = client.post("/calendars/primary/events/e1/respond", json=RESPOND_BODY)
         assert resp.status_code == 200
         data = resp.json()
         assert data["success"] is True
@@ -1149,12 +1195,7 @@ class TestSummarizeEndpoint:
 
     def test_summarize_success(self, client, mock_proxy_client, mock_llm_service):
         """Summarize event returns AI summary."""
-        request_data = {
-            "calendar_id": "primary",
-            "event_id": "event_123",
-            "format": "brief",
-        }
-        response = client.post("/summarize", json=request_data)
+        response = client.post("/summarize", json=SUMMARIZE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1189,12 +1230,7 @@ class TestAskAboutEndpoint:
 
     def test_ask_about_success(self, client, mock_proxy_client, mock_llm_service):
         """Ask about event returns AI answer."""
-        request_data = {
-            "calendar_id": "primary",
-            "event_id": "event_123",
-            "question": "What time is the meeting?",
-        }
-        response = client.post("/ask-about", json=request_data)
+        response = client.post("/ask-about", json=ASK_ABOUT_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1215,12 +1251,7 @@ class TestBatchSummarizeEndpoint:
 
     def test_batch_summarize_success(self, client, mock_proxy_client, mock_llm_service):
         """Batch summarize returns summaries for multiple events."""
-        request_data = {
-            "calendar_id": "primary",
-            "event_ids": ["event_1", "event_2", "event_3"],
-            "triage": False,
-        }
-        response = client.post("/batch-summarize", json=request_data)
+        response = client.post("/batch-summarize", json=BATCH_SUMMARIZE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1264,13 +1295,7 @@ class TestFindFreeTimeEndpoint:
 
     def test_find_free_time_success(self, client, mock_proxy_client, mock_llm_service):
         """Find free time returns available slots and suggestions."""
-        request_data = {
-            "calendar_id": "primary",
-            "time_min": "2024-01-15T09:00:00Z",
-            "time_max": "2024-01-15T17:00:00Z",
-            "duration_minutes": 30,
-        }
-        response = client.post("/find-free-time", json=request_data)
+        response = client.post("/find-free-time", json=FIND_FREE_TIME_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1309,13 +1334,7 @@ class TestAnalyzeScheduleEndpoint:
 
     def test_analyze_schedule_success(self, client, mock_proxy_client, mock_llm_service):
         """Analyze schedule returns insights and metrics."""
-        request_data = {
-            "calendar_id": "primary",
-            "time_min": "2024-01-15T00:00:00Z",
-            "time_max": "2024-01-22T00:00:00Z",
-            "analysis_type": "overview",
-        }
-        response = client.post("/analyze-schedule", json=request_data)
+        response = client.post("/analyze-schedule", json=ANALYZE_SCHEDULE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1341,11 +1360,7 @@ class TestPrepareBriefingEndpoint:
 
     def test_prepare_briefing_daily(self, client, mock_proxy_client, mock_llm_service):
         """Prepare daily briefing returns schedule overview."""
-        request_data = {
-            "calendar_id": "primary",
-            "briefing_type": "daily",
-        }
-        response = client.post("/prepare-briefing", json=request_data)
+        response = client.post("/prepare-briefing", json=PREPARE_BRIEFING_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1384,15 +1399,7 @@ class TestSearchEndpoint:
 
     def test_search_success(self, client, mock_proxy_client):
         """Search events with filters."""
-        request_data = {
-            "calendar_id": "primary",
-            "filters": {
-                "query": "meeting",
-                "time_min": "2024-01-01T00:00:00Z",
-                "time_max": "2024-01-31T23:59:59Z",
-            },
-        }
-        response = client.post("/search", json=request_data)
+        response = client.post("/search", json=SEARCH_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1453,13 +1460,7 @@ class TestBulkActionsEndpoint:
     def test_bulk_delete_success(self, client, mock_proxy_client):
         """Bulk delete events."""
         mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
-        request_data = {
-            "operations": [
-                {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
-                {"operation": "delete", "event_id": "event_2", "calendar_id": "primary"},
-            ]
-        }
-        response = client.post("/bulk-actions", json=request_data)
+        response = client.post("/bulk-actions", json=BULK_DELETE_BODY)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
@@ -1921,208 +1922,217 @@ class TestBulkStatusCode:
 # ============================================================================
 
 
-# (method, path, base_payload) -- base_payload is a MINIMAL VALID body for
-# that route. Each entry drives a generic "unknown top-level field is
-# rejected" test.
-UNKNOWN_FIELD_ROUTES = [
-    (
-        "post",
-        "/calendars/primary/events",
-        {"summary": "Standup"},
-    ),
-    (
-        "put",
-        "/calendars/primary/events/event_123",
-        {"summary": "Standup"},
-    ),
-    (
-        "patch",
-        "/calendars/primary/events/event_123",
-        {"summary": "Standup"},
-    ),
-    (
-        "post",
-        "/calendars/primary/events/event_123/respond",
-        {"response_status": "accepted"},
-    ),
-    (
-        "post",
-        "/summarize",
-        {"calendar_id": "primary", "event_id": "event_123"},
-    ),
-    (
-        "post",
-        "/ask-about",
-        {"calendar_id": "primary", "event_id": "event_123", "question": "When?"},
-    ),
-    (
-        "post",
-        "/batch-summarize",
-        {"calendar_id": "primary", "event_ids": ["event_1"]},
-    ),
-    (
-        "post",
-        "/find-free-time",
-        {
-            "calendar_id": "primary",
-            "time_min": "2024-01-15T09:00:00Z",
-            "time_max": "2024-01-15T17:00:00Z",
-            "duration_minutes": 30,
-        },
-    ),
-    (
-        "post",
-        "/analyze-schedule",
-        {
-            "calendar_id": "primary",
-            "time_min": "2024-01-15T00:00:00Z",
-            "time_max": "2024-01-22T00:00:00Z",
-        },
-    ),
-    (
-        "post",
-        "/prepare-briefing",
-        {"calendar_id": "primary"},
-    ),
-    (
-        "post",
-        "/search",
-        {"calendar_id": "primary", "filters": {"query": "meeting"}},
-    ),
-    (
-        "post",
-        "/bulk-actions",
-        {
-            "operations": [
-                {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
-            ],
-        },
-    ),
-]
+def assert_rejected_for_unknown_key(response, bogus_key, mock_proxy_client):
+    """The response is a 422 whose ONLY error is extra_forbidden on `bogus_key`.
+
+    Asserting the cause (not just the status) proves the base payload itself
+    was valid and the rejection is the unknown key, nothing else -- and that
+    nothing reached the proxy.
+    """
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert [(err["type"], err["loc"][-1]) for err in detail] == [
+        ("extra_forbidden", bogus_key)
+    ], detail
+    assert mock_proxy_client.method_calls == [], "a rejected request reached the proxy"
+
+
+# One row per request-body route: (method, path, minimal valid body).
+route_cases = pytest.mark.parametrize(
+    "method,path,base_payload",
+    [
+        pytest.param(method, path, payload, id=f"{method.upper()} {path}")
+        for method, path, payload in [
+            ("post", "/calendars/primary/events", CREATE_EVENT_BODY),
+            ("put", "/calendars/primary/events/event_123", UPDATE_EVENT_BODY),
+            ("patch", "/calendars/primary/events/event_123", PATCH_EVENT_BODY),
+            ("post", "/calendars/primary/events/event_123/respond", RESPOND_BODY),
+            ("post", "/summarize", SUMMARIZE_BODY),
+            ("post", "/ask-about", ASK_ABOUT_BODY),
+            ("post", "/batch-summarize", BATCH_SUMMARIZE_BODY),
+            ("post", "/find-free-time", FIND_FREE_TIME_BODY),
+            ("post", "/analyze-schedule", ANALYZE_SCHEDULE_BODY),
+            ("post", "/prepare-briefing", PREPARE_BRIEFING_BODY),
+            ("post", "/search", SEARCH_BODY),
+            ("post", "/bulk-actions", BULK_DELETE_BODY),
+        ]
+    ],
+)
+
+
+# Unknown keys below the top level, plus the issue's own three examples:
+# (method, path, payload containing the bogus key, the bogus key).
+nested_cases = pytest.mark.parametrize(
+    "method,path,payload,bogus_key",
+    [
+        pytest.param(
+            "post", "/search",
+            {"calendar_id": "primary", "timeMin": "2026-01-01T00:00:00Z"},
+            "timeMin", id="issue example: timeMin on /search",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"title": "Standup"},
+            "title", id="issue example: title on create",
+        ),
+        pytest.param(
+            "post", "/find-free-time",
+            {**FIND_FREE_TIME_BODY, "preferMorning": True},
+            "preferMorning", id="issue example: preferMorning on /find-free-time",
+        ),
+        pytest.param(
+            "post", "/search",
+            {"calendar_id": "primary", "filters": {"query": "meeting", "bogus": "x"}},
+            "bogus", id="inside filters",
+        ),
+        pytest.param(
+            "post", "/bulk-actions",
+            {"operations": [{**BULK_DELETE_BODY["operations"][0], "bogus": "x"}]},
+            "bogus", id="inside a bulk operation",
+        ),
+        pytest.param(
+            "post", "/bulk-actions",
+            {"operations": [{"operation": "update", "event_id": "e1", "calendar_id": "primary",
+                             "updates": {"summary": "s", "bogus": "x"}}]},
+            "bogus", id="inside bulk update `updates`",
+        ),
+        pytest.param(
+            "post", "/bulk-actions",
+            {"operations": [{"operation": "patch", "event_id": "e1", "calendar_id": "primary",
+                             "updates": {"summary": "s", "bogus": "x"}}]},
+            "bogus", id="inside bulk patch `updates`",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "start": {"dateTime": "2024-01-15T09:00:00Z", "bogus": "x"}},
+            "bogus", id="inside start",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "attendees": [{"email": "alice@example.com", "bogus": "x"}]},
+            "bogus", id="inside an attendee",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "reminders": {"useDefault": False, "bogus": "x"}},
+            "bogus", id="inside reminders",
+        ),
+        pytest.param(
+            "post", "/calendars/primary/events",
+            {"summary": "s", "reminders": {"useDefault": False,
+                                           "overrides": [{"method": "popup", "minutes": 5, "bogus": "x"}]}},
+            "bogus", id="inside a reminder override",
+        ),
+    ],
+)
 
 
 class TestUnknownFieldsRejected:
     """An unrecognized field on any request body is a 422, not a silent drop."""
 
-    @pytest.mark.parametrize(
-        "method,path,base_payload",
-        UNKNOWN_FIELD_ROUTES,
-        ids=[path for _, path, _ in UNKNOWN_FIELD_ROUTES],
-    )
-    def test_unknown_top_level_field_rejected(self, client, method, path, base_payload):
+    @route_cases
+    def test_unknown_top_level_field_rejected(
+        self, client, mock_proxy_client, method, path, base_payload
+    ):
         payload = {**base_payload, "bogus_field_xyz": "should not be accepted"}
         response = getattr(client, method)(path, json=payload)
-        assert response.status_code == 422, (
-            f"{method.upper()} {path} accepted an unknown field instead of "
-            f"rejecting it: got {response.status_code}, body {response.text}"
+        assert_rejected_for_unknown_key(response, "bogus_field_xyz", mock_proxy_client)
+
+    @nested_cases
+    def test_unknown_nested_field_rejected(
+        self, client, mock_proxy_client, method, path, payload, bogus_key
+    ):
+        response = getattr(client, method)(path, json=payload)
+        assert_rejected_for_unknown_key(response, bogus_key, mock_proxy_client)
+
+
+# ---------------------------------------------------------------------------
+# Structural guard: the tables above are hand-maintained. This walks the
+# app's own routes so the next request model -- or a dict[str, Any] field
+# that would forward unknown keys verbatim -- cannot silently revert to
+# extra="ignore" without a test failing.
+# ---------------------------------------------------------------------------
+
+
+def _iter_model_types(annotation):
+    """Yield every BaseModel subclass reachable from a type annotation, and
+    flag bare dict annotations, unwrapping Optional/list/Union/Annotated."""
+    from pydantic import BaseModel
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        yield annotation
+        return
+    origin = typing.get_origin(annotation)
+    if origin in (dict, Mapping):
+        yield dict
+        return
+    for arg in typing.get_args(annotation):
+        yield from _iter_model_types(arg)
+
+
+def iter_request_models():
+    """Every request-body model the app accepts, including nested ones.
+
+    Returns {model: "<where it was reached from>"}; `dict` appears as a key
+    if any reachable field is typed as a plain dict.
+    """
+    from calendar_agent.calendar_server import app
+
+    found: dict[object, str] = {}
+    pending = []
+    for route in app.routes:
+        for param in getattr(getattr(route, "dependant", None), "body_params", []):
+            for model in _iter_model_types(param.type_):
+                pending.append((model, f"{sorted(route.methods)[0]} {route.path} body"))
+    while pending:
+        model, origin = pending.pop()
+        if model in found:
+            continue
+        found[model] = origin
+        if model is dict:
+            continue
+        for name, field in model.model_fields.items():
+            for nested in _iter_model_types(field.annotation):
+                pending.append((nested, f"{model.__name__}.{name}"))
+    return found
+
+
+class TestRequestModelsAreStrict:
+    """Every request model, at every depth, forbids unknown fields (T1)."""
+
+    def test_walk_finds_the_models(self):
+        from calendar_agent.calendar_server import (
+            EventAttendee,
+            EventPatchRequest,
+            EventReminder,
+            EventUpdateRequest,
+            SearchFilters,
         )
 
-    @pytest.mark.parametrize(
-        "method,path,base_payload",
-        UNKNOWN_FIELD_ROUTES,
-        ids=[path for _, path, _ in UNKNOWN_FIELD_ROUTES],
-    )
-    def test_known_fields_still_accepted(self, client, method, path, base_payload):
-        """Sanity check the base payloads themselves are NOT rejected --
-        i.e. the parametrize table above isn't accidentally passing because
-        the base payload itself already 422s for an unrelated reason."""
-        response = getattr(client, method)(path, json=base_payload)
-        assert response.status_code == 200, (
-            f"{method.upper()} {path} rejected its own minimal valid "
-            f"payload: got {response.status_code}, body {response.text}"
-        )
+        found = iter_request_models()
+        # Sanity: the walk reaches top-level, nested and union-member models.
+        for model in (EventUpdateRequest, EventPatchRequest, EventAttendee,
+                      EventReminder, SearchFilters):
+            assert model in found, f"{model.__name__} not reached by the route walk"
+        assert len(found) >= 15
 
-    def test_google_style_time_min_max_on_search_is_rejected_not_ignored(self, client):
-        """The issue's own example: sending Google's timeMin/timeMax instead
-        of the documented nested filters.time_min/time_max must 422, not
-        silently run an unbounded search."""
-        response = client.post(
-            "/search",
-            json={
-                "calendar_id": "primary",
-                "timeMin": "2026-01-01T00:00:00Z",
-                "timeMax": "2026-02-01T00:00:00Z",
-            },
-        )
-        assert response.status_code == 422
+    def test_every_request_model_forbids_extra(self, subtests):
+        for model, origin in iter_request_models().items():
+            if model is dict:
+                continue
+            with subtests.test(model=model.__name__, reached_from=origin):
+                assert model.model_config.get("extra") == "forbid", (
+                    f"{model.__name__} (reached from {origin}) does not forbid "
+                    "unknown fields -- an unrecognized key would be silently dropped"
+                )
 
-    def test_misnamed_title_on_event_create_is_rejected_not_ignored(self, client):
-        """The issue's own example: {"title": ...} instead of {"summary":
-        ...} must 422, not silently create an event named 'Untitled
-        Event'."""
-        response = client.post(
-            "/calendars/primary/events",
-            json={"title": "Standup"},
+    def test_no_request_field_is_a_bare_dict(self):
+        found = iter_request_models()
+        assert dict not in found, (
+            f"a request field reached from {found.get(dict)} is typed as a plain "
+            "dict: unknown keys inside it would be forwarded verbatim (see #8, "
+            "bulk `updates`)"
         )
-        assert response.status_code == 422
-
-    def test_camelcase_prefer_morning_on_find_free_time_is_rejected(self, client):
-        """The issue's own example: preferMorning (Google/JS-style) instead
-        of prefer_morning must 422, not be silently ignored."""
-        response = client.post(
-            "/find-free-time",
-            json={
-                "calendar_id": "primary",
-                "time_min": "2024-01-15T09:00:00Z",
-                "time_max": "2024-01-15T17:00:00Z",
-                "duration_minutes": 30,
-                "preferMorning": True,
-            },
-        )
-        assert response.status_code == 422
-
-    def test_unknown_field_on_nested_search_filters_is_rejected(self, client):
-        """Unknown keys nested inside filters (not just top-level) must also
-        422 -- extra="forbid" needs to reach SearchFilters, not just
-        SearchRequest."""
-        response = client.post(
-            "/search",
-            json={
-                "calendar_id": "primary",
-                "filters": {"query": "meeting", "bogus_filter_field": "x"},
-            },
-        )
-        assert response.status_code == 422
-
-    def test_unknown_field_on_nested_bulk_operation_is_rejected(self, client):
-        """Unknown keys nested inside a bulk operation must also 422."""
-        response = client.post(
-            "/bulk-actions",
-            json={
-                "operations": [
-                    {
-                        "operation": "delete",
-                        "event_id": "event_1",
-                        "calendar_id": "primary",
-                        "bogus_op_field": "x",
-                    },
-                ],
-            },
-        )
-        assert response.status_code == 422
-
-    def test_unknown_field_on_nested_event_datetime_is_rejected(self, client):
-        """Unknown keys nested inside start/end datetime objects must also
-        422."""
-        response = client.post(
-            "/calendars/primary/events",
-            json={
-                "summary": "Standup",
-                "start": {"dateTime": "2024-01-15T09:00:00Z", "bogus": "x"},
-            },
-        )
-        assert response.status_code == 422
-
-    def test_unknown_field_on_nested_attendee_is_rejected(self, client):
-        """Unknown keys nested inside an attendee object must also 422."""
-        response = client.post(
-            "/calendars/primary/events",
-            json={
-                "summary": "Standup",
-                "attendees": [{"email": "alice@example.com", "bogus": "x"}],
-            },
-        )
-        assert response.status_code == 422
 
 
 # ============================================================================
@@ -2345,21 +2355,6 @@ class TestBulkUpdatesAreTyped:
     def _bulk(self, client, op):
         return client.post("/bulk-actions", json={"operations": [op]})
 
-    @pytest.mark.parametrize("operation", ["update", "patch"])
-    def test_unknown_key_inside_updates_is_rejected(self, client, mock_proxy_client, operation):
-        response = self._bulk(client, {
-            "operation": operation,
-            "event_id": "event_1",
-            "calendar_id": "primary",
-            "updates": {"title": "Standup", "timeMin": "2026-01-01T00:00:00Z"},
-        })
-        assert response.status_code == 422, response.text
-        locs = [tuple(err["loc"]) for err in response.json()["detail"]]
-        assert ("body", "operations", 0, operation, "updates", "title") in locs
-        assert ("body", "operations", 0, operation, "updates", "timeMin") in locs
-        mock_proxy_client.update_event.assert_not_called()
-        mock_proxy_client.patch_event.assert_not_called()
-
     def test_delete_with_updates_is_rejected(self, client, mock_proxy_client):
         """A mis-set operation must not DELETE while silently ignoring the payload."""
         response = self._bulk(client, {
@@ -2465,14 +2460,10 @@ class TestSearchFlatShapeFold:
         ]
         mock_proxy_client.list_events.assert_not_called()
 
-    @pytest.mark.parametrize("field", list(__import__(
-        "calendar_agent.calendar_server", fromlist=["SearchFilters"]
-    ).SearchFilters.model_fields))
+    @pytest.mark.parametrize("field", list(SearchFilters.model_fields))
     def test_every_search_filter_field_is_accepted_flat(self, client, mock_proxy_client, field):
         """Derived from SearchFilters.model_fields: a new filter field is
         covered here automatically, with no allowlist to update."""
-        from calendar_agent.calendar_server import SearchFilters
-
         value = {"query": "x", "time_min": "2024-01-01T00:00:00Z",
                  "time_max": "2024-01-02T00:00:00Z", "order_by": "updated"}.get(field)
         if value is None:

@@ -127,23 +127,8 @@ async def validation_error_envelope(request: Request, exc: RequestValidationErro
 
 
 class StrictRequestModel(BaseModel):
-    """Base for every request body model (top-level and nested).
-
-    Pydantic's default is extra="ignore": an unrecognized key is silently
-    dropped rather than rejected. That turns a caller's typo or a
-    Google-style parameter name (e.g. "timeMin" instead of "time_min",
-    "title" instead of "summary") into a confidently wrong HTTP 200 instead
-    of an error -- see issue #8. extra="forbid" makes it a 422 instead.
-
-    Applies to every model that appears inside a request body, including
-    nested ones (EventDateTime, EventAttendee, ...) -- an unknown field
-    nested inside "start" or "attendees" is exactly as silent and exactly
-    as dangerous as one at the top level.
-
-    Response models are NOT built on this base: they're constructed by this
-    server's own code from data it already trusts, not parsed from
-    caller-supplied JSON, so extra="forbid" has no relevant failure mode to
-    close there.
+    """Base for every request body model, top-level and nested: an unknown key
+    is a 422, not a silent drop. Rationale in README "Error Responses"; issue #8.
     """
 
     model_config = ConfigDict(extra="forbid")
