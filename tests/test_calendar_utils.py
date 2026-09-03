@@ -18,6 +18,7 @@ from calendar_agent.calendar_utils import (
     is_all_day_event,
     parse_attendee_name,
 )
+from tests.factories import colleague_copy
 
 # ============================================================================
 # Tests for get_event_time
@@ -434,29 +435,14 @@ def test_find_free_slots_all_day_event():
 # ============================================================================
 
 
-def _invitation(*, calendar_entry_status="accepted"):
-    """A colleague's copy of an invitation from Dave: the colleague's entry
-    carries self:true (it is their calendar); the authenticated user's
-    entry does not."""
-    return {
-        "status": "confirmed",
-        "organizer": {"email": "dave@example.com", "displayName": "Dave", "self": False},
-        "attendees": [
-            {"email": "carol@example.com", "self": True, "responseStatus": calendar_entry_status},
-            {"email": "me@example.com", "responseStatus": "declined"},
-            {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
-        ],
-    }
-
-
 class TestCalendarPerspective:
     def test_self_flags_describe_the_calendar_being_read(self):
-        p = calendar_perspective(_invitation())
+        p = calendar_perspective(colleague_copy())
         assert p.is_organizer is False
-        assert p.rsvp_state == "accepted"  # Carol's entry, not me@'s "declined"
+        assert p.rsvp_state == "accepted"  # Carol's entry, not john.doe@'s "declined"
 
     def test_is_a_plain_tuple_too(self):
-        assert calendar_perspective(_invitation()) == (False, "accepted")
+        assert calendar_perspective(colleague_copy()) == (False, "accepted")
 
     def test_calendar_organizes_with_no_attendees(self):
         event = {"organizer": {"email": "carol@example.com", "self": True}}
@@ -528,17 +514,17 @@ class TestCalendarPerspective:
         assert calendar_perspective({"status": "cancelled"}) == (False, "unknown")
 
     def test_needs_action_passes_through(self):
-        event = _invitation(calendar_entry_status="needsAction")
+        event = colleague_copy(calendar_entry_status="needsAction")
         assert calendar_perspective(event) == (False, "needsAction")
 
     def test_unrecognised_response_status_is_unknown(self):
         # A value this service does not know is not an error: the derived
         # state says "unknown" rather than raising or guessing.
-        event = _invitation(calendar_entry_status="somethingNew")
+        event = colleague_copy(calendar_entry_status="somethingNew")
         assert calendar_perspective(event) == (False, "unknown")
 
     def test_non_string_response_status_is_unknown(self):
-        event = _invitation(calendar_entry_status=42)
+        event = colleague_copy(calendar_entry_status=42)
         assert calendar_perspective(event) == (False, "unknown")
 
     def test_malformed_organizer_and_attendee_entries_do_not_raise(self):

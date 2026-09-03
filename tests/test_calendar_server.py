@@ -24,7 +24,13 @@ from calendar_agent.proxy_client import (
     resolve_confirm_timeout,
     resolve_confirmation_window,
 )
-from tests.factories import SAMPLE_EVENTS, make_event
+from tests.factories import (
+    AUTH_USER_EMAIL,
+    COLLEAGUE_EMAIL,
+    SAMPLE_EVENTS,
+    colleague_copy,
+    get_sample_event,
+)
 
 # ============================================================================
 # Health Endpoint Tests
@@ -122,24 +128,11 @@ class TestEventToSummary:
     only when that calendar is the user's own.
     """
 
-    @staticmethod
-    def _carols_copy():
-        """Carol's calendar's copy of Dave's invitation: Carol's entry is the
-        self entry; the authenticated user (me@) is a plain attendee."""
-        return make_event(
-            organizer={"email": "dave@example.com", "displayName": "Dave", "self": False},
-            creator={"email": "dave@example.com"},
-            attendees=[
-                {"email": "carol@example.com", "self": True, "responseStatus": "accepted"},
-                {"email": "me@example.com", "responseStatus": "declined"},
-            ],
-        )
-
     def test_self_flags_describe_the_calendar_being_read(self):
-        summary = event_to_summary(self._carols_copy(), "carol@example.com")
-        assert summary.calendar_id == "carol@example.com"
+        summary = event_to_summary(colleague_copy(), COLLEAGUE_EMAIL)
+        assert summary.calendar_id == COLLEAGUE_EMAIL
         assert summary.calendar_is_organizer is False
-        assert summary.calendar_rsvp_state == "accepted"  # Carol's RSVP, not me@'s
+        assert summary.calendar_rsvp_state == "accepted"  # Carol's RSVP, not john.doe@'s
         assert summary.organizer_email == "dave@example.com"
         assert summary.creator_email == "dave@example.com"
 
@@ -147,7 +140,7 @@ class TestEventToSummary:
         """The old contract (is_organizer / response_status "of the
         authenticated user") is gone: nothing on the wire is named as if it
         described the caller rather than the calendar."""
-        dumped = event_to_summary(self._carols_copy(), "carol@example.com").model_dump()
+        dumped = event_to_summary(colleague_copy(), COLLEAGUE_EMAIL).model_dump()
         assert "is_organizer" not in dumped
         assert "response_status" not in dumped
         assert "calendar_response_status" not in dumped  # dropped in round 3 (redundant)
@@ -163,7 +156,7 @@ class TestEventToSummary:
     def test_malformed_organizer_or_attendees_degrade_instead_of_raising(self):
         """Finding 8 (round 3): a non-dict organizer/creator or attendee row
         must not raise (which would 500 the whole page); it reads as absent."""
-        event = make_event(organizer=None, attendees=None)
+        event = get_sample_event()
         event["organizer"] = "dave@example.com"
         event["creator"] = ["dave@example.com"]
         event["attendees"] = [None, "bob@example.com"]
@@ -176,9 +169,9 @@ class TestEventToSummary:
         assert event_to_summary(event, "primary").attendee_count == 0
 
     def test_pending_invitation_on_own_calendar(self):
-        event = make_event(
+        event = get_sample_event(
             organizer={"email": "dave@example.com", "self": False},
-            attendees=[{"email": "me@example.com", "self": True, "responseStatus": "needsAction"}],
+            attendees=[{"email": AUTH_USER_EMAIL, "self": True, "responseStatus": "needsAction"}],
         )
         summary = event_to_summary(event, "primary")
         assert summary.calendar_is_organizer is False
@@ -188,9 +181,9 @@ class TestEventToSummary:
         """The dangerous null from issue #9: the calendar organizes, others
         are invited, the calendar has no attendee entry of its own. Reads as
         the calendar's own event, not an unanswered invitation."""
-        event = make_event(
-            organizer={"email": "me@example.com", "self": True},
-            creator={"email": "me@example.com", "self": True},
+        event = get_sample_event(
+            organizer={"email": AUTH_USER_EMAIL, "self": True},
+            creator={"email": AUTH_USER_EMAIL, "self": True},
             attendees=[
                 {"email": "alice@example.com", "responseStatus": "accepted"},
                 {"email": "bob@example.com", "responseStatus": "needsAction"},
@@ -206,9 +199,9 @@ class TestEventToSummary:
         calendar itself the organizer (email == calendar id, self:true); the
         person who created it is only in ``creator``."""
         group = "abc123@group.calendar.google.com"
-        event = make_event(
+        event = get_sample_event(
             organizer={"email": group, "displayName": "Team Calendar", "self": True},
-            creator={"email": "me@example.com"},
+            creator={"email": AUTH_USER_EMAIL},
             attendees=None,
         )
         summary = event_to_summary(event, group)
@@ -216,10 +209,10 @@ class TestEventToSummary:
         assert summary.calendar_is_organizer is True
         assert summary.calendar_rsvp_state == "organizer_no_rsvp"
         assert summary.organizer_email == group
-        assert summary.creator_email == "me@example.com"
+        assert summary.creator_email == AUTH_USER_EMAIL
 
     def test_calendar_neither_organizes_nor_attends(self):
-        event = make_event(
+        event = get_sample_event(
             organizer={"email": "dave@example.com", "self": False},
             attendees=[{"email": "alice@example.com", "responseStatus": "accepted"}],
         )
@@ -228,7 +221,7 @@ class TestEventToSummary:
         assert summary.calendar_rsvp_state == "not_attendee"
 
     def test_cancelled_recurring_stub_is_unknown_not_own_event(self):
-        event = make_event(organizer=None, attendees=None, status="cancelled")
+        event = get_sample_event(status="cancelled")
         summary = event_to_summary(event, "primary")
         assert summary.status == "cancelled"
         assert summary.attendee_count == 0
@@ -240,9 +233,13 @@ class TestEventToSummary:
     def test_attendee_addresses_are_not_on_the_wire(self):
         """Brian's 2026-09-03 decision: organizer and creator addresses are
         exposed; the attendee list is still only a count."""
-        dumped = event_to_summary(self._carols_copy(), "carol@example.com").model_dump_json()
-        assert "carol@example.com" in dumped  # it is the calendar_id
-        assert "me@example.com" not in dumped
+        event = colleague_copy()
+        # Guard the assertion below against a fixture drift that would make
+        # it vacuous: the address must really be in the attendee list.
+        assert any(a["email"] == AUTH_USER_EMAIL for a in event["attendees"])
+        dumped = event_to_summary(event, COLLEAGUE_EMAIL).model_dump_json()
+        assert COLLEAGUE_EMAIL in dumped  # it is the calendar_id
+        assert AUTH_USER_EMAIL not in dumped
         assert "attendees" not in dumped
 
 

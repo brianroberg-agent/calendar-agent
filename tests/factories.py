@@ -13,10 +13,16 @@ from typing import Any
 # ============================================================================
 
 
+# The authenticated user the sample data is built around (the proxy's
+# credentials belong to this account) and the colleague whose calendar the
+# colleague_copy fixture sits on.
+AUTH_USER_EMAIL = "john.doe@example.com"
+COLLEAGUE_EMAIL = "carol@example.com"
+
 SAMPLE_CALENDARS = {
     "primary": {
         "id": "primary",
-        "summary": "john.doe@example.com",
+        "summary": AUTH_USER_EMAIL,
         "description": "Primary calendar",
         "timeZone": "America/New_York",
         "primary": True,
@@ -48,8 +54,15 @@ def get_sample_event(
     attendees: list[dict[str, Any]] | None = None,
     is_all_day: bool = False,
     organizer: dict[str, Any] | None = None,
+    creator: dict[str, Any] | None = None,
+    status: str | None = "confirmed",
 ) -> dict[str, Any]:
-    """Generate a sample event with customizable properties."""
+    """Generate a sample event with customizable properties.
+
+    ``attendees`` / ``organizer`` / ``creator`` are omitted from the dict when
+    None, and so is ``status``, matching what Google returns for events that
+    carry none of them (e.g. cancelled recurring-instance stubs).
+    """
     now = datetime.now(UTC).replace(tzinfo=None)
     start = now + timedelta(hours=start_hours_from_now)
     end = start + timedelta(hours=duration_hours)
@@ -74,17 +87,22 @@ def get_sample_event(
         "location": location,
         "start": start_obj,
         "end": end_obj,
-        "status": "confirmed",
         "htmlLink": f"https://calendar.google.com/event?eid={event_id}",
         "created": (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "updated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+
+    if status is not None:
+        event["status"] = status
 
     if attendees is not None:
         event["attendees"] = attendees
 
     if organizer is not None:
         event["organizer"] = organizer
+
+    if creator is not None:
+        event["creator"] = creator
 
     return event
 
@@ -165,9 +183,9 @@ SAMPLE_EVENTS = {
             for i in range(50)
         ],
     ),
-    # The authenticated user's (john.doe@example.com, per SAMPLE_CALENDARS)
-    # own copy of an invitation: their entry carries self:true.
-    "invitation": {**get_sample_event(
+    # The authenticated user's own copy of an invitation from Dave: their
+    # entry carries self:true. See colleague_copy() for Carol's copy of it.
+    "invitation": get_sample_event(
         event_id="invite_001",
         summary="Budget Review",
         description="Quarterly budget walkthrough",
@@ -175,28 +193,13 @@ SAMPLE_EVENTS = {
         start_hours_from_now=5,
         duration_hours=1,
         organizer={"email": "dave@example.com", "displayName": "Dave Organizer", "self": False},
+        creator={"email": "dave@example.com"},
         attendees=[
             {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
-            {"email": "john.doe@example.com", "self": True, "responseStatus": "needsAction"},
+            {"email": AUTH_USER_EMAIL, "self": True, "responseStatus": "needsAction"},
             {"email": "alice@example.com", "responseStatus": "accepted"},
         ],
-    ), "creator": {"email": "dave@example.com"}},
-    # Carol's calendar's copy of the same invitation: Carol's entry is the
-    # self entry and the authenticated user is a plain attendee.
-    "colleague_copy": {**get_sample_event(
-        event_id="invite_001",
-        summary="Budget Review",
-        description="Quarterly budget walkthrough",
-        location=None,
-        start_hours_from_now=5,
-        duration_hours=1,
-        organizer={"email": "dave@example.com", "displayName": "Dave Organizer", "self": False},
-        attendees=[
-            {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
-            {"email": "carol@example.com", "self": True, "responseStatus": "accepted"},
-            {"email": "john.doe@example.com", "responseStatus": "declined"},
-        ],
-    ), "creator": {"email": "dave@example.com"}},
+    ),
     "past_event": get_sample_event(
         event_id="past_001",
         summary="Yesterday's Meeting",
@@ -207,35 +210,22 @@ SAMPLE_EVENTS = {
 }
 
 
-def make_event(
-    event_id: str = "event_static",
-    summary: str = "Planning Meeting",
-    organizer: dict[str, Any] | None = None,
-    creator: dict[str, Any] | None = None,
-    attendees: list[dict[str, Any]] | None = None,
-    status: str | None = "confirmed",
-) -> dict[str, Any]:
-    """Build a minimal, time-independent event dict.
+def colleague_copy(calendar_entry_status: Any = "accepted") -> dict[str, Any]:
+    """Carol's calendar's copy of ``SAMPLE_EVENTS["invitation"]``.
 
-    Unlike ``get_sample_event`` (which stamps times relative to *now*), every
-    field here is fixed, so organizer/RSVP tests are deterministic and the
-    dict can be compared whole. ``organizer`` / ``creator`` / ``attendees``
-    are omitted from the dict when None, matching what Google returns for
-    events that carry none of them (e.g. cancelled recurring-instance stubs).
+    Identical to the authenticated user's copy except for the attendee list,
+    which is how Google renders the same event on another calendar: Carol's
+    entry is the ``self`` entry (with ``calendar_entry_status``) and the
+    authenticated user is a plain attendee with no ``self`` flag.
     """
-    event: dict[str, Any] = {
-        "id": event_id,
-        "summary": summary,
-        "start": {"dateTime": "2030-01-15T10:00:00Z", "timeZone": "UTC"},
-        "end": {"dateTime": "2030-01-15T11:00:00Z", "timeZone": "UTC"},
-        "htmlLink": f"https://calendar.google.com/event?eid={event_id}",
+    return {
+        **SAMPLE_EVENTS["invitation"],
+        "attendees": [
+            {"email": "dave@example.com", "organizer": True, "responseStatus": "accepted"},
+            {"email": COLLEAGUE_EMAIL, "self": True, "responseStatus": calendar_entry_status},
+            {"email": AUTH_USER_EMAIL, "responseStatus": "declined"},
+        ],
     }
-    if status is not None:
-        event["status"] = status
-    if organizer is not None:
-        event["organizer"] = organizer
-    if creator is not None:
-        event["creator"] = creator
-    if attendees is not None:
-        event["attendees"] = attendees
-    return event
+
+
+SAMPLE_EVENTS["colleague_copy"] = colleague_copy()
