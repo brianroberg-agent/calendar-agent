@@ -96,12 +96,16 @@ Every endpoint returns a body with a `success` field, and on failure an
 | Status | Meaning |
 |--------|---------|
 | `200` | The operation succeeded (`success: true`) |
-| `400` | The request was rejected before anything was sent upstream (e.g. a bulk `update` with no `updates` payload) — nothing happened |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
 | `404` | The calendar or event does not exist. When verifying a deletion this is the *expected* answer: the event is gone |
-| `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) |
-| `502` | The proxy or LLM backend failed |
-| `504` | No response before this server's timeout — **the outcome is unknown**: a confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
+| `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) — nothing was sent upstream. A bulk `update`/`patch` with no `updates` payload rejects the **whole batch** this way, before any operation runs |
+| `502` | The proxy or LLM backend failed — or, on a delete, the proxy claimed success for an event that is still present on re-read |
+| `504` | **The outcome is unknown**: no response before this server's timeout and the resource is still present, or the verifying re-read itself failed. A confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
+
+Mutation envelopes (`DELETE …/events/{id}` and each `/bulk-actions` result)
+also carry an `outcome` of `succeeded` / `failed` / `unknown` (bulk only:
+`not_attempted`), so a caller reading only the body can tell "rejected" from
+"may still apply".
 | `500` | Unexpected internal error |
 
 ### GET /health
@@ -321,11 +325,20 @@ Response:
 
 ### DELETE /calendars/{calendar_id}/events/{event_id}
 
-Delete an event. The proxy requires operator confirmation for deletes: the
-request blocks while a human approves it, then returns `200` on approval,
-`403` if the operator rejects (or never answers), or `504` if this server
-times out first — in which case the outcome is unknown and the event should
-be re-read before assuming failure.
+Delete an event, **verified by re-reading it**. The proxy requires operator
+confirmation for deletes: the request blocks while a human approves it. The
+proxy's answer is treated as a claim, not evidence — this server re-reads the
+event afterwards and decides from that:
+
+| Proxy said | Re-read shows | Status | `outcome` |
+|------------|---------------|--------|-----------|
+| anything but 403/404 | gone (`404`/`410`, or `status: cancelled`) | `200` | `succeeded` |
+| success | still present | `502` | `failed` (the 2026-08-07 incident shape: a claim of success for work that has not happened) |
+| timed out | still present | `504` | `unknown` — may yet be applied when the operator approves; re-verify before acting |
+| anything | re-read failed | `504` | `unknown` — nothing established |
+| error (`5xx`, `4xx`) | still present | that error's code | `failed` |
+| `403` rejected | *(not re-read — the proxy dropped it)* | `403` | `failed` |
+| `404` no such event | *(not re-read — nothing to delete)* | `404` | `failed` |
 
 ```bash
 curl -X DELETE http://localhost:8082/calendars/primary/events/event123
@@ -335,6 +348,7 @@ Response:
 ```json
 {
   "success": true,
+  "outcome": "succeeded",
   "message": "Event deleted successfully",
   "error": null
 }
@@ -344,17 +358,20 @@ If the operator rejects the deletion (HTTP `403`):
 ```json
 {
   "success": false,
+  "outcome": "failed",
   "message": "Deletion blocked or rejected by operator",
   "error": "Operation blocked: Request rejected by operator"
 }
 ```
 
-If no response arrives before the timeout (HTTP `504` — outcome unknown,
-re-read the event before assuming failure):
+If no response arrives before the timeout and the event is still there (HTTP
+`504` — outcome unknown; never create a replacement until a re-read shows it
+gone):
 ```json
 {
   "success": false,
-  "message": "Deletion outcome unknown: no response before timeout",
+  "outcome": "unknown",
+  "message": "Deletion outcome unknown: no response before timeout and the event is still present; ...",
   "error": "Outcome unknown: No response from proxy after 330s; ..."
 }
 ```
@@ -672,15 +689,27 @@ Supported operations:
 - `patch`: Partial event update
 - `delete`: Delete event
 
-Each result carries an `outcome` of `succeeded`, `failed` or `unknown`.
-`unknown` means the mutation timed out and **may still be applied** when the
-operator approves it — re-read the event before doing anything about it.
+Operations run sequentially. Deletes are verified by re-reading the event,
+exactly as the single-event `DELETE` is. An `update`/`patch` without a
+non-empty `updates` payload fails request validation (`422`) and **no
+operation in the batch runs**.
 
-The envelope's `success` is true only when every operation succeeded, and the
-status code agrees with it: `200` when all succeeded, `504` if any outcome is
-unknown (this outranks a definite failure, because the unknown operation is
-the one that can still change the calendar), otherwise `403`/`404`/`502`/`400`
-from the first failure.
+Each result carries an `outcome`:
+
+| `outcome` | Meaning |
+|-----------|---------|
+| `succeeded` | Known to have happened (deletes: the re-read showed the event gone) |
+| `failed` | Known not to have happened (rejected, absent, upstream error, or a delete whose re-read still shows the event) |
+| `unknown` | Timed out and **may still be applied** when the operator approves it — re-read the event before doing anything about it |
+| `not_attempted` | Never sent: an earlier operation in the batch came back `unknown`, which means the operator is not answering, and each further gated operation would have held the connection another full timeout and queued another approval. Re-issue these in a new request once the unknown one is settled |
+
+The envelope's `success` is true only when every operation succeeded;
+otherwise `error` summarises the counts (`"2 of 3 operations did not
+succeed: 1 outcome unknown (...), 1 not attempted; see results"`). The status
+code agrees with the body and is ranked by severity, **never by position in
+the batch**: `504` if any outcome is unknown (the unknown operation is the one
+that can still change the calendar), else `403` if any was rejected, else
+`502`, else `500`, else `404`.
 
 ```bash
 curl -X POST http://localhost:8082/bulk-actions \
@@ -725,6 +754,7 @@ Response:
   "success_count": 2,
   "error_count": 0,
   "unknown_count": 0,
+  "not_attempted_count": 0,
   "error": null
 }
 ```

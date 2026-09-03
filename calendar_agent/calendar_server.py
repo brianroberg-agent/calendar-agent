@@ -16,13 +16,14 @@ and enforces security policies.
 """
 
 import os
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from . import __version__
 from .calendar_utils import find_free_slots, get_time_range_rfc3339
@@ -209,9 +210,21 @@ class BulkOperation(BaseModel):
     event_id: str
     calendar_id: str
     updates: dict[str, Any] | None = Field(
-        None, description="Update data (for update/patch operations)"
+        None, description="Update data (required for update/patch operations)"
     )
     send_updates: str | None = Field(None, description="'all', 'externalOnly', 'none'")
+
+    @model_validator(mode="after")
+    def _writes_need_a_payload(self) -> "BulkOperation":
+        # Validated with the request, so a malformed operation anywhere in the
+        # batch is a 422 before any operation runs. Discovering it mid-loop
+        # left the envelope's status depending on operation order (F3).
+        needs_payload = self.operation in (BulkOperationType.UPDATE, BulkOperationType.PATCH)
+        if needs_payload and not self.updates:
+            raise ValueError(
+                f"'{self.operation.value}' requires a non-empty 'updates' payload"
+            )
+        return self
 
 
 class BulkActionsRequest(BaseModel):
@@ -282,9 +295,29 @@ class EventDetailResponse(BaseModel):
     error: str | None = None
 
 
+class OperationOutcome(str, Enum):
+    """What is actually known about one mutation.
+
+    ``UNKNOWN`` is a first-class outcome, not a flavour of failure: a mutation
+    that timed out may still be applied when the operator approves it later
+    (issue #4). Treating it as failed is what produced the duplicate-event
+    incident. ``NOT_ATTEMPTED`` marks a bulk operation that was never sent
+    because an earlier one in the same batch came back unknown.
+    """
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    NOT_ATTEMPTED = "not_attempted"
+
+
 class ActionResponse(BaseModel):
-    """Response for action endpoints."""
+    """Response for action endpoints.
+
+    ``outcome`` puts the tri-state on the single-event envelope too, so a
+    caller reading only the body can tell "rejected" from "may still apply".
+    """
     success: bool
+    outcome: OperationOutcome
     message: str
     error: str | None = None
 
@@ -296,25 +329,12 @@ class LLMResponse(BaseModel):
     error: str | None = None
 
 
-class BulkOperationOutcome(str, Enum):
-    """What is actually known about one bulk operation.
-
-    ``UNKNOWN`` is a first-class outcome, not a flavour of failure: a mutation
-    that timed out may still be applied when the operator approves it later
-    (issue #4). Treating it as failed is what produced the duplicate-event
-    incident.
-    """
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    UNKNOWN = "unknown"
-
-
 class BulkOperationResult(BaseModel):
     """Result of a single bulk operation."""
     event_id: str
     operation: str
     success: bool
-    outcome: BulkOperationOutcome = BulkOperationOutcome.FAILED
+    outcome: OperationOutcome
     error: str | None = None
 
 
@@ -323,27 +343,22 @@ class BulkActionsResponse(BaseModel):
 
     ``success`` is true only when every operation is known to have happened;
     ``unknown_count`` covers operations whose outcome must be verified by
-    re-reading the event before anything is done about them.
+    re-reading the event before anything is done about them;
+    ``not_attempted_count`` covers operations never sent because an earlier
+    one came back unknown.
     """
     success: bool
     results: list[BulkOperationResult]
     success_count: int
     error_count: int
     unknown_count: int = 0
+    not_attempted_count: int = 0
     error: str | None = None
 
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
-
-
-class BulkInputError(Exception):
-    """A bulk operation rejected before anything was sent upstream.
-
-    Nothing was attempted, so the outcome is definitively "did not happen" and
-    the fault is the caller's.
-    """
 
 
 def format_proxy_error(e: Exception) -> str:
@@ -376,8 +391,6 @@ def error_status_code(e: Exception) -> int:
         return 404
     if isinstance(e, ProxyTimeoutError):
         return 504
-    if isinstance(e, BulkInputError):
-        return 400
     if isinstance(e, ProxyAuthError | ProxyError | LLMError):
         return 502
     return 500
@@ -388,18 +401,178 @@ def error_response(body: BaseModel, e: Exception) -> JSONResponse:
     return JSONResponse(status_code=error_status_code(e), content=body.model_dump())
 
 
-def bulk_status_code(errors: list[Exception]) -> int:
-    """Pick the status for a bulk response from its per-operation failures.
+# Most to least urgent for the caller. An unknown outcome outranks every
+# definite failure, however many of each there are: the timed-out operation is
+# the one that can still change the calendar, so the caller must verify before
+# issuing anything compensating (issue #4). A rejection outranks an upstream
+# fault, which outranks an absent event. Position in the batch never matters.
+BULK_STATUS_PRECEDENCE = (504, 403, 502, 500, 404)
 
-    An unknown outcome outranks a definite failure, however many of each there
-    are: the timed-out operation is the one that can still change the calendar,
-    so the caller must verify before issuing anything compensating (issue #4).
-    """
-    if not errors:
+
+def bulk_status_code(codes: list[int]) -> int:
+    """Pick the status for a bulk response from its per-operation statuses."""
+    failures = [code for code in codes if code != 200]
+    if not failures:
         return 200
-    if any(isinstance(e, ProxyTimeoutError) for e in errors):
-        return 504
-    return error_status_code(errors[0])
+    for status in BULK_STATUS_PRECEDENCE:
+        if status in failures:
+            return status
+    return failures[0]
+
+
+@dataclass(frozen=True)
+class OperationVerdict:
+    """What one mutation established, with the status code that agrees."""
+    outcome: OperationOutcome
+    status_code: int
+    message: str
+    error: str | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.outcome is OperationOutcome.SUCCEEDED
+
+
+async def event_presence(client, calendar_id: str, event_id: str) -> str:
+    """Re-read an event: ``"gone"``, ``"present"`` or ``"inconclusive"``.
+
+    Google keeps a deleted event readable with ``status: cancelled`` for a
+    while before answering 404/410, so both count as gone.
+    """
+    try:
+        event = await client.get_event(calendar_id, event_id)
+    except ProxyNotFoundError:
+        return "gone"
+    except Exception:
+        return "inconclusive"
+    status = event.get("status") if isinstance(event, dict) else None
+    if status is None:
+        return "inconclusive"
+    return "gone" if status == "cancelled" else "present"
+
+
+async def verified_delete(
+    client, calendar_id: str, event_id: str, send_updates: str | None = None
+) -> OperationVerdict:
+    """Delete an event and decide by re-reading it, not by the proxy's answer.
+
+    The proxy's response to a gated delete is a claim: it can be a success for
+    work that has not happened (the 2026-08-07 incident) or a timeout for work
+    that is still going to happen. Only the re-read is evidence (issue #4).
+    A 403 or 404 needs no re-read: the proxy dropped the request, or there was
+    nothing to delete.
+    """
+    try:
+        await client.delete_event(
+            calendar_id=calendar_id, event_id=event_id, send_updates=send_updates
+        )
+    except ProxyForbiddenError as e:
+        return OperationVerdict(
+            OperationOutcome.FAILED, 403,
+            "Deletion blocked or rejected by operator", format_proxy_error(e),
+        )
+    except ProxyNotFoundError as e:
+        return OperationVerdict(
+            OperationOutcome.FAILED, 404,
+            "No such event: nothing was deleted", format_proxy_error(e),
+        )
+    except ProxyTimeoutError as e:
+        claim, claim_error = "unknown", format_proxy_error(e)
+        claim_status = 504
+    except Exception as e:
+        claim, claim_error = "failed", format_proxy_error(e)
+        claim_status = error_status_code(e)
+    else:
+        claim, claim_error, claim_status = "deleted", None, 200
+
+    presence = await event_presence(client, calendar_id, event_id)
+
+    if presence == "gone":
+        message = "Event deleted successfully"
+        if claim != "deleted":
+            message += f" (confirmed by re-read; the delete itself reported: {claim_error})"
+        return OperationVerdict(OperationOutcome.SUCCEEDED, 200, message)
+
+    if presence == "present":
+        if claim == "unknown":
+            return OperationVerdict(
+                OperationOutcome.UNKNOWN, 504,
+                "Deletion outcome unknown: no response before timeout and the "
+                "event is still present; it may yet be applied when the operator "
+                "approves it. Re-verify before acting",
+                claim_error,
+            )
+        if claim == "failed":
+            return OperationVerdict(
+                OperationOutcome.FAILED, claim_status, "Failed to delete event", claim_error
+            )
+        return OperationVerdict(
+            OperationOutcome.FAILED, 502,
+            "Proxy reported the deletion complete, but the event is still present",
+            "Proxy claimed success for a deletion that has not happened: the event "
+            "is still present on re-read",
+        )
+
+    return OperationVerdict(
+        OperationOutcome.UNKNOWN, 504,
+        "Deletion outcome unknown: could not re-read the event, so nothing is "
+        "established. Re-verify before acting",
+        claim_error or "The delete was accepted but the verifying re-read failed",
+    )
+
+
+async def gated_write(
+    client, op: BulkOperation
+) -> OperationVerdict:
+    """Run a bulk update/patch and map its answer to a verdict."""
+    write = (
+        client.update_event
+        if op.operation == BulkOperationType.UPDATE
+        else client.patch_event
+    )
+    try:
+        await write(
+            calendar_id=op.calendar_id,
+            event_id=op.event_id,
+            event_data=op.updates,
+            send_updates=op.send_updates,
+        )
+    except ProxyTimeoutError as e:
+        return OperationVerdict(
+            OperationOutcome.UNKNOWN, 504,
+            f"{op.operation.value} outcome unknown", format_proxy_error(e),
+        )
+    except Exception as e:
+        return OperationVerdict(
+            OperationOutcome.FAILED, error_status_code(e),
+            f"{op.operation.value} failed", format_proxy_error(e),
+        )
+    return OperationVerdict(OperationOutcome.SUCCEEDED, 200, f"{op.operation.value} applied")
+
+
+def bulk_error_summary(results: list[BulkOperationResult]) -> str | None:
+    """One sentence for the envelope's ``error`` when a batch did not fully succeed."""
+    counts = {
+        outcome: sum(1 for r in results if r.outcome is outcome)
+        for outcome in OperationOutcome
+    }
+    not_ok = len(results) - counts[OperationOutcome.SUCCEEDED]
+    if not_ok == 0:
+        return None
+    parts = []
+    if counts[OperationOutcome.UNKNOWN]:
+        parts.append(
+            f"{counts[OperationOutcome.UNKNOWN]} outcome unknown "
+            "(may still be applied; verify before acting)"
+        )
+    if counts[OperationOutcome.FAILED]:
+        parts.append(f"{counts[OperationOutcome.FAILED]} failed")
+    if counts[OperationOutcome.NOT_ATTEMPTED]:
+        parts.append(f"{counts[OperationOutcome.NOT_ATTEMPTED]} not attempted")
+    return (
+        f"{not_ok} of {len(results)} operations did not succeed: "
+        f"{', '.join(parts)}; see results"
+    )
 
 
 def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
@@ -661,49 +834,32 @@ async def delete_event(
     event_id: str,
     send_updates: str | None = None,
 ):
-    """Delete an event.
+    """Delete an event, and verify it by re-reading before answering.
 
     The proxy requires operator confirmation for deletes: the request blocks
     while a human approves it. A 403 here means the operator rejected the
-    deletion (or never answered); a 504 means this server got no response
-    before its timeout and the outcome is unknown — verify by re-reading the
-    event before assuming failure.
+    deletion (or never answered); a 504 means the outcome is unknown — this
+    server got no response before its timeout and the event is still present,
+    or the verifying re-read failed. A 200 is only ever returned after the
+    re-read shows the event gone (404/410, or ``status: cancelled``).
     """
     try:
         client = get_calendar_client()
-        await client.delete_event(
-            calendar_id=calendar_id,
-            event_id=event_id,
-            send_updates=send_updates,
-        )
-        return ActionResponse(success=True, message="Event deleted successfully")
-    except ProxyForbiddenError as e:
-        return error_response(
-            ActionResponse(
-                success=False,
-                message="Deletion blocked or rejected by operator",
-                error=format_proxy_error(e),
-            ),
-            e,
-        )
-    except ProxyTimeoutError as e:
-        return error_response(
-            ActionResponse(
-                success=False,
-                message="Deletion outcome unknown: no response before timeout",
-                error=format_proxy_error(e),
-            ),
-            e,
-        )
+        verdict = await verified_delete(client, calendar_id, event_id, send_updates)
     except Exception as e:
-        return error_response(
-            ActionResponse(
-                success=False,
-                message="Failed to delete event",
-                error=format_proxy_error(e),
-            ),
-            e,
+        verdict = OperationVerdict(
+            OperationOutcome.FAILED, error_status_code(e),
+            "Failed to delete event", format_proxy_error(e),
         )
+    body = ActionResponse(
+        success=verdict.success,
+        outcome=verdict.outcome,
+        message=verdict.message,
+        error=verdict.error,
+    )
+    if verdict.status_code == 200:
+        return body
+    return JSONResponse(status_code=verdict.status_code, content=body.model_dump())
 
 
 @app.post(
@@ -1010,87 +1166,67 @@ async def bulk_actions(request: BulkActionsRequest):
     """Execute multiple operations on events in a single request.
 
     Supports update, patch, and delete operations. Operations are executed
-    sequentially, and the response includes results for each operation.
+    sequentially; deletes are verified by re-reading the event before they
+    are reported as succeeded.
 
     Every mutation blocks while a human operator approves it, so a bulk
     request can legitimately take several minutes (up to ~330s per gated
-    operation). A per-item error starting with "Operation blocked:" means the
-    operator rejected that operation (never "confirmation pending"); one
-    starting with "Outcome unknown:" means it timed out and must be verified
-    by re-reading the event before assuming failure.
+    operation). Once one operation comes back with an unknown outcome, the
+    operator is not answering: the remaining operations are not sent (each
+    would hold the connection another full timeout and enqueue another
+    approval) and are reported as ``not_attempted``.
     """
     try:
         client = get_calendar_client()
         results: list[BulkOperationResult] = []
-        errors: list[Exception] = []
-        success_count = 0
-        error_count = 0
-        unknown_count = 0
+        codes: list[int] = []
+        stop_reason: str | None = None
 
         for op in request.operations:
-            try:
-                if op.operation == BulkOperationType.DELETE:
-                    await client.delete_event(
-                        calendar_id=op.calendar_id,
-                        event_id=op.event_id,
-                        send_updates=op.send_updates,
-                    )
-
-                elif op.operation in (
-                    BulkOperationType.UPDATE, BulkOperationType.PATCH
-                ):
-                    if not op.updates:
-                        raise BulkInputError("No update data provided")
-
-                    write = (
-                        client.update_event
-                        if op.operation == BulkOperationType.UPDATE
-                        else client.patch_event
-                    )
-                    await write(
-                        calendar_id=op.calendar_id,
-                        event_id=op.event_id,
-                        event_data=op.updates,
-                        send_updates=op.send_updates,
-                    )
-
-                results.append(BulkOperationResult(
-                    event_id=op.event_id,
-                    operation=op.operation.value,
-                    success=True,
-                    outcome=BulkOperationOutcome.SUCCEEDED,
-                ))
-                success_count += 1
-
-            except Exception as e:
-                # A timed-out mutation is not a failure: the operator may
-                # approve it after this loop has moved on (issue #4).
-                unknown = isinstance(e, ProxyTimeoutError)
+            if stop_reason is not None:
                 results.append(BulkOperationResult(
                     event_id=op.event_id,
                     operation=op.operation.value,
                     success=False,
-                    outcome=(
-                        BulkOperationOutcome.UNKNOWN
-                        if unknown
-                        else BulkOperationOutcome.FAILED
-                    ),
-                    error=format_proxy_error(e),
+                    outcome=OperationOutcome.NOT_ATTEMPTED,
+                    error=f"Not attempted: {stop_reason}",
                 ))
-                errors.append(e)
-                if unknown:
-                    unknown_count += 1
-                else:
-                    error_count += 1
+                continue
+
+            if op.operation == BulkOperationType.DELETE:
+                verdict = await verified_delete(
+                    client, op.calendar_id, op.event_id, op.send_updates
+                )
+            else:
+                verdict = await gated_write(client, op)
+
+            results.append(BulkOperationResult(
+                event_id=op.event_id,
+                operation=op.operation.value,
+                success=verdict.success,
+                outcome=verdict.outcome,
+                error=verdict.error,
+            ))
+            codes.append(verdict.status_code)
+            if verdict.outcome is OperationOutcome.UNKNOWN:
+                stop_reason = (
+                    f"the {op.operation.value} of {op.event_id} timed out with its "
+                    "outcome unknown (the operator is not answering), so nothing "
+                    "further was queued for approval"
+                )
 
         body = BulkActionsResponse(
-            success=not errors,
+            success=all(r.success for r in results),
             results=results,
-            success_count=success_count,
-            error_count=error_count,
-            unknown_count=unknown_count,
+            success_count=sum(r.outcome is OperationOutcome.SUCCEEDED for r in results),
+            error_count=sum(r.outcome is OperationOutcome.FAILED for r in results),
+            unknown_count=sum(r.outcome is OperationOutcome.UNKNOWN for r in results),
+            not_attempted_count=sum(
+                r.outcome is OperationOutcome.NOT_ATTEMPTED for r in results
+            ),
+            error=bulk_error_summary(results),
         )
-        status = bulk_status_code(errors)
+        status = bulk_status_code(codes)
         if status == 200:
             return body
         return JSONResponse(status_code=status, content=body.model_dump())

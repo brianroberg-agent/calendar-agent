@@ -81,14 +81,30 @@ uv run pytest --cov=calendar_agent  # With coverage
 - Use `LLMError` for LLM failures
 - Always return the `{"success": false, "error": "..."}` envelope via
   `error_response(...)` so the HTTP status agrees with the body (issue #4):
-  400 caller error with nothing attempted, 403 forbidden/rejected, 404
-  absent, 504 timeout/outcome unknown, 502 upstream proxy/LLM failure, 500
-  unexpected — never 200 for a failure
-- Per-item results (`/bulk-actions`) carry an `outcome` of `succeeded` /
-  `failed` / `unknown`. Never collapse `unknown` into `failed`: a timed-out
-  mutation may still be applied when the operator approves it, and treating
-  that as failure is what produced the duplicate-event incident in issue #4.
-  An unknown outcome outranks a definite failure when picking the status code
+  403 forbidden/rejected, 404 absent, 504 outcome unknown, 502 upstream
+  proxy/LLM failure (or a delete the proxy claimed but the re-read
+  contradicts), 500 unexpected — never 200 for a failure. Caller errors are
+  422 from request validation (no envelope), raised *before* anything is
+  sent upstream — e.g. `BulkOperation`'s validator requiring `updates` for
+  update/patch. Nothing returns 400
+- Every mutation envelope carries an `outcome` (`OperationOutcome`):
+  `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items.
+  Never collapse `unknown` into `failed`: a timed-out mutation may still be
+  applied when the operator approves it, and treating that as failure is what
+  produced the duplicate-event incident in issue #4
+- **Deletes are verified server-side** (`verified_delete`): the proxy's
+  answer is a claim; the re-read (`event_presence`: gone / present /
+  inconclusive) decides. 200 only after the event is observed gone; a
+  success claim with the event still present is 502/`failed`; a timeout with
+  it still present is 504/`unknown`; an unreadable re-read is 504/`unknown`.
+  403 and 404 from the delete are definitive and skip the re-read
+- `/bulk-actions` status is `bulk_status_code(codes)`, ranked by
+  `BULK_STATUS_PRECEDENCE` (504 > 403 > 502 > 500 > 404) — never by position.
+  The envelope `error` is always set when any item did not succeed
+  (`bulk_error_summary`). After the first `unknown` outcome the loop stops
+  and the remaining items are `not_attempted` (the operator is not
+  answering; each further gated call would hold the connection another full
+  `CONFIRM_TIMEOUT` and queue another approval)
 - Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default
   window + 30s = 330s; `resolve_confirm_timeout` refuses `nan`/`inf` and any
   value below `PROXY_CONFIRMATION_WINDOW + CONFIRM_TIMEOUT_MARGIN`); reads
