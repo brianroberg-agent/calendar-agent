@@ -1909,3 +1909,217 @@ class TestBulkStatusCode:
         from calendar_agent.calendar_server import bulk_status_code
 
         assert bulk_status_code(codes) == expected
+# ============================================================================
+# Unknown-Field Rejection Tests (issue #8)
+#
+# Every request model used to inherit Pydantic's default extra="ignore": an
+# unrecognized key was silently dropped instead of rejected. That produced
+# HTTP 200 / success:true responses that were confidently wrong -- e.g. a
+# caller sending Google's own "timeMin"/"timeMax" got an unbounded search
+# with no error at all. These tests pin extra="forbid" on every request
+# model: an unknown or misspelled field must be a 422, not a silent no-op.
+# ============================================================================
+
+
+# (method, path, base_payload) -- base_payload is a MINIMAL VALID body for
+# that route. Each entry drives a generic "unknown top-level field is
+# rejected" test.
+UNKNOWN_FIELD_ROUTES = [
+    (
+        "post",
+        "/calendars/primary/events",
+        {"summary": "Standup"},
+    ),
+    (
+        "put",
+        "/calendars/primary/events/event_123",
+        {"summary": "Standup"},
+    ),
+    (
+        "patch",
+        "/calendars/primary/events/event_123",
+        {"summary": "Standup"},
+    ),
+    (
+        "post",
+        "/calendars/primary/events/event_123/respond",
+        {"response_status": "accepted"},
+    ),
+    (
+        "post",
+        "/summarize",
+        {"calendar_id": "primary", "event_id": "event_123"},
+    ),
+    (
+        "post",
+        "/ask-about",
+        {"calendar_id": "primary", "event_id": "event_123", "question": "When?"},
+    ),
+    (
+        "post",
+        "/batch-summarize",
+        {"calendar_id": "primary", "event_ids": ["event_1"]},
+    ),
+    (
+        "post",
+        "/find-free-time",
+        {
+            "calendar_id": "primary",
+            "time_min": "2024-01-15T09:00:00Z",
+            "time_max": "2024-01-15T17:00:00Z",
+            "duration_minutes": 30,
+        },
+    ),
+    (
+        "post",
+        "/analyze-schedule",
+        {
+            "calendar_id": "primary",
+            "time_min": "2024-01-15T00:00:00Z",
+            "time_max": "2024-01-22T00:00:00Z",
+        },
+    ),
+    (
+        "post",
+        "/prepare-briefing",
+        {"calendar_id": "primary"},
+    ),
+    (
+        "post",
+        "/search",
+        {"calendar_id": "primary", "filters": {"query": "meeting"}},
+    ),
+    (
+        "post",
+        "/bulk-actions",
+        {
+            "operations": [
+                {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
+            ],
+        },
+    ),
+]
+
+
+class TestUnknownFieldsRejected:
+    """An unrecognized field on any request body is a 422, not a silent drop."""
+
+    @pytest.mark.parametrize(
+        "method,path,base_payload",
+        UNKNOWN_FIELD_ROUTES,
+        ids=[path for _, path, _ in UNKNOWN_FIELD_ROUTES],
+    )
+    def test_unknown_top_level_field_rejected(self, client, method, path, base_payload):
+        payload = {**base_payload, "bogus_field_xyz": "should not be accepted"}
+        response = getattr(client, method)(path, json=payload)
+        assert response.status_code == 422, (
+            f"{method.upper()} {path} accepted an unknown field instead of "
+            f"rejecting it: got {response.status_code}, body {response.text}"
+        )
+
+    @pytest.mark.parametrize(
+        "method,path,base_payload",
+        UNKNOWN_FIELD_ROUTES,
+        ids=[path for _, path, _ in UNKNOWN_FIELD_ROUTES],
+    )
+    def test_known_fields_still_accepted(self, client, method, path, base_payload):
+        """Sanity check the base payloads themselves are NOT rejected --
+        i.e. the parametrize table above isn't accidentally passing because
+        the base payload itself already 422s for an unrelated reason."""
+        response = getattr(client, method)(path, json=base_payload)
+        assert response.status_code == 200, (
+            f"{method.upper()} {path} rejected its own minimal valid "
+            f"payload: got {response.status_code}, body {response.text}"
+        )
+
+    def test_google_style_time_min_max_on_search_is_rejected_not_ignored(self, client):
+        """The issue's own example: sending Google's timeMin/timeMax instead
+        of the documented nested filters.time_min/time_max must 422, not
+        silently run an unbounded search."""
+        response = client.post(
+            "/search",
+            json={
+                "calendar_id": "primary",
+                "timeMin": "2026-01-01T00:00:00Z",
+                "timeMax": "2026-02-01T00:00:00Z",
+            },
+        )
+        assert response.status_code == 422
+
+    def test_misnamed_title_on_event_create_is_rejected_not_ignored(self, client):
+        """The issue's own example: {"title": ...} instead of {"summary":
+        ...} must 422, not silently create an event named 'Untitled
+        Event'."""
+        response = client.post(
+            "/calendars/primary/events",
+            json={"title": "Standup"},
+        )
+        assert response.status_code == 422
+
+    def test_camelcase_prefer_morning_on_find_free_time_is_rejected(self, client):
+        """The issue's own example: preferMorning (Google/JS-style) instead
+        of prefer_morning must 422, not be silently ignored."""
+        response = client.post(
+            "/find-free-time",
+            json={
+                "calendar_id": "primary",
+                "time_min": "2024-01-15T09:00:00Z",
+                "time_max": "2024-01-15T17:00:00Z",
+                "duration_minutes": 30,
+                "preferMorning": True,
+            },
+        )
+        assert response.status_code == 422
+
+    def test_unknown_field_on_nested_search_filters_is_rejected(self, client):
+        """Unknown keys nested inside filters (not just top-level) must also
+        422 -- extra="forbid" needs to reach SearchFilters, not just
+        SearchRequest."""
+        response = client.post(
+            "/search",
+            json={
+                "calendar_id": "primary",
+                "filters": {"query": "meeting", "bogus_filter_field": "x"},
+            },
+        )
+        assert response.status_code == 422
+
+    def test_unknown_field_on_nested_bulk_operation_is_rejected(self, client):
+        """Unknown keys nested inside a bulk operation must also 422."""
+        response = client.post(
+            "/bulk-actions",
+            json={
+                "operations": [
+                    {
+                        "operation": "delete",
+                        "event_id": "event_1",
+                        "calendar_id": "primary",
+                        "bogus_op_field": "x",
+                    },
+                ],
+            },
+        )
+        assert response.status_code == 422
+
+    def test_unknown_field_on_nested_event_datetime_is_rejected(self, client):
+        """Unknown keys nested inside start/end datetime objects must also
+        422."""
+        response = client.post(
+            "/calendars/primary/events",
+            json={
+                "summary": "Standup",
+                "start": {"dateTime": "2024-01-15T09:00:00Z", "bogus": "x"},
+            },
+        )
+        assert response.status_code == 422
+
+    def test_unknown_field_on_nested_attendee_is_rejected(self, client):
+        """Unknown keys nested inside an attendee object must also 422."""
+        response = client.post(
+            "/calendars/primary/events",
+            json={
+                "summary": "Standup",
+                "attendees": [{"email": "alice@example.com", "bogus": "x"}],
+            },
+        )
+        assert response.status_code == 422

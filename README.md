@@ -121,6 +121,16 @@ also carry an `outcome` of `succeeded` / `failed` / `unknown` (bulk only:
 "may still apply".
 | `500` | Unexpected internal error |
 
+**Unknown fields are rejected, not ignored.** Every request body model uses
+`extra="forbid"` ([issue #8](https://github.com/brianroberg/calendar-agent/issues/8)):
+a key the model doesn't declare -- a typo, or a Google/JS-style name like
+`timeMin` instead of `time_min`, or `title` instead of `summary` -- is a
+`422`, at any nesting depth (e.g. inside `attendees` or `filters`), not a
+silently-dropped no-op. Before this, such a request could return
+`success: true` while quietly doing something other than what was asked
+(an unbounded search when time bounds were misnamed, an event titled
+"Untitled Event" when `title` was sent instead of `summary`).
+
 ### GET /health
 
 Health check endpoint. Returns server status and version.

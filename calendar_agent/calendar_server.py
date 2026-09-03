@@ -27,7 +27,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import __version__
 from .calendar_utils import (
@@ -74,14 +74,37 @@ app = FastAPI(
 # ============================================================================
 
 
-class EventDateTime(BaseModel):
+class StrictRequestModel(BaseModel):
+    """Base for every request body model (top-level and nested).
+
+    Pydantic's default is extra="ignore": an unrecognized key is silently
+    dropped rather than rejected. That turns a caller's typo or a
+    Google-style parameter name (e.g. "timeMin" instead of "time_min",
+    "title" instead of "summary") into a confidently wrong HTTP 200 instead
+    of an error -- see issue #8. extra="forbid" makes it a 422 instead.
+
+    Applies to every model that appears inside a request body, including
+    nested ones (EventDateTime, EventAttendee, ...) -- an unknown field
+    nested inside "start" or "attendees" is exactly as silent and exactly
+    as dangerous as one at the top level.
+
+    Response models are NOT built on this base: they're constructed by this
+    server's own code from data it already trusts, not parsed from
+    caller-supplied JSON, so extra="forbid" has no relevant failure mode to
+    close there.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EventDateTime(StrictRequestModel):
     """DateTime specification for calendar events."""
     date: str | None = Field(None, description="Date for all-day events (YYYY-MM-DD)")
     dateTime: str | None = Field(None, description="DateTime for timed events (RFC3339)")
     timeZone: str | None = Field(None, description="Timezone (e.g., 'America/New_York')")
 
 
-class EventAttendee(BaseModel):
+class EventAttendee(StrictRequestModel):
     """Event attendee."""
     email: str
     displayName: str | None = None
@@ -91,19 +114,19 @@ class EventAttendee(BaseModel):
     self_: bool | None = Field(None, alias="self")
 
 
-class EventReminder(BaseModel):
+class EventReminder(StrictRequestModel):
     """Event reminder."""
     method: str
     minutes: int
 
 
-class EventReminders(BaseModel):
+class EventReminders(StrictRequestModel):
     """Event reminders configuration."""
     useDefault: bool = True
     overrides: list[EventReminder] | None = None
 
 
-class EventCreateRequest(BaseModel):
+class EventCreateRequest(StrictRequestModel):
     """Request body for creating a new event."""
     summary: str | None = Field(None, description="Event title")
     description: str | None = Field(None, description="Event description")
@@ -126,7 +149,7 @@ class EventUpdateRequest(EventCreateRequest):
     pass
 
 
-class EventPatchRequest(BaseModel):
+class EventPatchRequest(StrictRequestModel):
     """Request body for partially updating an event."""
     summary: str | None = None
     description: str | None = None
@@ -145,7 +168,7 @@ _RSVP_RESPONSE_LIST = ", ".join(f"'{v}'" for v in RSVP_RESPONSES)
 _READ_STATUS_LIST = ", ".join(f"'{v}'" for v in READ_RESPONSE_STATUSES)
 
 
-class RespondRequest(BaseModel):
+class RespondRequest(StrictRequestModel):
     """Request body for RSVPing to an event.
 
     The proxy writes the AUTHENTICATED USER's own attendee entry, found by
@@ -169,28 +192,28 @@ class RespondRequest(BaseModel):
     )
 
 
-class SummarizeRequest(BaseModel):
+class SummarizeRequest(StrictRequestModel):
     """Request to summarize an event."""
     calendar_id: str = Field(..., description="Calendar ID containing the event")
     event_id: str = Field(..., description="Event ID to summarize")
     format: str = Field("brief", description="'brief' or 'detailed'")
 
 
-class AskAboutRequest(BaseModel):
+class AskAboutRequest(StrictRequestModel):
     """Request to ask a question about an event."""
     calendar_id: str = Field(..., description="Calendar ID containing the event")
     event_id: str = Field(..., description="Event ID to ask about")
     question: str = Field(..., description="Question to ask about the event")
 
 
-class BatchSummarizeRequest(BaseModel):
+class BatchSummarizeRequest(StrictRequestModel):
     """Request to summarize multiple events."""
     calendar_id: str = Field(..., description="Calendar ID containing the events")
     event_ids: list[str] = Field(..., description="List of event IDs to summarize")
     triage: bool = Field(False, description="Include action type classification")
 
 
-class FindFreeTimeRequest(BaseModel):
+class FindFreeTimeRequest(StrictRequestModel):
     """Request to find free time slots."""
     calendar_id: str = Field(..., description="Calendar ID to check")
     time_min: str = Field(..., description="Start of search range (RFC3339)")
@@ -202,7 +225,7 @@ class FindFreeTimeRequest(BaseModel):
     prefer_afternoon: bool = Field(False, description="Prefer afternoon times")
 
 
-class AnalyzeScheduleRequest(BaseModel):
+class AnalyzeScheduleRequest(StrictRequestModel):
     """Request to analyze schedule patterns."""
     calendar_id: str = Field(..., description="Calendar ID to analyze")
     time_min: str = Field(..., description="Start of analysis period (RFC3339)")
@@ -213,7 +236,7 @@ class AnalyzeScheduleRequest(BaseModel):
     )
 
 
-class PrepareBriefingRequest(BaseModel):
+class PrepareBriefingRequest(StrictRequestModel):
     """Request to prepare a schedule briefing."""
     calendar_id: str = Field(..., description="Calendar ID for briefing")
     briefing_type: str = Field("daily", description="'daily' or 'weekly'")
@@ -221,7 +244,7 @@ class PrepareBriefingRequest(BaseModel):
     time_max: str | None = Field(None, description="End time (defaults based on type)")
 
 
-class SearchFilters(BaseModel):
+class SearchFilters(StrictRequestModel):
     """Filters for event search."""
     query: str | None = Field(None, description="Free text search")
     time_min: str | None = Field(None, description="Start of time range (RFC3339)")
@@ -231,7 +254,7 @@ class SearchFilters(BaseModel):
     show_deleted: bool = Field(False, description="Include deleted events")
 
 
-class SearchRequest(BaseModel):
+class SearchRequest(StrictRequestModel):
     """Request to search events."""
     calendar_id: str = Field(..., description="Calendar ID to search")
     filters: SearchFilters = Field(default_factory=SearchFilters)
@@ -244,7 +267,7 @@ class BulkOperationType(str, Enum):
     PATCH = "patch"
 
 
-class BulkOperation(BaseModel):
+class BulkOperation(StrictRequestModel):
     """A single operation in a bulk request."""
     operation: BulkOperationType
     event_id: str
@@ -267,7 +290,7 @@ class BulkOperation(BaseModel):
         return self
 
 
-class BulkActionsRequest(BaseModel):
+class BulkActionsRequest(StrictRequestModel):
     """Request for bulk operations on events."""
     operations: list[BulkOperation] = Field(..., min_length=1)
 
