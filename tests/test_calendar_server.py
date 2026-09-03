@@ -24,7 +24,7 @@ from calendar_agent.proxy_client import (
     resolve_confirm_timeout,
     resolve_confirmation_window,
 )
-from tests.conftest import get_sample_event
+from tests.factories import get_sample_event
 
 # ============================================================================
 # Health Endpoint Tests
