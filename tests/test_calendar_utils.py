@@ -236,6 +236,11 @@ def test_is_all_day_event_no_start():
     assert is_all_day_event(event) is False
 
 
+def test_is_all_day_event_start_none():
+    """An explicit ``start: null`` is not all-day and must not raise."""
+    assert is_all_day_event({"start": None}) is False
+
+
 # ============================================================================
 # Tests for get_event_summary_text
 # ============================================================================

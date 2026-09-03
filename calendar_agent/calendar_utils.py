@@ -168,8 +168,12 @@ def parse_attendee_name(attendee: dict[str, Any]) -> str:
 
 
 def is_all_day_event(event: dict[str, Any]) -> bool:
-    """Check if an event is an all-day event."""
-    start = event.get("start", {})
+    """Check if an event is an all-day event.
+
+    A missing or null ``start`` (a cancelled recurring-instance stub) is not
+    all-day.
+    """
+    start = event.get("start") or {}
     return "date" in start and "dateTime" not in start
 
 

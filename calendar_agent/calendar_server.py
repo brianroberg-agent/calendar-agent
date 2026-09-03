@@ -37,6 +37,7 @@ from .calendar_utils import (
     find_free_slots,
     get_event_time,
     get_time_range_rfc3339,
+    is_all_day_event,
 )
 from .exceptions import (
     LLMError,
@@ -686,7 +687,6 @@ def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
     The ``calendar_*`` fields are derived from Google's ``self`` flags and so
     describe ``calendar_id`` -- the calendar this copy of the event sits on.
     """
-    start = event.get("start") or {}
     attendees = event.get("attendees")
     organizer = event.get("organizer")
     creator = event.get("creator")
@@ -696,15 +696,14 @@ def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
         id=event.get("id", ""),
         calendar_id=calendar_id,
         summary=event.get("summary", "Untitled Event"),
-        start=get_event_time(start),
+        # A cancelled recurring-instance stub has no start/end: empty strings.
+        start=get_event_time(event.get("start")),
         end=get_event_time(event.get("end")),
         location=event.get("location"),
         # Non-dict organizer/creator/attendee values read as absent rather
         # than raising, so one malformed row cannot 500 a whole page.
         attendee_count=len(attendees) if isinstance(attendees, list) else 0,
-        # Not calendar_utils.is_all_day_event(): that assumes a start dict and
-        # raises on a missing start, which a cancelled stub has.
-        is_all_day="date" in start and "dateTime" not in start,
+        is_all_day=is_all_day_event(event),
         status=event.get("status"),
         html_link=event.get("htmlLink"),
         organizer_email=organizer.get("email") if isinstance(organizer, dict) else None,

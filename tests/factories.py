@@ -56,12 +56,14 @@ def get_sample_event(
     organizer: dict[str, Any] | None = None,
     creator: dict[str, Any] | None = None,
     status: str | None = "confirmed",
+    with_times: bool = True,
 ) -> dict[str, Any]:
     """Generate a sample event with customizable properties.
 
     ``attendees`` / ``organizer`` / ``creator`` are omitted from the dict when
     None, and so is ``status``, matching what Google returns for events that
-    carry none of them (e.g. cancelled recurring-instance stubs).
+    carry none of them. ``with_times=False`` omits ``start`` and ``end`` too,
+    which is the shape of a cancelled recurring-instance stub.
     """
     now = datetime.now(UTC).replace(tzinfo=None)
     start = now + timedelta(hours=start_hours_from_now)
@@ -85,12 +87,14 @@ def get_sample_event(
         "summary": summary,
         "description": description,
         "location": location,
-        "start": start_obj,
-        "end": end_obj,
         "htmlLink": f"https://calendar.google.com/event?eid={event_id}",
         "created": (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "updated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+
+    if with_times:
+        event["start"] = start_obj
+        event["end"] = end_obj
 
     if status is not None:
         event["status"] = status
@@ -233,3 +237,13 @@ def colleague_copy(calendar_entry_status: Any = "accepted") -> dict[str, Any]:
 
 
 SAMPLE_EVENTS["colleague_copy"] = colleague_copy()
+
+# What Google returns for a deleted instance of a recurring series (a plain
+# GET with singleEvents=false): id, status, the series id and the original
+# start -- no start/end, no summary, no organizer, no attendees.
+CANCELLED_STUB: dict[str, Any] = {
+    "id": "recurring_001_20260107T140000Z",
+    "status": "cancelled",
+    "recurringEventId": "recurring_001",
+    "originalStartTime": {"dateTime": "2026-01-07T14:00:00Z"},
+}

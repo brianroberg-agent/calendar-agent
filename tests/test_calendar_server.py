@@ -27,6 +27,7 @@ from calendar_agent.proxy_client import (
 )
 from tests.factories import (
     AUTH_USER_EMAIL,
+    CANCELLED_STUB,
     COLLEAGUE_EMAIL,
     SAMPLE_EVENTS,
     colleague_copy,
@@ -222,7 +223,7 @@ class TestEventToSummary:
         assert summary.calendar_rsvp_state == "not_attendee"
 
     def test_cancelled_recurring_stub_is_unknown_not_own_event(self):
-        event = get_sample_event(status="cancelled")
+        event = get_sample_event(status="cancelled", with_times=False)
         summary = event_to_summary(event, "primary")
         assert summary.status == "cancelled"
         assert summary.attendee_count == 0
@@ -230,6 +231,19 @@ class TestEventToSummary:
         assert summary.calendar_rsvp_state == "unknown"
         assert summary.organizer_email is None
         assert summary.creator_email is None
+
+    def test_bare_cancelled_stub_with_no_start_or_end(self):
+        """The real shape of a deleted recurring instance: no start, no end,
+        no summary (finding 5, round 4). Empty times, not all-day, not a
+        crash."""
+        summary = event_to_summary(CANCELLED_STUB, "primary")
+        assert summary.id == CANCELLED_STUB["id"]
+        assert summary.status == "cancelled"
+        assert summary.start == ""
+        assert summary.end == ""
+        assert summary.is_all_day is False
+        assert summary.summary == "Untitled Event"
+        assert summary.calendar_rsvp_state == "unknown"
 
     def test_attendee_addresses_are_not_on_the_wire(self):
         """Brian's 2026-09-03 decision: organizer and creator addresses are
@@ -298,6 +312,17 @@ class TestEventsListEndpoint:
         assert data["success"] is True
         assert len(data["events"]) == 1
         assert data["events"][0]["calendar_rsvp_state"] == "unknown"
+
+    def test_list_serves_a_bare_cancelled_stub(self, client, mock_proxy_client):
+        """A plain GET with single_events=false returns stubs without
+        start/end; the page must still be 200 (finding 5, round 4)."""
+        mock_proxy_client.list_events.return_value = {"items": [CANCELLED_STUB]}
+        response = client.get("/calendars/primary/events", params={"single_events": "false"})
+        assert response.status_code == 200
+        row = response.json()["events"][0]
+        assert row["status"] == "cancelled"
+        assert row["start"] == "" and row["end"] == ""
+        assert row["is_all_day"] is False
 
     def test_list_events_empty(self, client, mock_proxy_client):
         """List events handles empty results."""
