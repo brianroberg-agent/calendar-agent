@@ -2335,3 +2335,74 @@ class TestGoogleEventRoundTrip:
         assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {
             "location": "Room B"
         }
+
+
+class TestBulkUpdatesAreTyped:
+    """A bulk operation's `updates` goes through the same strict event model
+    as the single-event routes (C1): an unknown key inside it is a 422, a
+    delete does not carry one, and the payload is dumped the same way."""
+
+    def _bulk(self, client, op):
+        return client.post("/bulk-actions", json={"operations": [op]})
+
+    @pytest.mark.parametrize("operation", ["update", "patch"])
+    def test_unknown_key_inside_updates_is_rejected(self, client, mock_proxy_client, operation):
+        response = self._bulk(client, {
+            "operation": operation,
+            "event_id": "event_1",
+            "calendar_id": "primary",
+            "updates": {"title": "Standup", "timeMin": "2026-01-01T00:00:00Z"},
+        })
+        assert response.status_code == 422, response.text
+        locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+        assert ("body", "operations", 0, operation, "updates", "title") in locs
+        assert ("body", "operations", 0, operation, "updates", "timeMin") in locs
+        mock_proxy_client.update_event.assert_not_called()
+        mock_proxy_client.patch_event.assert_not_called()
+
+    def test_delete_with_updates_is_rejected(self, client, mock_proxy_client):
+        """A mis-set operation must not DELETE while silently ignoring the payload."""
+        response = self._bulk(client, {
+            "operation": "delete",
+            "event_id": "event_1",
+            "calendar_id": "primary",
+            "updates": {"summary": "meant to patch this"},
+        })
+        assert response.status_code == 422, response.text
+        assert ["body", "operations", 0, "delete", "updates"] in [
+            err["loc"] for err in response.json()["detail"]
+        ]
+        mock_proxy_client.delete_event.assert_not_called()
+
+    def test_updates_are_dumped_like_the_single_routes(self, client, mock_proxy_client):
+        """exclude_none + by_alias + read-only strip, exactly as PUT/PATCH do."""
+        response = self._bulk(client, {
+            "operation": "patch",
+            "event_id": "event_1",
+            "calendar_id": "primary",
+            "updates": {
+                "id": "event_1",
+                "etag": '"1"',
+                "summary": "Renamed",
+                "location": None,
+                "attendees": [{"email": "alice@example.com", "self": True}],
+            },
+        })
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {
+            "summary": "Renamed",
+            "attendees": [{"email": "alice@example.com", "self": True}],
+        }
+
+    def test_empty_updates_object_is_still_a_per_item_error(self, client, mock_proxy_client):
+        response = self._bulk(client, {
+            "operation": "update",
+            "event_id": "event_1",
+            "calendar_id": "primary",
+            "updates": {},
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert data["error_count"] == 1
+        assert "No update data" in data["results"][0]["error"]
+        mock_proxy_client.update_event.assert_not_called()

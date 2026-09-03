@@ -22,7 +22,7 @@ and enforces security policies.
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -331,27 +331,65 @@ class BulkOperationType(str, Enum):
     PATCH = "patch"
 
 
-class BulkOperation(StrictRequestModel):
-    """A single operation in a bulk request."""
-    operation: BulkOperationType
+class _BulkOperationBase(StrictRequestModel):
+    """Fields every bulk operation carries."""
     event_id: str
     calendar_id: str
-    updates: dict[str, Any] | None = Field(
-        None, description="Update data (required for update/patch operations)"
-    )
     send_updates: str | None = Field(None, description="'all', 'externalOnly', 'none'")
 
+
+class BulkDeleteOperation(_BulkOperationBase):
+    """Delete one event. Carries no `updates` -- sending one is a 422, so a
+    mis-set operation can't delete while its payload is silently ignored."""
+    operation: Literal[BulkOperationType.DELETE]
+
+
+class _BulkWriteOperation(_BulkOperationBase):
+    """An update or patch: `updates` is required and must name at least one
+    writable field. Subclasses narrow `updates` to the matching single-event
+    body so an unknown key inside it is rejected at the same depth as on the
+    single-event routes (issue #8)."""
+    operation: BulkOperationType
+    updates: EventFields = Field(..., description="Update data")
+
+    @property
+    def event_data(self) -> dict[str, Any]:
+        """The payload as forwarded: same dump as the single-event routes."""
+        return self.updates.model_dump(exclude_none=True, by_alias=True)
+
     @model_validator(mode="after")
-    def _writes_need_a_payload(self) -> "BulkOperation":
+    def _writes_need_a_payload(self) -> "_BulkWriteOperation":
         # Validated with the request, so a malformed operation anywhere in the
         # batch is a 422 before any operation runs. Discovering it mid-loop
         # left the envelope's status depending on operation order (F3).
-        needs_payload = self.operation in (BulkOperationType.UPDATE, BulkOperationType.PATCH)
-        if needs_payload and not self.updates:
+        # Emptiness is judged on the forwarded payload, not the model object
+        # (which is always truthy): `updates: {}` or all-null values are empty.
+        if not self.event_data:
             raise ValueError(
                 f"'{self.operation.value}' requires a non-empty 'updates' payload"
             )
         return self
+
+
+class BulkUpdateOperation(_BulkWriteOperation):
+    """Full replacement of one event; `updates` is validated exactly like PUT."""
+    operation: Literal[BulkOperationType.UPDATE]
+    updates: EventUpdateRequest = Field(..., description="Full event body")
+
+
+class BulkPatchOperation(_BulkWriteOperation):
+    """Partial update of one event; `updates` is validated exactly like PATCH."""
+    operation: Literal[BulkOperationType.PATCH]
+    updates: EventPatchRequest = Field(..., description="Fields to change")
+
+
+# Discriminated on `operation`, so `updates` is typed by the operation it
+# accompanies and an unknown key inside it is rejected at the same depth as
+# on the single-event routes (issue #8).
+BulkOperation = Annotated[
+    BulkDeleteOperation | BulkUpdateOperation | BulkPatchOperation,
+    Field(discriminator="operation"),
+]
 
 
 class BulkActionsRequest(StrictRequestModel):
@@ -752,7 +790,7 @@ async def verified_delete(
 
 
 async def gated_write(
-    client, op: BulkOperation
+    client, op: BulkUpdateOperation | BulkPatchOperation
 ) -> OperationVerdict:
     """Run a bulk update/patch and map its answer to a verdict."""
     write = (
@@ -764,7 +802,7 @@ async def gated_write(
         await write(
             calendar_id=op.calendar_id,
             event_id=op.event_id,
-            event_data=op.updates,
+            event_data=op.event_data,
             send_updates=op.send_updates,
         )
     except ProxyTimeoutError as e:
