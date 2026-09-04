@@ -8,11 +8,21 @@ import pytest
 
 from calendar_agent.exceptions import (
     ProxyAuthError,
+    ProxyConfigError,
     ProxyError,
     ProxyForbiddenError,
+    ProxyNotFoundError,
     ProxyTimeoutError,
 )
-from calendar_agent.proxy_client import CONFIRM_TIMEOUT, READ_TIMEOUT, CalendarProxyClient
+from calendar_agent.proxy_client import (
+    CONFIRM_TIMEOUT,
+    CONFIRM_TIMEOUT_MARGIN,
+    PROXY_CONFIRMATION_WINDOW,
+    READ_TIMEOUT,
+    CalendarProxyClient,
+    resolve_confirm_timeout,
+    resolve_confirmation_window,
+)
 
 # ============================================================================
 # Health Endpoint Tests
@@ -267,12 +277,37 @@ class TestEventDeleteEndpoint:
     """Tests for DELETE /calendars/{calendar_id}/events/{event_id}."""
 
     def test_delete_event_success(self, client, mock_proxy_client):
-        """Delete event returns success."""
+        """Delete event returns success once the re-read shows it gone."""
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
         response = client.delete("/calendars/primary/events/event_123")
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["outcome"] == "succeeded"
         assert "deleted" in data["message"].lower()
+
+    def test_delete_is_verified_by_re_reading_the_event(self, client, mock_proxy_client):
+        """The proxy's answer is a claim; the re-read is the evidence (F4)."""
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
+        client.delete("/calendars/primary/events/event_123")
+        assert [c[0] for c in mock_proxy_client.mock_calls] == ["delete_event", "get_event"]
+        assert mock_proxy_client.get_event.call_args.args[:2] == ("primary", "event_123")
+
+    def test_cancelled_status_on_re_read_is_success(self, client, mock_proxy_client):
+        mock_proxy_client.get_event.return_value = {"id": "event_123", "status": "cancelled"}
+        response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 200
+        assert response.json()["outcome"] == "succeeded"
+
+    def test_success_claim_contradicted_by_re_read_is_failure(self, client, mock_proxy_client):
+        """The 2026-08-07 incident: the proxy said 200 for an event still
+        confirmed. Fixture default: get_event returns a confirmed event."""
+        response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 502
+        data = response.json()
+        assert data["success"] is False
+        assert data["outcome"] == "failed"
+        assert "still present" in data["error"]
 
     def test_delete_event_rejected_by_operator(self, client, mock_proxy_client):
         """An operator rejection surfaces as 403 with the rejection message."""
@@ -287,7 +322,7 @@ class TestEventDeleteEndpoint:
         assert "rejected by operator" in data["error"]
 
     def test_delete_event_timeout_outcome_unknown(self, client, mock_proxy_client):
-        """A timed-out delete surfaces as 504 with outcome-unknown messaging."""
+        """A timed-out delete with the event still present is 504/unknown."""
         mock_proxy_client.delete_event.side_effect = ProxyTimeoutError(
             "No response from proxy after 330s"
         )
@@ -295,7 +330,44 @@ class TestEventDeleteEndpoint:
         assert response.status_code == 504
         data = response.json()
         assert data["success"] is False
+        assert data["outcome"] == "unknown"
         assert "unknown" in data["message"].lower()
+
+    def test_delete_timeout_but_event_gone_is_success(self, client, mock_proxy_client):
+        """Approved after this server gave up, but before the re-read: the
+        deletion did happen, and saying 504 would invite a compensating
+        mutation against an event that no longer exists."""
+        mock_proxy_client.delete_event.side_effect = ProxyTimeoutError("no response")
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
+        response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 200
+        assert response.json()["outcome"] == "succeeded"
+
+    def test_delete_timeout_and_unreadable_re_read_is_unknown(
+        self, client, mock_proxy_client
+    ):
+        mock_proxy_client.delete_event.side_effect = ProxyTimeoutError("no response")
+        mock_proxy_client.get_event.side_effect = ProxyError("proxy down")
+        response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 504
+        assert response.json()["outcome"] == "unknown"
+
+    def test_rejection_is_failed_without_a_re_read(self, client, mock_proxy_client):
+        """A 403 is the proxy saying it dropped the request: definitive."""
+        mock_proxy_client.delete_event.side_effect = ProxyForbiddenError("rejected")
+        response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 403
+        assert response.json()["outcome"] == "failed"
+        mock_proxy_client.get_event.assert_not_called()
+
+    def test_nonexistent_event_is_404_failed(self, client, mock_proxy_client):
+        mock_proxy_client.delete_event.side_effect = ProxyNotFoundError("Not Found")
+        response = client.delete("/calendars/primary/events/event_123")
+        assert response.status_code == 404
+        data = response.json()
+        assert data["success"] is False
+        assert data["outcome"] == "failed"
+        mock_proxy_client.get_event.assert_not_called()
 
 
 class TestEventRespondEndpoint:
@@ -401,6 +473,60 @@ class TestProxyClientRespond:
             "http://proxy/calendar/v3/calendars/"
             "en.usa%23holiday@group.v.calendar.google.com/events/e1/respond"
         )
+
+
+class TestProxyClientPathQuoting:
+    """Every event route must percent-encode its path segments (F9).
+
+    Google's built-in calendar ids contain ``#`` (``#contacts@group.v...``,
+    ``en.usa#holiday@...``). Unquoted, httpx reads the ``#`` as a fragment and
+    the request goes to ``/calendars/`` — a different route, whose 404 now maps
+    to "the event does not exist" instead of a recognisable upstream error.
+    """
+
+    CAL = "#contacts@group.v.calendar.google.com"
+    EXPECTED = (
+        "http://proxy/calendar/v3/calendars/"
+        "%23contacts@group.v.calendar.google.com/events/e%2F1"
+    )
+
+    @pytest.fixture
+    def ok_response(self):
+        r = AsyncMock(spec=httpx.Response)
+        r.status_code = 200
+        r.json.return_value = {"id": "e/1"}
+        return r
+
+    @pytest.mark.parametrize(
+        ("method", "call"),
+        [
+            ("get", lambda c, cal: c.get_event(cal, "e/1")),
+            ("put", lambda c, cal: c.update_event(cal, "e/1", {"summary": "x"})),
+            ("patch", lambda c, cal: c.patch_event(cal, "e/1", {"summary": "x"})),
+            ("delete", lambda c, cal: c.delete_event(cal, "e/1")),
+        ],
+    )
+    async def test_event_routes_quote_both_segments(self, ok_response, method, call):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with patch("calendar_agent.proxy_client.httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            getattr(mock_http, method).return_value = ok_response
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await call(client, self.CAL)
+        url = getattr(mock_http, method).call_args.args[0]
+        assert url == self.EXPECTED
+        assert httpx.URL(url).raw_path.decode().endswith("/events/e%2F1")
+
+    async def test_proxy_410_is_not_found(self):
+        """Google answers 410 Gone for a deleted event; that is "absent", the
+        expected answer when verifying a delete, not a generic proxy error."""
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        response = AsyncMock(spec=httpx.Response)
+        response.status_code = 410
+        response.json.return_value = {"detail": "Resource has been deleted"}
+        with pytest.raises(ProxyNotFoundError):
+            client._handle_response(response)
 
 
 class TestProxyClientTimeouts:
@@ -769,6 +895,7 @@ class TestBulkActionsEndpoint:
 
     def test_bulk_delete_success(self, client, mock_proxy_client):
         """Bulk delete events."""
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
         request_data = {
             "operations": [
                 {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
@@ -800,6 +927,7 @@ class TestBulkActionsEndpoint:
 
     def test_bulk_mixed_operations(self, client, mock_proxy_client):
         """Bulk operations with mixed types."""
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
         request_data = {
             "operations": [
                 {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
@@ -821,6 +949,10 @@ class TestBulkActionsEndpoint:
             {"success": True},
             ProxyError("Event not found"),
         ]
+        mock_proxy_client.get_event.side_effect = [
+            ProxyNotFoundError("Not Found"),
+            {"id": "event_2", "status": "confirmed"},
+        ]
         request_data = {
             "operations": [
                 {"operation": "delete", "event_id": "event_1", "calendar_id": "primary"},
@@ -829,21 +961,21 @@ class TestBulkActionsEndpoint:
         }
         response = client.post("/bulk-actions", json=request_data)
         data = response.json()
-        assert data["success"] is True  # Overall still success
+        assert data["success"] is False  # one operation did not happen
         assert data["success_count"] == 1
         assert data["error_count"] == 1
 
     def test_bulk_update_without_data(self, client, mock_proxy_client):
-        """Bulk update fails without update data."""
+        """Bulk update without update data is a validation error (422)."""
         request_data = {
             "operations": [
                 {"operation": "update", "event_id": "event_1", "calendar_id": "primary"},
             ]
         }
         response = client.post("/bulk-actions", json=request_data)
-        data = response.json()
-        assert data["error_count"] == 1
-        assert "No update data" in data["results"][0]["error"]
+        assert response.status_code == 422
+        assert "updates" in response.text
+        mock_proxy_client.update_event.assert_not_called()
 
 
 # ============================================================================
@@ -919,3 +1051,275 @@ class TestRequestValidation:
         }
         response = client.post("/find-free-time", json=request_data)
         assert response.status_code == 422
+
+
+class TestConfirmTimeoutResolution:
+    """The confirm timeout is env-overridable; it must never silently drop
+    back below the proxy's approval window (issue #4, item 1)."""
+
+    def test_default_outlives_the_proxy_confirmation_window(self):
+        """With nothing configured, the mutation budget clears the window."""
+        assert resolve_confirm_timeout(None) > PROXY_CONFIRMATION_WINDOW
+
+    def test_override_above_the_window_is_honoured(self):
+        assert resolve_confirm_timeout("400") == 400.0
+
+    def test_override_below_the_window_is_rejected(self):
+        """A 30s override is the original incident's configuration; accepting
+        it silently makes every approval outcome undeliverable again."""
+        with pytest.raises(ProxyConfigError) as exc_info:
+            resolve_confirm_timeout("30")
+        assert "PROXY_CONFIRM_TIMEOUT" in str(exc_info.value)
+        assert "300" in str(exc_info.value)
+
+    def test_non_numeric_override_is_rejected(self):
+        """A typo must fail loudly rather than fall back to a short default."""
+        with pytest.raises(ProxyConfigError):
+            resolve_confirm_timeout("5 minutes")
+
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "NaN", "Infinity"])
+    def test_non_finite_override_is_rejected(self, raw):
+        """float('nan') parses and compares False against everything, so the
+        old ``<= window`` guard let it through; ``inf`` disables the timeout.
+        Neither is a budget that outlives anything."""
+        with pytest.raises(ProxyConfigError):
+            resolve_confirm_timeout(raw)
+
+    @pytest.mark.parametrize("raw", ["301", "329.9"])
+    def test_override_inside_the_margin_is_rejected(self, raw):
+        """Clearing the window by a second is not clearing it: the proxy's own
+        timeout, its response, and the network all sit inside that gap."""
+        with pytest.raises(ProxyConfigError) as exc_info:
+            resolve_confirm_timeout(raw)
+        assert str(int(PROXY_CONFIRMATION_WINDOW + CONFIRM_TIMEOUT_MARGIN)) in str(
+            exc_info.value
+        )
+
+    def test_override_at_window_plus_margin_is_accepted(self):
+        assert resolve_confirm_timeout("330") == 330.0
+
+    def test_guard_follows_an_overridden_confirmation_window(self):
+        """The window is api-proxy's ``--confirmation-timeout``, not a law of
+        nature; an operator who raises it there must be able to keep this
+        guard honest, or it passes while the invariant is violated (F5)."""
+        with pytest.raises(ProxyConfigError):
+            resolve_confirm_timeout("330", window=600.0)
+        assert resolve_confirm_timeout("630", window=600.0) == 630.0
+
+
+class TestConfirmationWindowResolution:
+    """``PROXY_CONFIRMATION_WINDOW`` mirrors api-proxy's confirmation timeout."""
+
+    def test_default_matches_api_proxy_default(self):
+        assert resolve_confirmation_window(None) == 300.0
+
+    def test_override_is_honoured(self):
+        assert resolve_confirmation_window("600") == 600.0
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "five"])
+    def test_unbounded_or_invalid_window_is_rejected(self, raw):
+        """api-proxy treats ``<= 0`` as "wait forever" — a window no client
+        timeout can outlive, so the guard cannot be honest and must say so."""
+        with pytest.raises(ProxyConfigError) as exc_info:
+            resolve_confirmation_window(raw)
+        assert "PROXY_CONFIRMATION_WINDOW" in str(exc_info.value)
+
+
+class TestMissingEventStatus:
+    """A resource the proxy says is gone must surface as 404, not 502.
+
+    Item 3's verify-by-re-read (issue #4) is specified as "expect 404 or
+    status: cancelled"; collapsing 404 into the generic upstream-error bucket
+    leaves a caller unable to tell "deleted" from "proxy is broken"."""
+
+    async def test_proxy_404_raises_not_found(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        response = AsyncMock(spec=httpx.Response)
+        response.status_code = 404
+        response.json.return_value = {"detail": "Not Found"}
+        with pytest.raises(ProxyNotFoundError):
+            client._handle_response(response)
+
+    def test_get_deleted_event_returns_404(self, client, mock_proxy_client):
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Event not found")
+        response = client.get("/calendars/primary/events/gone_123")
+        assert response.status_code == 404
+        data = response.json()
+        assert data["success"] is False
+        assert data["event"] is None
+
+
+class TestBulkActionsOutcomeHonesty:
+    """/bulk-actions must not answer 200/success:true for work that failed or
+    whose outcome is unknown (issue #4, item 4)."""
+
+    def _delete_ops(self, *event_ids: str) -> dict:
+        return {
+            "operations": [
+                {"operation": "delete", "event_id": e, "calendar_id": "primary"}
+                for e in event_ids
+            ]
+        }
+
+    def test_all_operations_failing_is_not_reported_as_success(
+        self, client, mock_proxy_client
+    ):
+        mock_proxy_client.delete_event.side_effect = ProxyError("proxy exploded")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.status_code == 502
+        data = response.json()
+        assert data["success"] is False
+        assert data["error_count"] == 2
+        assert data["error"]  # F7: the envelope must say so, not just the items
+
+    def test_partial_failure_is_not_reported_as_success(self, client, mock_proxy_client):
+        mock_proxy_client.delete_event.side_effect = [
+            {"success": True},
+            ProxyError("proxy exploded"),
+        ]
+        mock_proxy_client.get_event.side_effect = [
+            ProxyNotFoundError("Not Found"),
+            {"id": "e2", "status": "confirmed"},
+        ]
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        data = response.json()
+        assert data["success"] is False
+        assert response.status_code == 502
+        assert "1 of 2" in data["error"]
+        assert "1 failed" in data["error"]
+
+    def test_timed_out_operation_is_unknown_not_failed(self, client, mock_proxy_client):
+        """A mutation that timed out may still be applied after later approval;
+        recording it as a plain failure is the incident's error inverted."""
+        mock_proxy_client.delete_event.side_effect = ProxyTimeoutError("no response")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1"))
+        assert response.status_code == 504
+        data = response.json()
+        assert data["success"] is False
+        assert data["unknown_count"] == 1
+        assert data["error_count"] == 0
+        assert data["results"][0]["outcome"] == "unknown"
+        assert "unknown" in data["error"]  # F7
+
+    def test_unknown_outcome_outranks_a_definite_failure(self, client, mock_proxy_client):
+        """504 (verify before acting) must win over 502, because the unknown
+        operation is the one that can still change the calendar."""
+        mock_proxy_client.delete_event.side_effect = [
+            ProxyError("proxy exploded"),
+            ProxyTimeoutError("no response"),
+        ]
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.status_code == 504
+
+    def test_rejected_operation_propagates_403(self, client, mock_proxy_client):
+        mock_proxy_client.delete_event.side_effect = ProxyForbiddenError("rejected")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1"))
+        assert response.status_code == 403
+        assert response.json()["error"]  # F7
+
+    def test_nonexistent_event_propagates_404(self, client, mock_proxy_client):
+        """The README's 404 bulk contract (F10): a proxy 404 is "absent",
+        not a 502 upstream failure."""
+        mock_proxy_client.delete_event.side_effect = ProxyNotFoundError("Not Found")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1"))
+        assert response.status_code == 404
+        data = response.json()
+        assert data["results"][0]["outcome"] == "failed"
+        assert data["error"]
+
+    def test_all_succeeding_stays_200_and_true(self, client, mock_proxy_client):
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["unknown_count"] == 0
+        assert [r["outcome"] for r in data["results"]] == ["succeeded", "succeeded"]
+
+    @pytest.mark.parametrize("operation", ["update", "patch"])
+    def test_missing_update_payload_rejects_the_whole_batch(
+        self, client, mock_proxy_client, operation
+    ):
+        """F3: a malformed operation anywhere in the batch is a 422 before any
+        operation runs — never a 400 that claims "nothing happened" after
+        earlier operations already did."""
+        request_data = {
+            "operations": [
+                {"operation": "delete", "event_id": "e1", "calendar_id": "primary"},
+                {"operation": operation, "event_id": "e2", "calendar_id": "primary"},
+            ]
+        }
+        response = client.post("/bulk-actions", json=request_data)
+        assert response.status_code == 422
+        mock_proxy_client.delete_event.assert_not_called()
+
+    @pytest.mark.parametrize("order", ["not_found_first", "rejected_first"])
+    def test_status_code_is_ranked_by_severity_not_position(
+        self, client, mock_proxy_client, order
+    ):
+        """F3: the envelope's status must not depend on operation order."""
+        errors = [ProxyNotFoundError("Not Found"), ProxyForbiddenError("rejected")]
+        if order == "rejected_first":
+            errors.reverse()
+        mock_proxy_client.delete_event.side_effect = errors
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2"))
+        assert response.status_code == 403
+
+    def test_bulk_delete_is_verified_by_re_read(self, client, mock_proxy_client):
+        """F4: bulk deletes get the same after-write check as single deletes."""
+        # Fixture default: get_event returns a confirmed event.
+        response = client.post("/bulk-actions", json=self._delete_ops("e1"))
+        assert response.status_code == 502
+        data = response.json()
+        assert data["results"][0]["outcome"] == "failed"
+        assert "still present" in data["results"][0]["error"]
+
+    def test_stops_after_the_first_unknown_outcome(self, client, mock_proxy_client):
+        """F8: once one gated mutation has timed out, the operator is not
+        answering; each further operation would hold the connection another
+        full CONFIRM_TIMEOUT and enqueue another approval. Stop, and say so."""
+        mock_proxy_client.delete_event.side_effect = [
+            {"success": True},
+            ProxyTimeoutError("no response"),
+            {"success": True},
+        ]
+        mock_proxy_client.get_event.side_effect = [
+            ProxyNotFoundError("Not Found"),
+            {"id": "e2", "status": "confirmed"},
+        ]
+        response = client.post("/bulk-actions", json=self._delete_ops("e1", "e2", "e3"))
+        assert response.status_code == 504
+        data = response.json()
+        assert [r["outcome"] for r in data["results"]] == [
+            "succeeded", "unknown", "not_attempted"
+        ]
+        assert data["results"][2]["success"] is False
+        assert "not attempted" in data["results"][2]["error"].lower()
+        assert data["success_count"] == 1
+        assert data["unknown_count"] == 1
+        assert data["error_count"] == 0
+        assert data["not_attempted_count"] == 1
+        assert mock_proxy_client.delete_event.call_count == 2
+        assert "1 not attempted" in data["error"]
+
+
+class TestBulkStatusCode:
+    """Pure ranking of per-operation status codes into one envelope status."""
+
+    @pytest.mark.parametrize(
+        ("codes", "expected"),
+        [
+            ([200, 200], 200),
+            ([404, 403], 403),
+            ([403, 404], 403),
+            ([502, 403], 403),
+            ([404, 502], 502),
+            ([403, 504], 504),
+            ([200, 404], 404),
+            ([500, 404], 500),
+        ],
+    )
+    def test_precedence(self, codes, expected):
+        from calendar_agent.calendar_server import bulk_status_code
+
+        assert bulk_status_code(codes) == expected

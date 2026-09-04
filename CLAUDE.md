@@ -72,16 +72,72 @@ uv run pytest --cov=calendar_agent  # With coverage
 - Use `ProxyForbiddenError` for 403 responses (policy blocks and operator
   rejections — the proxy blocks mutations in-line for human approval, so a
   403 means rejected, never "confirmation pending")
+- Use `ProxyNotFoundError` for 404 responses (the calendar or event does not
+  exist — the *expected* answer when verifying that a delete took effect, so
+  it must not be folded into the generic upstream-error bucket)
 - Use `ProxyTimeoutError` when the proxy doesn't answer before the client
   timeout (outcome unknown — the mutation may still complete if approved)
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
 - Always return the `{"success": false, "error": "..."}` envelope via
   `error_response(...)` so the HTTP status agrees with the body (issue #4):
-  403 forbidden/rejected, 504 timeout/outcome unknown, 502 upstream
-  proxy/LLM failure, 500 unexpected — never 200 for a failure
-- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default 330s,
-  must exceed the proxy's 300s confirmation window); reads use `READ_TIMEOUT`
+  403 forbidden/rejected, 404 absent, 504 outcome unknown, 502 upstream
+  proxy/LLM failure (or a delete the proxy claimed but the re-read
+  contradicts), 500 unexpected — never 200 for a failure. Caller errors are
+  422 from request validation (no envelope), raised *before* anything is
+  sent upstream — e.g. `BulkOperation`'s validator requiring `updates` for
+  update/patch. Nothing returns 400
+- Every mutation envelope carries an `outcome` (`OperationOutcome`):
+  `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items.
+  Never collapse `unknown` into `failed`: a timed-out mutation may still be
+  applied when the operator approves it, and treating that as failure is what
+  produced the duplicate-event incident in issue #4
+- **Deletes are verified server-side** (`verified_delete`): the proxy's
+  answer is a claim; the re-read (`event_presence`: gone / present /
+  inconclusive) decides. 200 only after the event is observed gone; a
+  success claim with the event still present is 502/`failed`; a timeout with
+  it still present is 504/`unknown`; an unreadable re-read is 504/`unknown`.
+  403 and 404 from the delete are definitive and skip the re-read
+- `/bulk-actions` status is `bulk_status_code(codes)`, ranked by
+  `BULK_STATUS_PRECEDENCE` (504 > 403 > 502 > 500 > 404) — never by position.
+  The envelope `error` is always set when any item did not succeed
+  (`bulk_error_summary`). After the first `unknown` outcome the loop stops
+  and the remaining items are `not_attempted` (the operator is not
+  answering; each further gated call would hold the connection another full
+  `CONFIRM_TIMEOUT` and queue another approval)
+- Mutations use `CONFIRM_TIMEOUT` (env `PROXY_CONFIRM_TIMEOUT`, default
+  window + 30s = 330s; `resolve_confirm_timeout` refuses `nan`/`inf` and any
+  value below `PROXY_CONFIRMATION_WINDOW + CONFIRM_TIMEOUT_MARGIN`); reads
+  use `READ_TIMEOUT`
+- `PROXY_CONFIRMATION_WINDOW` (env, default 300s) is a *copy* of api-proxy's
+  `--confirmation-timeout`, which the proxy does not expose on `/health`. The
+  guard is honest only while the two are kept in step by hand; changing one
+  without the other re-creates issue #4 silently. Refuses `<= 0` (the proxy
+  reads that as "wait forever", which nothing can outlive)
+
+### Wrapper Scripts
+
+- `scripts/calendar-delete-event.sh` is the supported way to delete an event
+  from a script. It re-reads the event to decide, and exits `0` success /
+  `1` failure / `2` unknown / `3` not found (the DELETE itself 404/410'd with
+  calendar-agent's envelope — the id never existed, nothing was deleted) /
+  `4` usage or configuration error (nothing attempted). Exit `2` means do
+  not act — never create a replacement event until a deletion has been
+  observed complete
+- Its DELETE deadline (`CALENDAR_DELETE_MAX_TIME`, default 340) must exceed
+  calendar-agent's mutation budget (`CALENDAR_AGENT_CONFIRM_TIMEOUT`,
+  default 330, a hand-kept copy of the server's `PROXY_CONFIRM_TIMEOUT`);
+  it refuses to run otherwise. The verify GET has its own 35s deadline.
+  Worst case 375s: callers must pass a tool timeout above that
+- Any `5xx` from the DELETE is `unknown`, not `failed` — a 502 can be a
+  transport fault after the request reached the proxy's approval queue. A
+  404 counts as "absent" only when the body carries the `success` envelope;
+  a bare router 404 (wrong `CALENDAR_AGENT_URL`) is inconclusive
+- **The workspace's whitelisted copy and the `calendar-delete-event` skill
+  are separate and unchanged by this repo** — both must be replaced after
+  merge for any of this to take effect
+- It is covered end to end by `tests/test_delete_event_script.py`, which runs
+  the real script against a loopback stub of calendar-agent
 
 ## Testing Guidelines
 

@@ -57,7 +57,21 @@ Required environment variables:
 | `LLM_URL` | URL of the local LLM server | `http://localhost:8080/v1/chat/completions` |
 | `LLM_MODEL` | Model name for LLM requests | `qwen/qwen3-14b` |
 | `CALENDAR_AGENT_PORT` | Port for the calendar agent server | `8082` |
-| `PROXY_CONFIRM_TIMEOUT` | Client timeout (seconds) for mutations, which block in the proxy while a human operator approves them; must exceed the proxy's 300s confirmation window | `330` |
+| `PROXY_CONFIRMATION_WINDOW` | How long (seconds) api-proxy waits for a human to approve a mutation — **must mirror the proxy's `--confirmation-timeout` by hand** (see [Coupling with api-proxy](#coupling-with-api-proxy)). Must be finite and positive | `300` |
+| `PROXY_CONFIRM_TIMEOUT` | Client timeout (seconds) for mutations, which block in the proxy while a human operator approves them. Must be at least `PROXY_CONFIRMATION_WINDOW` + 30s; the server refuses to start otherwise, and refuses `nan`/`inf` | `330` (window + 30) |
+
+#### Coupling with api-proxy
+
+Mutations block inside api-proxy until a human approves them, for at most the
+proxy's `--confirmation-timeout` (300s by default; `0` or less means *wait
+forever*). This server's mutation timeout must outlive that window, or every
+approval and rejection arrives after the client has given up and the
+operation completes unobserved (issue #4). The proxy does not publish its
+window on `/health`, so the check is only as honest as its inputs: **if you
+change `--confirmation-timeout` on the proxy, change `PROXY_CONFIRMATION_WINDOW`
+here to match** (and set `PROXY_CONFIRM_TIMEOUT` at least 30s above it, or
+leave it unset to follow automatically). A proxy configured to wait forever
+cannot be mirrored — set a finite window on both sides.
 
 ### Running the Server
 
@@ -83,9 +97,15 @@ Every endpoint returns a body with a `success` field, and on failure an
 |--------|---------|
 | `200` | The operation succeeded (`success: true`) |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
-| `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) |
-| `502` | The proxy or LLM backend failed |
-| `504` | No response before this server's timeout — **the outcome is unknown**: a confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
+| `404` | The calendar or event does not exist. When verifying a deletion this is the *expected* answer: the event is gone |
+| `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) — nothing was sent upstream. A bulk `update`/`patch` with no `updates` payload rejects the **whole batch** this way, before any operation runs |
+| `502` | The proxy or LLM backend failed — or, on a delete, the proxy claimed success for an event that is still present on re-read |
+| `504` | **The outcome is unknown**: no response before this server's timeout and the resource is still present, or the verifying re-read itself failed. A confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
+
+Mutation envelopes (`DELETE …/events/{id}` and each `/bulk-actions` result)
+also carry an `outcome` of `succeeded` / `failed` / `unknown` (bulk only:
+`not_attempted`), so a caller reading only the body can tell "rejected" from
+"may still apply".
 | `500` | Unexpected internal error |
 
 ### GET /health
@@ -305,11 +325,20 @@ Response:
 
 ### DELETE /calendars/{calendar_id}/events/{event_id}
 
-Delete an event. The proxy requires operator confirmation for deletes: the
-request blocks while a human approves it, then returns `200` on approval,
-`403` if the operator rejects (or never answers), or `504` if this server
-times out first — in which case the outcome is unknown and the event should
-be re-read before assuming failure.
+Delete an event, **verified by re-reading it**. The proxy requires operator
+confirmation for deletes: the request blocks while a human approves it. The
+proxy's answer is treated as a claim, not evidence — this server re-reads the
+event afterwards and decides from that:
+
+| Proxy said | Re-read shows | Status | `outcome` |
+|------------|---------------|--------|-----------|
+| anything but 403/404 | gone (`404`/`410`, or `status: cancelled`) | `200` | `succeeded` |
+| success | still present | `502` | `failed` (the 2026-08-07 incident shape: a claim of success for work that has not happened) |
+| timed out | still present | `504` | `unknown` — may yet be applied when the operator approves; re-verify before acting |
+| anything | re-read failed | `504` | `unknown` — nothing established |
+| error (`5xx`, `4xx`) | still present | that error's code | `failed` |
+| `403` rejected | *(not re-read — the proxy dropped it)* | `403` | `failed` |
+| `404` no such event | *(not re-read — nothing to delete)* | `404` | `failed` |
 
 ```bash
 curl -X DELETE http://localhost:8082/calendars/primary/events/event123
@@ -319,6 +348,7 @@ Response:
 ```json
 {
   "success": true,
+  "outcome": "succeeded",
   "message": "Event deleted successfully",
   "error": null
 }
@@ -328,20 +358,72 @@ If the operator rejects the deletion (HTTP `403`):
 ```json
 {
   "success": false,
+  "outcome": "failed",
   "message": "Deletion blocked or rejected by operator",
   "error": "Operation blocked: Request rejected by operator"
 }
 ```
 
-If no response arrives before the timeout (HTTP `504` — outcome unknown,
-re-read the event before assuming failure):
+If no response arrives before the timeout and the event is still there (HTTP
+`504` — outcome unknown; never create a replacement until a re-read shows it
+gone):
 ```json
 {
   "success": false,
-  "message": "Deletion outcome unknown: no response before timeout",
+  "outcome": "unknown",
+  "message": "Deletion outcome unknown: no response before timeout and the event is still present; ...",
   "error": "Outcome unknown: No response from proxy after 330s; ..."
 }
 ```
+
+#### Deleting from a script: `scripts/calendar-delete-event.sh`
+
+The server now verifies deletes itself (above), but a caller that reads only
+`curl`'s status code, or whose `curl` is killed by a harness timeout, still
+cannot tell the cases apart. The wrapper script captures body and status,
+**re-reads the event itself** rather than trusting the delete's answer, and
+reports through its exit status:
+
+| Exit | Result | Meaning |
+|------|--------|---------|
+| `0` | `SUCCESS` | The event is gone — re-read returned `404`, or `status: cancelled` |
+| `1` | `FAILURE` | The event is still there and nothing is outstanding (rejected `403`, other `4xx`, or `success: false`) |
+| `2` | `UNKNOWN` | The event is still there but the deletion may yet be applied (the DELETE timed out, or answered `408`/**any `5xx`** — a `502` can be a transport fault *after* the request reached the proxy, where it stays queued), or the re-read established nothing, or the response carried no calendar-agent envelope (a bare router `404` from a wrong `CALENDAR_AGENT_URL`) |
+| `3` | `NOT FOUND` | The DELETE itself answered `404`/`410` *with* calendar-agent's envelope — the event id (or calendar id) didn't exist before this ran, so nothing was deleted. Check the id; a re-read that also 404s is not evidence of a completed deletion |
+| `4` | `USAGE` | Bad arguments or configuration (missing url, `python3` not on `PATH`, a deadline that does not outlive the server's budget). Nothing was attempted |
+
+```bash
+CALENDAR_AGENT_URL=http://localhost:8082 \
+  scripts/calendar-delete-event.sh event123 primary
+```
+
+```
+DELETE primary event event123 (deadline 340s) -> HTTP 200 (body success: true)
+VERIFY event123 (verify deadline 35s) -> HTTP 404 (event status: <absent>)
+RESULT: SUCCESS - event no longer present
+```
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `CALENDAR_AGENT_CONFIRM_TIMEOUT` | calendar-agent's own mutation budget (its `PROXY_CONFIRM_TIMEOUT`); the script cannot read it across the container boundary, so keep them in step by hand | `330` |
+| `CALENDAR_DELETE_MAX_TIME` | `curl` deadline for the DELETE. **Must exceed the budget** — the script refuses (exit `4`) otherwise, because a shorter deadline abandons the DELETE while the operator can still approve it, re-creating one hop out the very mismatch the server guards against | budget + 10 = `340` |
+| `CALENDAR_DELETE_VERIFY_MAX_TIME` | `curl` deadline for the verifying GET (an ordinary 30s-bounded read) | `35` |
+
+**Worst case the script runs for 375s** (340 + 35). The *calling* harness must
+allow at least that — pass a tool timeout of 400s or more. If the caller kills
+the script earlier, it dies before its verification step, which is the one
+part that establishes anything. The script never retries — a retry enqueues a
+second operator approval for the same operation.
+
+**Exit `2` means do not act.** In particular, never create a replacement event
+until a deletion has been observed complete.
+
+> **Deployment note.** This script lives in this repository. The copy the
+> assistant actually runs is the separate whitelisted script in the workspace
+> repo, and the `calendar-delete-event` skill still does `curl -X DELETE | jq .`.
+> Merging this PR changes neither; both must be replaced with this script
+> (and the skill taught the exit codes and the 400s tool timeout) before any
+> of it takes effect operationally.
 
 ### POST /calendars/{calendar_id}/events/{event_id}/respond
 
@@ -622,6 +704,28 @@ Supported operations:
 - `patch`: Partial event update
 - `delete`: Delete event
 
+Operations run sequentially. Deletes are verified by re-reading the event,
+exactly as the single-event `DELETE` is. An `update`/`patch` without a
+non-empty `updates` payload fails request validation (`422`) and **no
+operation in the batch runs**.
+
+Each result carries an `outcome`:
+
+| `outcome` | Meaning |
+|-----------|---------|
+| `succeeded` | Known to have happened (deletes: the re-read showed the event gone) |
+| `failed` | Known not to have happened (rejected, absent, upstream error, or a delete whose re-read still shows the event) |
+| `unknown` | Timed out and **may still be applied** when the operator approves it — re-read the event before doing anything about it |
+| `not_attempted` | Never sent: an earlier operation in the batch came back `unknown`, which means the operator is not answering, and each further gated operation would have held the connection another full timeout and queued another approval. Re-issue these in a new request once the unknown one is settled |
+
+The envelope's `success` is true only when every operation succeeded;
+otherwise `error` summarises the counts (`"2 of 3 operations did not
+succeed: 1 outcome unknown (...), 1 not attempted; see results"`). The status
+code agrees with the body and is ranked by severity, **never by position in
+the batch**: `504` if any outcome is unknown (the unknown operation is the one
+that can still change the calendar), else `403` if any was rejected, else
+`502`, else `500`, else `404`.
+
 ```bash
 curl -X POST http://localhost:8082/bulk-actions \
   -H "Content-Type: application/json" \
@@ -651,17 +755,21 @@ Response:
       "event_id": "event1",
       "operation": "patch",
       "success": true,
+      "outcome": "succeeded",
       "error": null
     },
     {
       "event_id": "event2",
       "operation": "delete",
       "success": true,
+      "outcome": "succeeded",
       "error": null
     }
   ],
   "success_count": 2,
   "error_count": 0,
+  "unknown_count": 0,
+  "not_attempted_count": 0,
   "error": null
 }
 ```
@@ -730,11 +838,13 @@ calendar-agent/
 ├── tests/
 │   ├── conftest.py           # Test fixtures
 │   ├── test_calendar_server.py
+│   ├── test_delete_event_script.py  # End-to-end tests for the delete wrapper
 │   ├── test_proxy_contract.py    # Client routes vs. the api-proxy spec snapshot
 │   └── test_readme_documentation.py
 ├── docs/
 │   └── api-proxy-openapi-doc.json    # Stamped snapshot of the api-proxy spec
 ├── scripts/
+│   ├── calendar-delete-event.sh  # Verified delete wrapper (success/failure/unknown)
 │   └── refresh_openapi.py    # Regenerates the api-proxy spec snapshot
 ├── pyproject.toml
 ├── README.md
