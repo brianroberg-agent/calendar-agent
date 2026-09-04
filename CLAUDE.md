@@ -80,12 +80,17 @@ uv run pytest --cov=calendar_agent  # With coverage
 - Use `ProxyRequestError` for any other 4xx (it carries the proxy's status
   and message; `error_status_code` passes 400 through and maps the rest to
   502 — 404/410 never reach it, they are `ProxyNotFoundError`)
+- Use `RsvpCalendarRefusedError` when `POST .../respond` names a calendar
+  that is not the authenticated user's own (`primary` or the account's own
+  calendar id) — a local refusal that never reaches the proxy;
+  `error_status_code` maps it to 400
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
 - Always return the `{"success": false, "error": "..."}` envelope via
   `error_response(...)` so the HTTP status agrees with the body (issue #4):
   400 passed through from a proxy 400 (`ProxyRequestError`; e.g. `/respond`
-  when the authenticated user is not an attendee), 403 forbidden/rejected,
+  when the authenticated user is not an attendee) or a local RSVP calendar
+  refusal (`RsvpCalendarRefusedError`), 403 forbidden/rejected,
   404 absent (`ProxyNotFoundError`), 504 outcome unknown, 502 upstream
   proxy/LLM failure (including a proxy 401 or any other proxy 4xx, or a
   delete the proxy claimed but the re-read contradicts), 500 unexpected —

@@ -108,7 +108,7 @@ Every endpoint returns a body with a `success` field, and on failure an
 | Status | Meaning |
 |--------|---------|
 | `200` | The operation succeeded (`success: true`) |
-| `400` | The proxy rejected the request as malformed or not applicable; the proxy's message is in `error` (e.g. `/respond` when the authenticated user is not an attendee of the event) |
+| `400` | The proxy rejected the request as malformed or not applicable, and its message is in `error` (e.g. `/respond` when the authenticated user is not an attendee of the event); also this service's own refusal to RSVP through a calendar that is not the authenticated user's own, which is not forwarded to the proxy at all |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
 | `404` | The calendar or event does not exist (the proxy's message is in `error`). When verifying a deletion this is the *expected* answer: the event is gone |
 | `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) — nothing was sent upstream. A bulk `update`/`patch` with no `updates` payload rejects the **whole batch** this way, before any operation runs |
@@ -298,7 +298,8 @@ that the read side and `/respond` take **different perspectives**: these
 fields report the calendar's own entry, while `/respond` always writes the
 **authenticated user's** entry (matched by email address, never by the
 `self` flag). On your own calendar the two coincide; on a colleague's or
-group calendar they do not -- see that endpoint's note below.
+group calendar they do not, which is why `/respond` accepts only your own
+`calendar_id` and refuses the rest -- see that endpoint's note below.
 
 ### POST /calendars/{calendar_id}/events
 
@@ -518,24 +519,21 @@ attendee list **by email address** (it resolves that address from the
 account's primary calendar and does not trust Google's `self` flag), patches
 only that entry, and sends no invitations or notifications.
 
-> **Whose RSVP this changes: always the authenticated user's** -- the account
-> the proxy holds credentials for -- whatever `calendar_id` is. On a
-> colleague's calendar, `POST /calendars/colleague@example.com/events/{event_id}/respond`
-> updates *your* entry on that copy of the event, or fails if you are not an
-> attendee; it cannot RSVP on the colleague's behalf. This is the opposite
-> perspective from the read side: on the same `calendar_id`,
-> `calendar_rsvp_state` reports the **colleague's** entry, so a
-> read-then-respond loop must not treat the value it read as the entry it is
-> about to write.
+> **`calendar_id` must be your own calendar.** The route accepts the literal
+> `primary` and the authenticated account's own calendar id (its address),
+> and refuses anything else with **`400`** without forwarding the request.
 >
-> To make that visible in the response, a successful RSVP on any
-> `calendar_id` other than the literal `primary` carries one entry in
-> `warnings` naming the calendar and saying the authenticated user's own
-> entry is what changed. This service does not resolve the authenticated
-> user's address, so passing your own address as `calendar_id` produces the
-> warning as well; on `primary` the list is empty. Whether `/respond`
-> should refuse non-primary calendars outright is an open policy question
-> (see PR #11), not something this service decides.
+> **Why.** Whose RSVP this route changes is always the authenticated user's
+> -- the account the proxy holds credentials for. That is the opposite
+> perspective from the read side, where `calendar_rsvp_state` and
+> `calendar_is_organizer` describe *the calendar being read*. On a group or
+> colleague calendar those are two different attendee entries, so a
+> `"needsAction"` read there says nothing about the entry an RSVP would
+> write -- a read-then-respond loop across calendars answers on the strength
+> of a state that was about someone else. Refusing keeps reading and
+> answering on one calendar, where the two agree. `primary` is accepted with
+> no lookup; any other id is compared against the account's own calendar id,
+> which this service reads once per process from `GET /calendars/primary`.
 >
 > If the authenticated user is not an attendee, the proxy answers
 > `400 You are not an attendee of this event; cannot RSVP.` This service
@@ -566,12 +564,16 @@ Response:
 }
 ```
 
-On another calendar (`POST /calendars/carol@example.com/events/event123/respond`),
-`warnings` carries one entry:
+On any other calendar -- a colleague's, or a group calendar such as
+`POST /calendars/team_calendar@group.calendar.google.com/events/event123/respond`
+-- the request is refused with `400` and never reaches the proxy:
 ```json
-"warnings": [
-  "RSVP 'accepted' was applied to the authenticated user's own attendee entry on calendar 'carol@example.com'. That calendar's read fields (calendar_rsvp_state, calendar_is_organizer) describe the calendar, not the authenticated user; re-read the user's own calendar to see the entry this changed."
-]
+{
+  "success": false,
+  "event": null,
+  "error": "Refusing to RSVP through calendar 'team_calendar@group.calendar.google.com': it is not the authenticated user's own calendar. This route always writes the authenticated user's attendee entry, while that calendar's read fields (calendar_rsvp_state, calendar_is_organizer) describe the calendar itself -- so an RSVP state read there is not the entry this would change. Send the RSVP on the authenticated user's own calendar instead: POST /calendars/primary/events/{event_id}/respond.",
+  "warnings": []
+}
 ```
 
 ---
