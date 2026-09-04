@@ -29,6 +29,7 @@ from tests.factories import (
     AUTH_USER_EMAIL,
     CANCELLED_STUB,
     COLLEAGUE_EMAIL,
+    GROUP_CALENDAR_ID,
     SAMPLE_EVENTS,
     colleague_copy,
     get_sample_event,
@@ -669,34 +670,119 @@ class TestEventRespondEndpoint:
         assert resp.status_code == 200
         assert resp.json()["warnings"] == []
 
-    def test_respond_on_another_calendar_warns_whose_entry_changed(self, client, mock_proxy_client):
-        """The read fields on carol@ describe Carol; /respond wrote the
-        authenticated user's entry. The response says so (finding 9,
-        round 4). Emitted for any calendar_id other than the literal
-        'primary' -- this service does not resolve the authenticated
-        address, so the user's own address gets the warning too."""
-        mock_proxy_client.respond_to_event.return_value = colleague_copy()
-        resp = client.post(
-            f"/calendars/{COLLEAGUE_EMAIL}/events/invite_001/respond",
-            json={"response_status": "declined"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["success"] is True
-        assert len(data["warnings"]) == 1
-        warning = data["warnings"][0]
-        assert COLLEAGUE_EMAIL in warning
-        assert "authenticated user" in warning
-        assert "calendar_rsvp_state" in warning
-
     def test_respond_error_envelope_has_no_warnings(self, client, mock_proxy_client):
         mock_proxy_client.respond_to_event.side_effect = ProxyForbiddenError("blocked")
         resp = client.post(
-            f"/calendars/{COLLEAGUE_EMAIL}/events/e1/respond",
+            "/calendars/primary/events/e1/respond",
             json={"response_status": "accepted"},
         )
         assert resp.status_code == 403
         assert resp.json()["warnings"] == []
+
+
+class TestEventRespondRefusesForeignCalendars:
+    """POST .../respond refuses any calendar_id that is not the authenticated
+    user's own (Brian's decision, 2026-09-04).
+
+    The read fields describe the calendar being read; /respond always writes
+    the authenticated user's entry. Refusing keeps the two on the same
+    calendar, where they agree.
+    """
+
+    def test_refuses_a_group_calendar_id(self, client, mock_proxy_client):
+        """A group calendar is never the authenticated account's own."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{GROUP_CALENDAR_ID}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["success"] is False
+        assert GROUP_CALENDAR_ID in data["error"]
+        assert "primary" in data["error"]
+        mock_proxy_client.respond_to_event.assert_not_called()
+
+    def test_refuses_a_colleagues_address(self, client, mock_proxy_client):
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{COLLEAGUE_EMAIL}/events/invite_001/respond",
+            json={"response_status": "declined"},
+        )
+        assert resp.status_code == 400
+        assert COLLEAGUE_EMAIL in resp.json()["error"]
+        mock_proxy_client.respond_to_event.assert_not_called()
+
+    def test_refusal_envelope_has_no_event_and_no_warnings(self, client, mock_proxy_client):
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{COLLEAGUE_EMAIL}/events/invite_001/respond",
+            json={"response_status": "declined"},
+        )
+        assert resp.json()["event"] is None
+        assert resp.json()["warnings"] == []
+
+    def test_allows_the_literal_primary_without_resolving_an_address(
+        self, client, mock_proxy_client
+    ):
+        """'primary' needs no identity lookup, so the common path costs no
+        extra proxy call."""
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert mock_proxy_client.get_calendar.await_count == 0
+
+    def test_allows_the_authenticated_users_own_address(self, client, mock_proxy_client):
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        mock_proxy_client.respond_to_event.assert_called_once_with(
+            AUTH_USER_EMAIL, "invite_001", "accepted"
+        )
+
+    def test_own_address_matches_case_insensitively(self, client, mock_proxy_client):
+        """Google lowercases calendar ids; a caller's capitalisation must not
+        turn an allowed RSVP into a refusal."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL.upper()}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
+    def test_resolves_the_authenticated_address_once_per_process(
+        self, client, mock_proxy_client
+    ):
+        """The identity lookup is cached: two RSVPs, one GET /calendars/primary."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        for _ in range(2):
+            client.post(
+                f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+                json={"response_status": "accepted"},
+            )
+        assert mock_proxy_client.get_calendar.await_count == 1
+
+    def test_unresolvable_identity_is_an_upstream_failure_not_a_refusal(
+        self, client, mock_proxy_client
+    ):
+        """If the proxy's primary calendar carries no id there is nothing to
+        compare against: 502, and the RSVP is not forwarded."""
+        mock_proxy_client.get_calendar.return_value = {"summary": "no id here"}
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        assert resp.json()["success"] is False
+        mock_proxy_client.respond_to_event.assert_not_called()
 
     def test_respond_invalid_status_rejected(self, client, mock_proxy_client):
         """Values outside accepted/declined/tentative are rejected with 422."""

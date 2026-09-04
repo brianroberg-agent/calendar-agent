@@ -15,6 +15,24 @@ from tests.factories import SAMPLE_CALENDARS, SAMPLE_EVENTS
 # ============================================================================
 
 
+@pytest.fixture(autouse=True)
+def clear_authenticated_calendar_id():
+    """Clear the process-wide authenticated-calendar-id cache around every
+    test.
+
+    ``calendar_server`` reads the authenticated account's own calendar id
+    once and keeps it for the life of the process (the proxy's credentials
+    never change under a running server). In a test run that would leak one
+    test's resolved identity into the next, so tests would pass or fail
+    depending on their order.
+    """
+    from calendar_agent.calendar_server import reset_authenticated_calendar_id
+
+    reset_authenticated_calendar_id()
+    yield
+    reset_authenticated_calendar_id()
+
+
 @pytest.fixture
 def mock_proxy_client():
     """Mock CalendarProxyClient with default responses."""

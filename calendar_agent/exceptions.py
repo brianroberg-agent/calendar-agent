@@ -61,6 +61,17 @@ class ProxyConfigError(ProxyError):
     pass
 
 
+class RsvpCalendarRefusedError(Exception):
+    """Raised when POST .../respond names a calendar that is not the
+    authenticated user's own (Brian's decision, 2026-09-04).
+
+    A local refusal, not a proxy answer: the request is never forwarded.
+    ``calendar_server.error_status_code`` maps it to 400, alongside the
+    proxy 400s, because it is the caller's request that is wrong."""
+
+    pass
+
+
 class LLMError(Exception):
     """Raised when LLM operations fail."""
 

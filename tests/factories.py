@@ -19,6 +19,10 @@ from typing import Any
 # colleague_copy fixture sits on.
 AUTH_USER_EMAIL = "john.doe@example.com"
 COLLEAGUE_EMAIL = "carol@example.com"
+# A Google *group* calendar: not a person, and never the authenticated
+# account's own calendar. Two of Brian's three binding calendars have this
+# shape, which is what POST .../respond refuses.
+GROUP_CALENDAR_ID = "team_calendar@group.calendar.google.com"
 
 SAMPLE_CALENDARS = {
     "primary": {
