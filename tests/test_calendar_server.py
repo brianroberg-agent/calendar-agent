@@ -2794,7 +2794,9 @@ class TestBulkOperationTagErrors:
 # 200-with-wrong-answer to hard 422. A before-validator folds exactly the
 # keys SearchFilters declares into "filters" (consuming them, so a true typo
 # still 422s); the allowlist is derived from SearchFilters.model_fields, so
-# adding a filter field keeps the flat path working with no test change.
+# the fold needs no edit when a filter field is added. The parametrized test
+# below still needs a sample value for the new field, and `search_events`
+# must forward it -- neither is derived.
 # ============================================================================
 
 
@@ -2844,8 +2846,11 @@ class TestSearchFlatShapeFold:
 
     @pytest.mark.parametrize("field", list(SearchFilters.model_fields))
     def test_every_search_filter_field_is_accepted_flat(self, client, mock_proxy_client, field):
-        """Derived from SearchFilters.model_fields: a new filter field is
-        covered here automatically, with no allowlist to update."""
+        """Parametrized over SearchFilters.model_fields, so a new filter field
+        is picked up by name -- but it needs a sample value in the mapping
+        below (and a proxy-key entry if the proxy's name differs), and
+        `search_events` must forward it. Until then this test fails for it,
+        which is the point: the fold's allowlist is derived, the rest is not."""
         value = {"query": "x", "time_min": "2024-01-01T00:00:00Z",
                  "time_max": "2024-01-02T00:00:00Z", "order_by": "updated"}.get(field)
         if value is None:

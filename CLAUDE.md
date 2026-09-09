@@ -173,8 +173,13 @@ uv run pytest --cov=calendar_agent  # With coverage
   `GOOGLE_READ_ONLY_EVENT_FIELDS` set so fetched events round-trip — keep
   that set and the README list in sync
 - `/search` accepts filter keys flat or nested; the fold derives its
-  allowlist from `SearchFilters.model_fields`, so adding a filter field
-  needs no allowlist edit (a test parametrized over `model_fields` covers it)
+  allowlist from `SearchFilters.model_fields`, so the fold itself needs no
+  edit when a filter field is added. Adding one still means: forward it in
+  `search_events` (and the proxy client), give
+  `test_every_search_filter_field_is_accepted_flat` a sample value (and a
+  proxy-key entry if the proxy's name differs), and list it in the README
+  `/search` section. That test derives field *names* from `model_fields`,
+  not values, so a new field fails it until it is forwarded and given a value
 - Document every accepted field in README.md — the strict models make the
   README the contract callers must match
 
