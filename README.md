@@ -174,8 +174,11 @@ accept everything Google returns for an attendee (`id`, `resource`,
 **`/search` accepts two shapes** -- filter keys nested under `filters`, or the
 same keys flat at the top level -- see its section for the rules.
 
-**What a 422 looks like.** The body carries the standard envelope; `error`
-names every failing field and `detail` is FastAPI's structured list:
+**What a 422 looks like.** The body carries the standard envelope; for body
+errors, `error` names each failing field and `detail` is FastAPI's structured
+list. The query-string check runs first and on its own: a request with an
+undeclared query key reports only that key, and any body errors surface once
+the query string is fixed and the request is resent.
 
 ```json
 {

@@ -2971,6 +2971,24 @@ class TestUnknownQueryParamsRejected:
         assert response.json()["detail"][0]["loc"] == ["query", "max_results"]
         mock_proxy_client.list_events.assert_not_called()
 
+    def test_query_key_error_is_reported_alone_and_masks_body_errors(
+        self, client, mock_proxy_client
+    ):
+        """The query guard is an app-level dependency and raises before the
+        body is validated, so a request with both an undeclared query key and
+        a bad body reports only the query key (README "What a 422 looks
+        like" says so; fix round, item 6). Fix the query string, resend, and
+        the body errors appear."""
+        response = client.patch(
+            "/calendars/primary/events/event_123?sendUpdates=all",
+            json={"titel": "typo", "status": "cancelled"},
+        )
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert [err["loc"] for err in detail] == [["query", "sendUpdates"]]
+        assert response.json()["error"] == "query.sendUpdates: Extra inputs are not permitted"
+        mock_proxy_client.patch_event.assert_not_called()
+
     def test_every_route_is_guarded(self, client, subtests):
         """Walk the app's own routes: none of them may accept a bogus query key."""
         from tests.test_readme_documentation import get_all_endpoints
