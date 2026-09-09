@@ -111,7 +111,7 @@ Every endpoint returns a body with a `success` field, and on failure an
 | `400` | The proxy rejected the request as malformed or not applicable, and its message is in `error` (e.g. `/respond` when the authenticated user is not an attendee of the event); also this service's own refusal to RSVP through a calendar that is not the authenticated user's own, which is not forwarded to the proxy at all |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
 | `404` | The calendar or event does not exist (the proxy's message is in `error`). When verifying a deletion this is the *expected* answer: the event is gone |
-| `422` | Request validation failed: an unknown field or query key, a missing required field, or a bad value — nothing was sent upstream. Same `success: false` / `error` envelope as every other failure, plus FastAPI's `detail` list (see below). A bulk `update`/`patch` with a missing or empty `updates` payload rejects the **whole batch** this way, before any operation runs |
+| `422` | Request validation failed: an unknown field or query key, a missing required field, or a bad value — nothing was sent upstream. Same `success: false` / `error` envelope as every other failure, plus FastAPI's `detail` list (see below). A `PUT`/`PATCH` body that would forward nothing (`{}`, all-null values, or only read-only keys) is rejected this way too, and a bulk `update`/`patch` with a missing or empty `updates` payload rejects the **whole batch**, before any operation runs |
 | `502` | The proxy or LLM backend failed; the proxy answered 401 (this service's own key was rejected) or a 4xx other than 400/403/404 (its message is in `error`); or, on a delete, the proxy claimed success for an event that is still present on re-read |
 | `504` | **The outcome is unknown**: no response before this server's timeout and the resource is still present, or the verifying re-read itself failed. A confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
 
@@ -441,7 +441,9 @@ Response:
 
 ### PUT /calendars/{calendar_id}/events/{event_id}
 
-Update an event (full replacement). Accepts the same fields as `POST`. A
+Update an event (full replacement). Accepts the same fields as `POST`; a
+body that would forward nothing (`{}`, all-null values, only read-only keys)
+is a `422` rather than an empty write. A
 fetched event can be sent back as-is with the changes applied -- Google's
 read-only keys (`id`, `etag`, `htmlLink`, ...) are stripped, not rejected.
 Query parameter: `send_updates`.
@@ -472,7 +474,8 @@ Response:
 
 Partially update an event. Accepts every field `POST` does (including
 `status`, `transparency`, `visibility` and the `guestsCan*` flags); only the
-fields sent are changed. Query parameter: `send_updates`.
+fields sent are changed. A body that would forward nothing is a `422`, as on
+`PUT`. Query parameter: `send_updates`.
 
 ```bash
 curl -X PATCH http://localhost:8082/calendars/primary/events/event123 \

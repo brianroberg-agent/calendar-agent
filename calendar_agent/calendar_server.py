@@ -243,17 +243,55 @@ class EventFields(StrictRequestModel):
             return {k: v for k, v in data.items() if k not in GOOGLE_READ_ONLY_EVENT_FIELDS}
         return data
 
+    def forwarded_data(self) -> dict[str, Any]:
+        """The payload as sent upstream: nulls and read-only keys are gone.
+
+        The one dump every write route and bulk `updates` uses, so "does this
+        body forward anything" is judged the same way everywhere.
+        """
+        return self.model_dump(exclude_none=True, by_alias=True)
+
+
+def empty_write_payload_message(operation: str) -> str:
+    """The 422 text for an update/patch that would forward nothing. Shared by
+    the single routes and bulk `updates` so both paths say the same thing."""
+    return (
+        f"'{operation}' requires a non-empty payload: nothing would be sent once "
+        "null values and Google's read-only keys are dropped"
+    )
+
+
+def _require_forwardable_payload(event: EventFields, operation: str) -> EventFields:
+    # Validated with the request, so it is a 422 before anything is sent
+    # upstream. Judged on the forwarded payload, not the model object (which
+    # is always truthy): `{}`, all-null values and read-only-only keys are
+    # empty. Before PR #12's fix round the single routes sent Google an empty
+    # body and reported success; bulk already refused (main's F3 rule).
+    if not event.forwarded_data():
+        raise ValueError(empty_write_payload_message(operation))
+    return event
+
 
 class EventCreateRequest(EventFields):
     """Request body for creating a new event."""
 
 
 class EventUpdateRequest(EventCreateRequest):
-    """Request body for updating an event (full replacement)."""
+    """Request body for updating an event (full replacement). Must forward
+    at least one field; used by PUT and by bulk `update`."""
+
+    @model_validator(mode="after")
+    def _needs_a_payload(self) -> "EventUpdateRequest":
+        return _require_forwardable_payload(self, "update")
 
 
 class EventPatchRequest(EventFields):
-    """Request body for partially updating an event."""
+    """Request body for partially updating an event. Must forward at least
+    one field; used by PATCH and by bulk `patch`."""
+
+    @model_validator(mode="after")
+    def _needs_a_payload(self) -> "EventPatchRequest":
+        return _require_forwardable_payload(self, "patch")
 
 
 # Rendered into the field descriptions below so /openapi.json lists exactly
@@ -410,30 +448,20 @@ class BulkDeleteOperation(_BulkOperationBase):
 
 
 class _BulkWriteOperation(_BulkOperationBase):
-    """An update or patch: `updates` is required and must name at least one
-    writable field. Subclasses narrow `updates` to the matching single-event
-    body so an unknown key inside it is rejected at the same depth as on the
-    single-event routes (issue #8)."""
+    """An update or patch: `updates` is required. Subclasses narrow `updates`
+    to the matching single-event body, so an unknown key inside it is rejected
+    at the same depth as on the single-event routes (issue #8) and an empty
+    payload is refused by that body's own validator -- with the request, so a
+    malformed operation anywhere in the batch is a 422 before any operation
+    runs (F3: discovering it mid-loop left the envelope's status depending on
+    operation order)."""
     operation: BulkOperationType
     updates: EventFields = Field(..., description="Update data")
 
     @property
     def event_data(self) -> dict[str, Any]:
         """The payload as forwarded: same dump as the single-event routes."""
-        return self.updates.model_dump(exclude_none=True, by_alias=True)
-
-    @model_validator(mode="after")
-    def _writes_need_a_payload(self) -> "_BulkWriteOperation":
-        # Validated with the request, so a malformed operation anywhere in the
-        # batch is a 422 before any operation runs. Discovering it mid-loop
-        # left the envelope's status depending on operation order (F3).
-        # Emptiness is judged on the forwarded payload, not the model object
-        # (which is always truthy): `updates: {}` or all-null values are empty.
-        if not self.event_data:
-            raise ValueError(
-                f"'{self.operation.value}' requires a non-empty 'updates' payload"
-            )
-        return self
+        return self.updates.forwarded_data()
 
 
 class BulkUpdateOperation(_BulkWriteOperation):
@@ -1152,7 +1180,7 @@ async def create_event(
     try:
         client = get_calendar_client()
         # Convert Pydantic model to dict, excluding None values
-        event_data = event.model_dump(exclude_none=True, by_alias=True)
+        event_data = event.forwarded_data()
 
         result = await client.create_event(
             calendar_id=calendar_id,
@@ -1205,7 +1233,7 @@ async def update_event(
     """Update an event (full replacement)."""
     try:
         client = get_calendar_client()
-        event_data = event.model_dump(exclude_none=True, by_alias=True)
+        event_data = event.forwarded_data()
 
         result = await client.update_event(
             calendar_id=calendar_id,
@@ -1234,7 +1262,7 @@ async def patch_event(
     """Partially update an event."""
     try:
         client = get_calendar_client()
-        event_data = event.model_dump(exclude_none=True, by_alias=True)
+        event_data = event.forwarded_data()
 
         result = await client.patch_event(
             calendar_id=calendar_id,

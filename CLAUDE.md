@@ -99,8 +99,10 @@ uv run pytest --cov=calendar_agent  # With coverage
   proxy/LLM failure (including a proxy 401 or any other proxy 4xx, or a
   delete the proxy claimed but the re-read contradicts), 500 unexpected —
   never 200 for a failure. Caller errors are 422 from request validation,
-  raised *before* anything is sent upstream — e.g. `_BulkWriteOperation`'s
-  validator requiring a non-empty `updates` for update/patch
+  raised *before* anything is sent upstream — e.g. `EventUpdateRequest` /
+  `EventPatchRequest` refusing a body that would forward nothing
+  (`_require_forwardable_payload`), which covers PUT, PATCH and bulk
+  `updates` from one place
 - 422s carry the same envelope: the `RequestValidationError` handler
   (`validation_error_envelope`) returns `{"success": false, "error":
   "<loc>: <msg>; ...", "detail": [...]}` — keep `detail`, callers read it

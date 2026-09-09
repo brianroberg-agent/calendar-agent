@@ -2342,6 +2342,46 @@ class TestCancelledStatusIsRejected:
         mock_proxy_client.patch_event.assert_not_called()
 
 
+class TestEmptySingleRouteWriteIsRejected:
+    """A PUT/PATCH body that forwards nothing is a 422, exactly like an empty
+    bulk `updates` (fix round, item 2). Before this the single routes sent
+    Google an empty body and reported `success: true`. Emptiness is judged on
+    the forwarded payload -- `{}`, all-null values and read-only-only keys all
+    dump to nothing -- and none may reach the proxy."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param({}, id="empty-object"),
+            pytest.param({"summary": None, "location": None}, id="all-null-values"),
+            pytest.param({"id": "event_1", "etag": '"1"'}, id="read-only-keys-only"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "method,operation,forwarder",
+        [("put", "update", "update_event"), ("patch", "patch", "patch_event")],
+    )
+    def test_nothing_to_forward_is_a_422(
+        self, client, mock_proxy_client, method, operation, forwarder, body
+    ):
+        response = getattr(client, method)("/calendars/primary/events/event_1", json=body)
+        assert response.status_code == 422, response.text
+        data = response.json()
+        assert data["success"] is False
+        assert f"'{operation}' requires a non-empty payload" in data["error"]
+        assert [err["loc"] for err in data["detail"]] == [["body"]]
+        getattr(mock_proxy_client, forwarder).assert_not_called()
+
+    def test_single_and_bulk_use_the_same_message(self, client, mock_proxy_client):
+        single = client.put("/calendars/primary/events/event_1", json={}).json()["error"]
+        bulk = client.post("/bulk-actions", json={"operations": [
+            {"operation": "update", "event_id": "event_1", "calendar_id": "primary",
+             "updates": {}},
+        ]}).json()["error"]
+        # Same text after the `<loc>: ` prefix the envelope adds.
+        assert single.split(": ", 1)[1] == bulk.split(": ", 1)[1]
+
+
 class TestGoogleEventRoundTrip:
     """fetch -> modify -> write of a real Google event succeeds (C3)."""
 
@@ -2484,7 +2524,7 @@ class TestBulkUpdatesAreTyped:
             "updates": updates,
         })
         assert response.status_code == 422, response.text
-        assert "non-empty 'updates'" in response.json()["error"]
+        assert "'update' requires a non-empty payload" in response.json()["error"]
         mock_proxy_client.update_event.assert_not_called()
 
 
