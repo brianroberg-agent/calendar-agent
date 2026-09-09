@@ -955,9 +955,9 @@ Supported operations:
 - `delete`: Delete event -- must not carry `updates` (a `422` if it does, so a
   mis-set operation can't delete while its payload is silently ignored)
 
-An unknown key inside `updates` is a `422` for the whole request; a missing
-or empty `updates` on `update`/`patch` is a per-operation error in `results`.
-Each operation may also carry `send_updates`.
+An unknown key inside `updates` is a `422` for the whole request, and so is
+a missing or empty `updates` on `update`/`patch` (see below). Each operation
+may also carry `send_updates`.
 
 Operations run sequentially. Deletes are verified by re-reading the event,
 exactly as the single-event `DELETE` is. An `update`/`patch` without a

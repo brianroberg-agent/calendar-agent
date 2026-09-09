@@ -2389,17 +2389,29 @@ class TestBulkUpdatesAreTyped:
             "attendees": [{"email": "alice@example.com", "self": True}],
         }
 
-    def test_empty_updates_object_is_still_a_per_item_error(self, client, mock_proxy_client):
+    @pytest.mark.parametrize(
+        "updates",
+        [
+            pytest.param({}, id="empty-object"),
+            pytest.param({"summary": None}, id="all-null-values"),
+            pytest.param({"id": "event_1", "etag": '"1"'}, id="read-only-keys-only"),
+        ],
+    )
+    def test_empty_updates_payload_rejects_the_whole_batch(
+        self, client, mock_proxy_client, updates
+    ):
+        """An `updates` that forwards nothing is a 422 for the whole request
+        (main's F3 rule), judged on the dumped payload rather than on the
+        raw object: `{}`, all-null values and read-only-only keys all dump to
+        nothing, and none may reach the proxy or be reported per item."""
         response = self._bulk(client, {
             "operation": "update",
             "event_id": "event_1",
             "calendar_id": "primary",
-            "updates": {},
+            "updates": updates,
         })
-        assert response.status_code == 200
-        data = response.json()
-        assert data["error_count"] == 1
-        assert "No update data" in data["results"][0]["error"]
+        assert response.status_code == 422, response.text
+        assert "non-empty 'updates'" in response.json()["error"]
         mock_proxy_client.update_event.assert_not_called()
 
 
