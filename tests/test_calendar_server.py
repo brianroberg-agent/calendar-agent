@@ -2049,40 +2049,72 @@ class TestUnknownFieldsRejected:
 
 # ---------------------------------------------------------------------------
 # Structural guard: the tables above are hand-maintained. This walks the
-# app's own routes so the next request model -- or a dict[str, Any] field
-# that would forward unknown keys verbatim -- cannot silently revert to
-# extra="ignore" without a test failing.
+# app's own routes so the next request model -- or a field typed as a plain
+# dict / Mapping / Any / object, through which unknown keys would pass
+# unvalidated -- cannot silently revert to extra="ignore" without a test
+# failing. Body models declared on `Depends(...)` functions are walked too;
+# `TestRouteWalkGuards` pins each of these against a throwaway model.
 # ---------------------------------------------------------------------------
 
 
+# Annotations through which an unknown key would pass unvalidated. The walker
+# reports each as the normalised type here (any mapping -> dict).
+OPEN_TYPES = frozenset({dict, typing.Any, object})
+
+
 def _iter_model_types(annotation):
-    """Yield every BaseModel subclass reachable from a type annotation, and
-    flag bare dict annotations, unwrapping Optional/list/Union/Annotated."""
+    """Yield every BaseModel subclass reachable from a type annotation,
+    unwrapping Optional/list/Union/Annotated, and yield an OPEN_TYPES member
+    for any annotation that would accept unknown keys unvalidated: a mapping
+    (bare or parametrised, reported as `dict`), `typing.Any`, or `object`."""
     from pydantic import BaseModel
 
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+    if annotation is typing.Any or annotation is object:
         yield annotation
         return
+    if isinstance(annotation, type):
+        if issubclass(annotation, BaseModel):
+            yield annotation
+            return
+        if issubclass(annotation, Mapping):
+            yield dict
+            return
     origin = typing.get_origin(annotation)
-    if origin in (dict, Mapping):
+    if isinstance(origin, type) and issubclass(origin, Mapping):
         yield dict
         return
     for arg in typing.get_args(annotation):
         yield from _iter_model_types(arg)
 
 
-def iter_request_models():
-    """Every request-body model the app accepts, including nested ones.
+def _iter_body_params(dependant):
+    """Body params of a route, including those of its `Depends` sub-dependencies
+    at any depth -- the same set FastAPI resolves for the request body."""
+    yield from dependant.body_params
+    for sub in dependant.dependencies:
+        yield from _iter_body_params(sub)
 
-    Returns {model: "<where it was reached from>"}; `dict` appears as a key
-    if any reachable field is typed as a plain dict.
+
+def iter_request_models(app=None):
+    """Every request-body model the app accepts, including nested ones and
+    those declared on `Depends(...)` functions.
+
+    Returns {model: "<where it was reached from>"}; an OPEN_TYPES member
+    appears as a key if any reachable field is typed that loosely. `app`
+    defaults to the real server; the guard's own tests pass a throwaway one.
     """
-    from calendar_agent.calendar_server import app
+    from pydantic import BaseModel
+
+    if app is None:
+        from calendar_agent.calendar_server import app
 
     found: dict[object, str] = {}
     pending = []
     for route in app.routes:
-        for param in getattr(getattr(route, "dependant", None), "body_params", []):
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            continue
+        for param in _iter_body_params(dependant):
             for model in _iter_model_types(param.type_):
                 pending.append((model, f"{sorted(route.methods)[0]} {route.path} body"))
     while pending:
@@ -2090,8 +2122,8 @@ def iter_request_models():
         if model in found:
             continue
         found[model] = origin
-        if model is dict:
-            continue
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            continue  # an open type: nothing beneath it to walk
         for name, field in model.model_fields.items():
             for nested in _iter_model_types(field.annotation):
                 pending.append((nested, f"{model.__name__}.{name}"))
@@ -2119,7 +2151,7 @@ class TestRequestModelsAreStrict:
 
     def test_every_request_model_forbids_extra(self, subtests):
         for model, origin in iter_request_models().items():
-            if model is dict:
+            if model in OPEN_TYPES:
                 continue
             with subtests.test(model=model.__name__, reached_from=origin):
                 assert model.model_config.get("extra") == "forbid", (
@@ -2127,13 +2159,124 @@ class TestRequestModelsAreStrict:
                     "unknown fields -- an unrecognized key would be silently dropped"
                 )
 
-    def test_no_request_field_is_a_bare_dict(self):
+    def test_no_request_field_is_open(self):
+        """No reachable field is typed so loosely that unknown keys inside it
+        would be forwarded verbatim (see #8, bulk `updates`)."""
         found = iter_request_models()
-        assert dict not in found, (
-            f"a request field reached from {found.get(dict)} is typed as a plain "
-            "dict: unknown keys inside it would be forwarded verbatim (see #8, "
-            "bulk `updates`)"
+        open_fields = {found[t] for t in OPEN_TYPES if t in found}
+        assert not open_fields, (
+            f"request field(s) reached from {sorted(open_fields)} are typed as a "
+            "plain dict / Mapping / Any / object"
         )
+
+
+class TestRouteWalkGuards:
+    """The structural guard is itself guarded (fix round, item 5): a walker
+    that cannot see a loosely typed field, or a model reached only through a
+    `Depends(...)` sub-dependency, is a guard that passes vacuously. Each
+    case below is a throwaway model the pre-fix walker missed."""
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            pytest.param(dict, id="bare-dict"),
+            pytest.param(Mapping, id="bare-Mapping"),
+            pytest.param(typing.Any, id="Any"),
+            pytest.param(object, id="object"),
+            pytest.param(dict[str, typing.Any], id="dict[str, Any]"),
+            pytest.param(dict | None, id="dict | None"),
+            pytest.param(list[typing.Any], id="list[Any]"),
+            pytest.param(typing.Mapping[str, int], id="typing.Mapping[str, int]"),
+        ],
+    )
+    def test_open_annotation_is_flagged(self, annotation):
+        assert set(_iter_model_types(annotation)) & OPEN_TYPES, (
+            f"{annotation!r} lets unknown keys through but the walker does not flag it"
+        )
+
+    @pytest.mark.parametrize(
+        "annotation", [str, int, str | None, list[str], typing.Literal["a"]]
+    )
+    def test_closed_annotation_is_not_flagged(self, annotation):
+        assert not set(_iter_model_types(annotation)) & OPEN_TYPES
+
+    def test_walk_flags_open_fields_on_a_body_model(self):
+        from fastapi import FastAPI
+        from pydantic import BaseModel, ConfigDict
+
+        class Blob(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            payload: typing.Any
+            tags: object
+            meta: Mapping
+
+        mini = FastAPI()
+
+        @mini.post("/blob")
+        def route(body: Blob):  # pragma: no cover - never called
+            return body
+
+        found = iter_request_models(mini)
+        assert Blob in found
+        assert {t for t in OPEN_TYPES if t in found} == OPEN_TYPES
+        assert found[typing.Any] == "Blob.payload"
+        assert found[object] == "Blob.tags"
+        assert found[dict] == "Blob.meta"
+
+    def test_walk_reaches_models_behind_depends(self):
+        """A body model declared on a `Depends` function -- one or two levels
+        down -- is request surface just like a route parameter."""
+        from fastapi import Depends, FastAPI
+        from pydantic import BaseModel, ConfigDict
+
+        class ViaDepends(BaseModel):  # deliberately NOT extra="forbid"
+            x: int
+
+        class ViaNestedDepends(BaseModel):
+            y: int
+
+        class Direct(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            z: int
+
+        def inner(body: ViaNestedDepends):  # pragma: no cover
+            return body
+
+        def outer(
+            body: ViaDepends, nested: typing.Annotated[object, Depends(inner)]
+        ):  # pragma: no cover
+            return body
+
+        mini = FastAPI()
+
+        @mini.post("/deep")
+        def route(
+            direct: Direct, dep: typing.Annotated[object, Depends(outer)]
+        ):  # pragma: no cover
+            return direct
+
+        found = iter_request_models(mini)
+        assert Direct in found
+        assert ViaDepends in found, "model behind one Depends not reached"
+        assert ViaNestedDepends in found, "model behind two Depends not reached"
+
+    def test_walk_matches_fastapi_flat_dependant_on_the_real_app(self):
+        """Cross-check: per route, the top-level body models the walk starts
+        from equal what FastAPI itself resolves for the request body."""
+        from fastapi.dependencies.utils import get_flat_dependant
+
+        from calendar_agent.calendar_server import app
+
+        for route in app.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            via_fastapi = {
+                m for p in get_flat_dependant(dependant).body_params
+                for m in _iter_model_types(p.type_)
+            }
+            via_walk = {m for p in _iter_body_params(dependant) for m in _iter_model_types(p.type_)}
+            assert via_walk == via_fastapi, route.path
 
 
 # ============================================================================
