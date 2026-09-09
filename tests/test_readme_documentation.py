@@ -9,6 +9,7 @@ has corresponding documentation in the README, including:
 This pattern follows the datasette-enrichments testing approach.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -212,3 +213,41 @@ def test_readme_never_shows_the_literal_primary_as_a_calendar_id():
         if '"id": "primary"' in line
     ]
     assert offenders == [], f"README shows a calendar with id 'primary' on lines {offenders}"
+
+
+CLAUDE_MD_PATH = Path(__file__).parent.parent / "CLAUDE.md"
+
+
+def _section(text: str, start_marker: str, end_marker: str) -> str:
+    start = text.index(start_marker)
+    end = text.index(end_marker, start + len(start_marker))
+    return text[start:end]
+
+
+def test_refusal_docs_name_the_identity_lookup_and_its_502(subtests):
+    """The refusal docs say the RSVP itself is not forwarded; what they must
+    also say is that a non-``primary`` ``calendar_id`` first reads
+    ``GET /calendars/primary`` (once per process), and that a failure of
+    that read is a 502 with nothing sent (Opus delta review, finding 4).
+    Loose on wording: each passage must name the lookup and the 502.
+    """
+    readme = README_PATH.read_text()
+    claude_md = CLAUDE_MD_PATH.read_text()
+    passages = {
+        "README respond blockquote": _section(
+            readme, "> **`calendar_id` must be your own calendar.**", "Request body:"
+        ),
+        "README refusal example": _section(
+            readme, "On any other calendar -- a colleague's", "## LLM-Powered Endpoints"
+        ),
+        "CLAUDE.md RsvpCalendarRefusedError bullet": _section(
+            claude_md, "- Use `RsvpCalendarRefusedError`", "- Use `ProxyError`"
+        ),
+    }
+    for name, passage in passages.items():
+        with subtests.test(passage=name):
+            assert "GET /calendars/primary" in passage, f"{name} does not name the identity lookup"
+            assert "502" in passage, f"{name} does not say the lookup's failure is a 502"
+            assert re.search(r"nothing (?:was |is )?sent", passage), (
+                f"{name} does not say a failed lookup sends nothing"
+            )

@@ -82,8 +82,12 @@ uv run pytest --cov=calendar_agent  # With coverage
   502 — 404/410 never reach it, they are `ProxyNotFoundError`)
 - Use `RsvpCalendarRefusedError` when `POST .../respond` names a calendar
   that is not the authenticated user's own (`primary` or the account's own
-  calendar id) — a local refusal that never reaches the proxy;
-  `error_status_code` maps it to 400
+  calendar id) — a local refusal: the RSVP is not forwarded;
+  `error_status_code` maps it to 400. The check itself reads
+  `GET /calendars/primary` once per process (cached) for a non-`primary` id;
+  if that read fails, `require_own_calendar_for_rsvp` re-raises it as a plain
+  `ProxyError` → 502 saying the ownership check could not be performed and
+  nothing was sent — not 504 or 404, because no RSVP was attempted
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
 - Always return the `{"success": false, "error": "..."}` envelope via

@@ -520,8 +520,10 @@ account's primary calendar and does not trust Google's `self` flag), patches
 only that entry, and sends no invitations or notifications.
 
 > **`calendar_id` must be your own calendar.** The route accepts the literal
-> `primary` and the authenticated account's own calendar id (its address),
-> and refuses anything else with **`400`** without forwarding the request.
+> `primary` (any capitalisation) and the authenticated account's own calendar
+> id (its address), and refuses anything else with **`400`**; the RSVP is not
+> forwarded. The one proxy call a non-`primary` id does make is the identity
+> lookup described below.
 >
 > **Why.** Whose RSVP this route changes is always the authenticated user's
 > -- the account the proxy holds credentials for. That is the opposite
@@ -533,7 +535,12 @@ only that entry, and sends no invitations or notifications.
 > of a state that was about someone else. Refusing keeps reading and
 > answering on one calendar, where the two agree. `primary` is accepted with
 > no lookup; any other id is compared against the account's own calendar id,
-> which this service reads once per process from `GET /calendars/primary`.
+> which this service reads once per process from `GET /calendars/primary`
+> (cached for the life of the process, so the read happens on the first
+> non-`primary` RSVP after a start). If that lookup fails -- timeout, 404, 403
+> or any other proxy error -- the route answers **`502`** with a message
+> saying the ownership check could not be performed, and nothing is sent: not
+> `504` outcome-unknown and not `404`, because no RSVP was attempted.
 >
 > If the authenticated user is not an attendee, the proxy answers
 > `400 You are not an attendee of this event; cannot RSVP.` This service
@@ -566,7 +573,10 @@ Response:
 
 On any other calendar -- a colleague's, or a group calendar such as
 `POST /calendars/team_calendar@group.calendar.google.com/events/event123/respond`
--- the request is refused with `400` and never reaches the proxy:
+-- the RSVP is refused with `400` and is not forwarded. The proxy sees only
+the `GET /calendars/primary` identity lookup the check needs (once per
+process); if that lookup fails the answer is `502` with nothing sent, rather
+than the refusal below:
 ```json
 {
   "success": false,
