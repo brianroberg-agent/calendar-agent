@@ -155,7 +155,7 @@ Response:
   "success": true,
   "calendars": [
     {
-      "id": "primary",
+      "id": "john.doe@example.com",
       "summary": "john.doe@example.com",
       "description": "Primary calendar",
       "timeZone": "America/New_York",
@@ -179,7 +179,7 @@ Response:
 {
   "success": true,
   "calendar": {
-    "id": "primary",
+    "id": "john.doe@example.com",
     "summary": "john.doe@example.com",
     "timeZone": "America/New_York"
   }

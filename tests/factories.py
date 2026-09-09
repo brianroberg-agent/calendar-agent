@@ -26,7 +26,7 @@ GROUP_CALENDAR_ID = "team_calendar@group.calendar.google.com"
 
 SAMPLE_CALENDARS = {
     "primary": {
-        "id": "primary",
+        "id": AUTH_USER_EMAIL,
         "summary": AUTH_USER_EMAIL,
         "description": "Primary calendar",
         "timeZone": "America/New_York",

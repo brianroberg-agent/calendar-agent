@@ -196,3 +196,19 @@ def test_endpoint_count_matches():
         f"Expected {expected_count} endpoints, found {len(endpoints)}. "
         f"Endpoints: {endpoints}"
     )
+
+
+def test_readme_never_shows_the_literal_primary_as_a_calendar_id():
+    """``GET /calendars/primary`` answers with the account's address in
+    ``id`` -- that is the identity ``POST .../respond`` compares against.
+    A response example showing ``"id": "primary"`` documents a proxy that
+    does not exist (Opus delta review, finding 3). Request examples still
+    send ``"calendar_id": "primary"``; only response ``id`` values are
+    pinned here.
+    """
+    readme = README_PATH.read_text()
+    offenders = [
+        n for n, line in enumerate(readme.splitlines(), start=1)
+        if '"id": "primary"' in line
+    ]
+    assert offenders == [], f"README shows a calendar with id 'primary' on lines {offenders}"

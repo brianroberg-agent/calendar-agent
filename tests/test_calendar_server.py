@@ -73,7 +73,7 @@ class TestCalendarsEndpoint:
         data = response.json()
         assert data["success"] is True
         assert len(data["calendars"]) == 3
-        assert data["calendars"][0]["id"] == "primary"
+        assert data["calendars"][0]["id"] == AUTH_USER_EMAIL
 
     def test_list_calendars_empty(self, client, mock_proxy_client):
         """List calendars handles empty list."""
@@ -107,7 +107,7 @@ class TestCalendarsEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["calendar"]["id"] == "primary"
+        assert data["calendar"]["id"] == AUTH_USER_EMAIL
 
     def test_get_calendar_not_found(self, client, mock_proxy_client):
         """Get calendar handles not found."""
