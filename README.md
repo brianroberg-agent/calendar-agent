@@ -903,8 +903,9 @@ are always expanded (`singleEvents=true`).
 
 The filter keys (`query`, `time_min`, `time_max`, `max_results`, `order_by`,
 `show_deleted`) may be nested under `filters` (the shape `/openapi.json`
-describes) **or** sent flat at the top level next to `calendar_id` (the shape
-the calendar skills use). Both requests below are equivalent. Rules for the
+describes) **or** sent flat at the top level next to `calendar_id`. The flat
+shape is kept for compatibility with earlier callers; the installed calendar
+skills nest their filters. Both requests below are equivalent. Rules for the
 flat shape:
 
 - Only the keys `filters` declares are folded in; anything else at the top

@@ -401,8 +401,9 @@ class SearchRequest(StrictRequestModel):
     """Request to search events.
 
     Accepts the filter keys either nested under `filters` (the shape
-    /openapi.json describes) or flat at the top level (the shape the calendar
-    skills document); see `_fold_flat_filter_keys`.
+    /openapi.json describes) or flat at the top level (kept for compatibility
+    with earlier callers; the installed skills nest theirs); see
+    `_fold_flat_filter_keys`.
     """
     calendar_id: str = Field(..., description="Calendar ID to search")
     filters: SearchFilters = Field(default_factory=SearchFilters)

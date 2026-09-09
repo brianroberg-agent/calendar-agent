@@ -2788,10 +2788,11 @@ class TestBulkOperationTagErrors:
 # ============================================================================
 # /search flat-shape fold (issue #8 "shape of the fix" items 2-4)
 #
-# The installed calendar skills document /search with the filter keys at the
-# top level ({"calendar_id": ..., "query": ..., "time_min": ...}) rather than
-# nested under "filters". With extra="forbid" alone that shape went from
-# 200-with-wrong-answer to hard 422. A before-validator folds exactly the
+# Earlier callers sent /search with the filter keys at the top level
+# ({"calendar_id": ..., "query": ..., "time_min": ...}) rather than nested
+# under "filters"; the flat shape is kept for compatibility with them (the
+# installed calendar skills nest their filters). With extra="forbid" alone
+# that shape went from 200-with-wrong-answer to hard 422. A before-validator folds exactly the
 # keys SearchFilters declares into "filters" (consuming them, so a true typo
 # still 422s); the allowlist is derived from SearchFilters.model_fields, so
 # the fold needs no edit when a filter field is added. The parametrized test
@@ -2814,7 +2815,7 @@ FLAT_SEARCH = {"calendar_id": "primary", **NESTED_SEARCH["filters"]}
 
 
 class TestSearchFlatShapeFold:
-    """The flat /search shape the skills document works, and only that shape."""
+    """The flat /search shape kept for earlier callers works, and only that shape."""
 
     def test_flat_shape_gives_the_same_proxy_call_as_nested(self, client, mock_proxy_client):
         client.post("/search", json=NESTED_SEARCH)
