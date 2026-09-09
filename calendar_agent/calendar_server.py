@@ -167,11 +167,16 @@ class EventReminders(StrictRequestModel):
     overrides: list[EventReminder] | None = None
 
 
-# Server-populated, read-only keys Google puts on every event it returns. A
+# Server-populated, read-only keys Google puts on the events it returns. A
 # caller doing fetch -> modify -> write sends them back verbatim; Google
 # tolerates that, so these -- and ONLY these -- are stripped before the
 # extra="forbid" check instead of being rejected. Documented in README.md
 # next to the "Unknown fields are rejected" paragraph; keep the two in sync.
+# Writable keys Google also returns but this server does not declare
+# (`conferenceData`, `attachments`, `extendedProperties`, `source`,
+# `anyoneCanAddSelf`) are deliberately NOT here: stripping them would make
+# a write silently drop what the caller sent, and declaring them is new
+# write surface. The README tells callers to remove them.
 GOOGLE_READ_ONLY_EVENT_FIELDS: frozenset[str] = frozenset({
     "kind",
     "etag",
@@ -187,6 +192,12 @@ GOOGLE_READ_ONLY_EVENT_FIELDS: frozenset[str] = frozenset({
     "eventType",
     "recurringEventId",
     "originalStartTime",
+    "privateCopy",
+    "locked",
+    "attendeesOmitted",
+    "endTimeUnspecified",
+    "outOfOfficeProperties",
+    "workingLocationProperties",
 })
 
 

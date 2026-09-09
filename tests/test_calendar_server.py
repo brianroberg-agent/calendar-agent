@@ -2206,21 +2206,69 @@ class TestValidationErrorEnvelope:
 # Every read-only, server-populated key Google puts on an event it returns.
 # A caller doing fetch -> modify -> write sends these back verbatim; the
 # server strips exactly this set (and nothing else) before forwarding.
+# `outOfOfficeProperties` / `workingLocationProperties` only appear on events
+# of those types; they are folded into this one fixture so the strip set is
+# exercised in full, at the cost of the fixture being a composite.
 GOOGLE_READ_ONLY_EVENT_FIELDS = {
     "kind": "calendar#event",
     "etag": '"3181161784712000"',
     "id": "meeting_001",
-    "htmlLink": "https://calendar.google.com/event?eid=meeting_001",
-    "created": "2024-01-08T10:00:00Z",
-    "updated": "2024-01-15T10:00:00Z",
+    "htmlLink": "https://www.google.com/calendar/event?eid=bWVldGluZ18wMDE",
+    "created": "2024-01-08T10:00:00.000Z",
+    "updated": "2024-01-15T10:00:00.712Z",
     "creator": {"email": "owner@example.com", "self": True},
     "organizer": {"email": "owner@example.com", "self": True},
-    "iCalUID": "meeting_001@google.com",
+    "iCalUID": "recurring_001@google.com",
     "sequence": 3,
     "eventType": "default",
     "hangoutLink": "https://meet.google.com/abc-defg-hij",
     "recurringEventId": "recurring_001",
-    "originalStartTime": {"dateTime": "2024-01-15T10:00:00Z", "timeZone": "UTC"},
+    "originalStartTime": {"dateTime": "2024-01-15T10:00:00-05:00", "timeZone": "America/New_York"},
+    "privateCopy": False,
+    "locked": False,
+    "attendeesOmitted": False,
+    "endTimeUnspecified": False,
+    "outOfOfficeProperties": {
+        "autoDeclineMode": "declineAllConflictingInvitations",
+        "declineMessage": "Out until Monday",
+    },
+    "workingLocationProperties": {"type": "homeOffice", "homeOffice": {}},
+}
+
+# Keys Google returns that ARE writable but this server does not declare:
+# accepting them would be new write surface, and `conferenceData` is ignored
+# by Google on a write unless `conferenceDataVersion` is sent (this server
+# never sends it). A caller round-tripping a fetched event removes these
+# before writing; Meet and attachment events are the common case. README
+# "Round-tripping a fetched event" names the same five.
+GOOGLE_WRITABLE_UNDECLARED_FIELDS = {
+    "conferenceData": {
+        "entryPoints": [
+            {
+                "entryPointType": "video",
+                "uri": "https://meet.google.com/abc-defg-hij",
+                "label": "meet.google.com/abc-defg-hij",
+            }
+        ],
+        "conferenceSolution": {
+            "key": {"type": "hangoutsMeet"},
+            "name": "Google Meet",
+            "iconUri": "https://fonts.gstatic.com/s/i/productlogos/meet_2020q4/v6/web-512dp/logo_meet_2020q4_color_2x_web_512dp.png",
+        },
+        "conferenceId": "abc-defg-hij",
+    },
+    "attachments": [
+        {
+            "fileUrl": "https://drive.google.com/open?id=1AbCdEfG",
+            "title": "Agenda",
+            "mimeType": "application/vnd.google-apps.document",
+            "iconLink": "https://drive-thirdparty.googleusercontent.com/16/type/application/vnd.google-apps.document",
+            "fileId": "1AbCdEfG",
+        }
+    ],
+    "extendedProperties": {"private": {"crmId": "42"}, "shared": {}},
+    "source": {"url": "https://example.com/tickets/42", "title": "Ticket 42"},
+    "anyoneCanAddSelf": False,
 }
 
 # A Google-shaped attendee entry as Google returns it (all writable/tolerated).
@@ -2236,6 +2284,36 @@ GOOGLE_ATTENDEE = {
     "comment": "Joining remotely",
     "additionalGuests": 1,
 }
+
+
+def google_event_as_fetched() -> dict:
+    """A Meet event as `GET .../events/{id}` returns it: read-only keys,
+    writable-but-undeclared keys, and every declared field."""
+    return {
+        **GOOGLE_READ_ONLY_EVENT_FIELDS,
+        **GOOGLE_WRITABLE_UNDECLARED_FIELDS,
+        "status": "confirmed",
+        "summary": "Team Standup",
+        "description": "Daily standup meeting",
+        "location": "Room 4B",
+        "start": {"dateTime": "2024-01-15T10:00:00-05:00", "timeZone": "America/New_York"},
+        "end": {"dateTime": "2024-01-15T10:30:00-05:00", "timeZone": "America/New_York"},
+        "attendees": [GOOGLE_ATTENDEE, {"email": "room@example.com", "resource": True}],
+        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 10}]},
+        "transparency": "opaque",
+        "visibility": "default",
+        "guestsCanInviteOthers": True,
+        "guestsCanModify": False,
+        "guestsCanSeeOtherGuests": True,
+    }
+
+
+def round_trip_body() -> dict:
+    """The fetched event after the removal step the README documents."""
+    return {
+        k: v for k, v in google_event_as_fetched().items()
+        if k not in GOOGLE_WRITABLE_UNDECLARED_FIELDS
+    }
 
 
 class TestPatchAcceptsEveryCreateField:
@@ -2384,31 +2462,14 @@ class TestEmptySingleRouteWriteIsRejected:
 
 
 class TestGoogleEventRoundTrip:
-    """fetch -> modify -> write of a real Google event succeeds (C3)."""
-
-    def _fetched_event(self):
-        return {
-            **GOOGLE_READ_ONLY_EVENT_FIELDS,
-            "status": "confirmed",
-            "summary": "Team Standup",
-            "description": "Daily standup meeting",
-            "location": "Zoom",
-            "start": {"dateTime": "2024-01-15T10:00:00Z", "timeZone": "UTC"},
-            "end": {"dateTime": "2024-01-15T10:30:00Z", "timeZone": "UTC"},
-            "attendees": [GOOGLE_ATTENDEE, {"email": "room@example.com", "resource": True}],
-            "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 10}]},
-            "transparency": "opaque",
-            "visibility": "default",
-            "guestsCanInviteOthers": True,
-            "guestsCanModify": False,
-            "guestsCanSeeOtherGuests": True,
-        }
+    """fetch -> modify -> write of a real Google event succeeds (C3), once the
+    caller removes the writable-but-undeclared keys (fix round, item 4)."""
 
     @pytest.mark.parametrize("method", ["put", "patch"])
     def test_round_trip_succeeds_and_strips_only_read_only_keys(
         self, client, mock_proxy_client, method
     ):
-        body = self._fetched_event()
+        body = round_trip_body()
         body["summary"] = "Team Standup (moved)"
         response = getattr(client, method)("/calendars/primary/events/meeting_001", json=body)
         assert response.status_code == 200, response.text
@@ -2425,14 +2486,31 @@ class TestGoogleEventRoundTrip:
 
     def test_round_trip_through_create_succeeds(self, client, mock_proxy_client):
         """Duplicating an event by POSTing a fetched one works the same way."""
-        response = client.post("/calendars/primary/events", json=self._fetched_event())
+        response = client.post("/calendars/primary/events", json=round_trip_body())
         assert response.status_code == 200, response.text
         forwarded = mock_proxy_client.create_event.call_args.kwargs["event_data"]
-        assert "id" not in forwarded and "etag" not in forwarded
+        assert not set(forwarded) & set(GOOGLE_READ_ONLY_EVENT_FIELDS)
         assert forwarded["summary"] == "Team Standup"
 
+    @pytest.mark.parametrize("method", ["put", "patch"])
+    def test_fetched_event_sent_verbatim_names_exactly_the_undeclared_keys(
+        self, client, mock_proxy_client, method
+    ):
+        """The removal step is real and bounded: sending a fetched Meet event
+        as-is is a 422 on precisely the five writable-but-undeclared keys --
+        none of them is silently stripped, and nothing else is rejected."""
+        response = getattr(client, method)(
+            "/calendars/primary/events/meeting_001", json=google_event_as_fetched()
+        )
+        assert response.status_code == 422, response.text
+        rejected = sorted(err["loc"][-1] for err in response.json()["detail"])
+        assert rejected == sorted(GOOGLE_WRITABLE_UNDECLARED_FIELDS)
+        assert all(err["type"] == "extra_forbidden" for err in response.json()["detail"])
+        mock_proxy_client.update_event.assert_not_called()
+        mock_proxy_client.patch_event.assert_not_called()
+
     def test_unknown_key_outside_read_only_set_still_rejected(self, client, mock_proxy_client):
-        body = {**self._fetched_event(), "titel": "typo"}
+        body = {**round_trip_body(), "titel": "typo"}
         response = client.put("/calendars/primary/events/meeting_001", json=body)
         assert response.status_code == 422
         data = response.json()
@@ -2446,14 +2524,15 @@ class TestGoogleEventRoundTrip:
         ]
         mock_proxy_client.update_event.assert_not_called()
 
+    @pytest.mark.parametrize("key", sorted(GOOGLE_READ_ONLY_EVENT_FIELDS))
     def test_read_only_keys_are_not_silently_written_by_a_bare_request(
-        self, client, mock_proxy_client
+        self, client, mock_proxy_client, key
     ):
         """Stripping is exactly the named set: a read-only key sent alone is
         dropped (200, nothing forwarded for it), never forwarded."""
         response = client.patch(
             "/calendars/primary/events/meeting_001",
-            json={"etag": '"1"', "location": "Room B"},
+            json={key: GOOGLE_READ_ONLY_EVENT_FIELDS[key], "location": "Room B"},
         )
         assert response.status_code == 200, response.text
         assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {

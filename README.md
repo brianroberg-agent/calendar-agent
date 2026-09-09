@@ -149,17 +149,27 @@ operation's `updates` object is validated with
 the same model as `PUT`/`PATCH`; a bulk `delete` must not carry `updates`.
 
 **Round-tripping a fetched event.** Google adds server-populated, read-only
-keys to every event it returns. So that fetch -> modify -> write works, the
+keys to the events it returns. So that fetch -> modify -> write works, the
 event-write routes strip exactly this named set before checking for unknown
 fields, and never forward them:
 
 `kind`, `etag`, `id`, `htmlLink`, `hangoutLink`, `created`, `updated`,
 `creator`, `organizer`, `iCalUID`, `sequence`, `eventType`,
-`recurringEventId`, `originalStartTime`
+`recurringEventId`, `originalStartTime`, `privateCopy`, `locked`,
+`attendeesOmitted`, `endTimeUnspecified`, `outOfOfficeProperties`,
+`workingLocationProperties`
 
-Anything else undeclared is still rejected. Attendee entries accept
-everything Google returns for an attendee (`id`, `resource`, `comment`,
-`additionalGuests`, `self`, ...).
+Anything else undeclared is still rejected -- including five keys Google
+returns that *are* writable but this server does not declare:
+`conferenceData` (the object `hangoutLink` derives from, present on Meet
+events), `attachments`, `extendedProperties`, `source` and
+`anyoneCanAddSelf`. A caller round-tripping a fetched event removes those
+before writing. They are not stripped because that would silently drop
+something the caller sent, and not declared because that is new write
+surface (and without `conferenceDataVersion`, which this server does not
+send, Google ignores `conferenceData` on a write anyway). Attendee entries
+accept everything Google returns for an attendee (`id`, `resource`,
+`comment`, `additionalGuests`, `self`, ...).
 
 **`/search` accepts two shapes** -- filter keys nested under `filters`, or the
 same keys flat at the top level -- see its section for the rules.
@@ -444,9 +454,12 @@ Response:
 Update an event (full replacement). Accepts the same fields as `POST`; a
 body that would forward nothing (`{}`, all-null values, only read-only keys)
 is a `422` rather than an empty write. A
-fetched event can be sent back as-is with the changes applied -- Google's
-read-only keys (`id`, `etag`, `htmlLink`, ...) are stripped, not rejected.
-Query parameter: `send_updates`.
+fetched event round-trips once the caller removes the writable keys this
+server does not declare -- `conferenceData`, `attachments`,
+`extendedProperties`, `source`, `anyoneCanAddSelf` (Meet and attachment
+events are the common case) -- Google's read-only keys (`id`, `etag`,
+`htmlLink`, `privateCopy`, ...) are stripped, not rejected. See
+*Round-tripping a fetched event* above. Query parameter: `send_updates`.
 
 ```bash
 curl -X PUT http://localhost:8082/calendars/primary/events/event123 \
