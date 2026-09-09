@@ -141,8 +141,11 @@ a `422` with `loc: ["query", "<key>"]`, not ignored.
 section below lists. The three event-write routes -- `POST` create, `PUT`
 update and `PATCH` -- all accept the same set (the one listed under
 `POST /calendars/{calendar_id}/events`), so anything you can create you can
-also update or patch, including `status` (`"cancelled"` is Google's cancel
-path). A bulk `update`/`patch` operation's `updates` object is validated with
+also update or patch. The one value-level exception is `status`: it accepts
+`"confirmed"` and `"tentative"` only. `"cancelled"` is a `422` that names the
+right route -- cancelling goes through `DELETE`, which verifies the deletion
+and reports an `outcome`; an update path would not. A bulk `update`/`patch`
+operation's `updates` object is validated with
 the same model as `PUT`/`PATCH`; a bulk `delete` must not carry `updates`.
 
 **Round-tripping a fetched event.** Google adds server-populated, read-only
@@ -374,7 +377,7 @@ which are stripped):
 | `attendees` | list of `{"email": ..., "displayName", "responseStatus", "optional", "organizer", "self", "id", "resource", "comment", "additionalGuests"}` |
 | `reminders` | `{"useDefault": bool, "overrides": [{"method": ..., "minutes": ...}]}` |
 | `recurrence` | list of RRULE strings |
-| `status` | `"confirmed"`, `"tentative"` or `"cancelled"` |
+| `status` | `"confirmed"` or `"tentative"` (`"cancelled"` is a `422`: cancel with `DELETE`) |
 | `transparency` | `"opaque"` or `"transparent"` |
 | `visibility` | `"default"`, `"public"` or `"private"` |
 | `guestsCanInviteOthers`, `guestsCanModify`, `guestsCanSeeOtherGuests` | bool |

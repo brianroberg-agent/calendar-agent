@@ -29,7 +29,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import __version__
 from .calendar_utils import (
@@ -205,14 +205,31 @@ class EventFields(StrictRequestModel):
     reminders: EventReminders | None = Field(None, description="Reminder settings")
     recurrence: list[str] | None = Field(None, description="Recurrence rules (RRULE)")
     colorId: str | None = Field(None, description="Color ID")
-    status: str | None = Field(
-        None, description="'confirmed', 'tentative' or 'cancelled' (Google's cancel path)"
+    # Declared so a fetched event round-trips, but `cancelled` is refused: a
+    # cancel through an update reaches Google with none of the DELETE path's
+    # re-read verification and no `outcome` (PR #12 review, item 1).
+    status: Literal["confirmed", "tentative"] | None = Field(
+        None,
+        description="'confirmed' or 'tentative'. To cancel an event use DELETE, which "
+        "verifies the deletion; 'cancelled' here is a 422",
     )
     transparency: str | None = Field(None, description="'opaque' or 'transparent'")
     visibility: str | None = Field(None, description="'default', 'public', 'private'")
     guestsCanInviteOthers: bool | None = None
     guestsCanModify: bool | None = None
     guestsCanSeeOtherGuests: bool | None = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _cancel_goes_through_delete(cls, value: Any) -> Any:
+        """Name the right route instead of a bare "not a permitted value"."""
+        if value == "cancelled":
+            raise ValueError(
+                "'status: cancelled' is not accepted on a write. Cancel the event "
+                "with DELETE /calendars/{calendar_id}/events/{event_id}, which "
+                "verifies the deletion and reports an outcome"
+            )
+        return value
 
     @model_validator(mode="before")
     @classmethod

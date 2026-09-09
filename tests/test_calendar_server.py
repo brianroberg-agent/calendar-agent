@@ -2248,7 +2248,7 @@ class TestPatchAcceptsEveryCreateField:
             ("guestsCanInviteOthers", False),
             ("guestsCanModify", True),
             ("guestsCanSeeOtherGuests", False),
-            ("status", "cancelled"),
+            ("status", "tentative"),
         ],
     )
     def test_patch_forwards_field(self, client, mock_proxy_client, field, value):
@@ -2267,6 +2267,79 @@ class TestPatchAcceptsEveryCreateField:
         assert response.status_code == 200, response.text
         forwarder = mock_proxy_client.create_event if method == "post" else mock_proxy_client.update_event
         assert forwarder.call_args.kwargs["event_data"]["status"] == "tentative"
+
+
+class TestCancelledStatusIsRejected:
+    """`status: "cancelled"` is refused on every write (fix round, item 1).
+
+    A cancel through PUT/PATCH reaches Google with none of the DELETE path's
+    re-read verification and no `outcome`. `status` stays declared (a fetched
+    event carries it) but accepts only `confirmed` / `tentative`; `cancelled`
+    is a 422 that points the caller at DELETE. The rule lives on the shared
+    `EventFields` model, so POST and bulk `updates` get it too.
+    """
+
+    CANCEL = {"summary": "Standup", "status": "cancelled"}
+
+    @pytest.mark.parametrize(
+        "method,path,forwarder",
+        [
+            ("post", "/calendars/primary/events", "create_event"),
+            ("put", "/calendars/primary/events/event_123", "update_event"),
+            ("patch", "/calendars/primary/events/event_123", "patch_event"),
+        ],
+    )
+    def test_single_route_rejects_cancelled_and_points_at_delete(
+        self, client, mock_proxy_client, method, path, forwarder
+    ):
+        response = getattr(client, method)(path, json=self.CANCEL)
+        assert response.status_code == 422, response.text
+        data = response.json()
+        assert data["success"] is False
+        assert "DELETE" in data["error"]
+        assert [err["loc"] for err in data["detail"]] == [["body", "status"]]
+        getattr(mock_proxy_client, forwarder).assert_not_called()
+
+    @pytest.mark.parametrize(
+        "operation,forwarder", [("update", "update_event"), ("patch", "patch_event")]
+    )
+    def test_bulk_rejects_cancelled_before_any_operation_runs(
+        self, client, mock_proxy_client, operation, forwarder
+    ):
+        response = client.post("/bulk-actions", json={"operations": [
+            {"operation": "delete", "event_id": "event_0", "calendar_id": "primary"},
+            {"operation": operation, "event_id": "event_1", "calendar_id": "primary",
+             "updates": self.CANCEL},
+        ]})
+        assert response.status_code == 422, response.text
+        assert "DELETE" in response.json()["error"]
+        getattr(mock_proxy_client, forwarder).assert_not_called()
+        mock_proxy_client.delete_event.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["confirmed", "tentative"])
+    def test_confirmed_and_tentative_are_still_forwarded(
+        self, client, mock_proxy_client, value
+    ):
+        response = client.patch(
+            "/calendars/primary/events/event_123", json={"status": value}
+        )
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.patch_event.call_args.kwargs["event_data"] == {"status": value}
+
+        response = client.post("/bulk-actions", json={"operations": [
+            {"operation": "update", "event_id": "event_1", "calendar_id": "primary",
+             "updates": {"summary": "Standup", "status": value}},
+        ]})
+        assert response.status_code == 200, response.text
+        assert mock_proxy_client.update_event.call_args.kwargs["event_data"]["status"] == value
+
+    def test_any_other_status_value_is_rejected(self, client, mock_proxy_client):
+        response = client.patch(
+            "/calendars/primary/events/event_123", json={"status": "maybe"}
+        )
+        assert response.status_code == 422, response.text
+        assert [err["loc"] for err in response.json()["detail"]] == [["body", "status"]]
+        mock_proxy_client.patch_event.assert_not_called()
 
 
 class TestGoogleEventRoundTrip:
