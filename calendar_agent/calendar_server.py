@@ -29,7 +29,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from . import __version__
 from .calendar_utils import (
@@ -476,12 +476,37 @@ class BulkPatchOperation(_BulkWriteOperation):
     updates: EventPatchRequest = Field(..., description="Fields to change")
 
 
+_BULK_OPERATION_NAMES = ", ".join(f"'{op.value}'" for op in BulkOperationType)
+_BULK_OPERATION_VALUES = frozenset(op.value for op in BulkOperationType)
+
+
+def _check_bulk_operation_tag(item: Any) -> Any:
+    """Report an absent or unknown `operation` in fixed words.
+
+    Runs before the discriminated union below, whose own message for a bad
+    tag spells the expected tags as Python enum reprs
+    (`<BulkOperationType.DELETE: 'delete'>`) -- in `error`, `detail[].msg`
+    and `ctx.expected_tags` alike (PR #12 review, item 3). Anything that is
+    not a mapping is left for the union to reject.
+    """
+    if not isinstance(item, dict):
+        return item
+    tag = item.get("operation")
+    # The `isinstance` guard keeps an unhashable tag (a list or object) from
+    # raising TypeError out of the set lookup, which would be a 500 not a 422.
+    if not (isinstance(tag, str) and tag in _BULK_OPERATION_VALUES):
+        got = f"got {tag!r}" if "operation" in item else "it is missing"
+        raise ValueError(f"'operation' must be one of {_BULK_OPERATION_NAMES}; {got}")
+    return item
+
+
 # Discriminated on `operation`, so `updates` is typed by the operation it
 # accompanies and an unknown key inside it is rejected at the same depth as
 # on the single-event routes (issue #8).
 BulkOperation = Annotated[
     BulkDeleteOperation | BulkUpdateOperation | BulkPatchOperation,
     Field(discriminator="operation"),
+    BeforeValidator(_check_bulk_operation_tag),
 ]
 
 

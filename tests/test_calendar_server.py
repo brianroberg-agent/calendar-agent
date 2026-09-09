@@ -1,6 +1,7 @@
 """Tests for Calendar Agent server endpoints."""
 
 
+import re
 import typing
 from collections.abc import Mapping
 from unittest.mock import AsyncMock, patch
@@ -2526,6 +2527,40 @@ class TestBulkUpdatesAreTyped:
         assert response.status_code == 422, response.text
         assert "'update' requires a non-empty payload" in response.json()["error"]
         mock_proxy_client.update_event.assert_not_called()
+
+
+class TestBulkOperationTagErrors:
+    """A bad `operation` value gets a fixed message naming the allowed
+    operations (fix round, item 3). Before, the discriminated union's own
+    message leaked Python enum reprs (`<BulkOperationType.DELETE: 'delete'>`)
+    into `error`, `detail[].msg` and `detail[].ctx.expected_tags`."""
+
+    ENUM_REPR = re.compile(r"BulkOperationType|<[A-Za-z_.]+: '")
+    FIXED = "'operation' must be one of 'update', 'delete', 'patch'"
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            pytest.param({"operation": "bogus"}, id="unknown-tag"),
+            pytest.param({}, id="missing-tag"),
+            pytest.param({"operation": None}, id="null-tag"),
+            pytest.param({"operation": []}, id="list-tag"),
+            pytest.param({"operation": {}}, id="object-tag"),
+        ],
+    )
+    def test_bad_operation_tag_gets_a_fixed_message(self, client, mock_proxy_client, op):
+        # An unhashable tag must not turn the 422 into a 500 via `in <set>`.
+        response = client.post("/bulk-actions", json={"operations": [
+            {"event_id": "event_1", "calendar_id": "primary", **op},
+        ]})
+        assert response.status_code == 422, response.text
+        assert not self.ENUM_REPR.search(response.text), response.text
+        data = response.json()
+        assert data["success"] is False
+        assert self.FIXED in data["error"]
+        assert [err["loc"] for err in data["detail"]] == [["body", "operations", 0]]
+        for name in ("delete_event", "update_event", "patch_event"):
+            getattr(mock_proxy_client, name).assert_not_called()
 
 
 # ============================================================================
