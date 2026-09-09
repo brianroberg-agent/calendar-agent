@@ -769,11 +769,24 @@ async def require_own_calendar_for_rsvp(calendar_id: str) -> None:
     talking about the same attendee entry.
 
     ``primary`` is accepted without a lookup, so the ordinary path makes no
-    extra proxy call at all.
+    extra proxy call. Any other id needs the account's own calendar id, read
+    once per process from GET /calendars/primary. If that read fails -- for
+    any reason, timeout included -- the failure is re-raised as a plain
+    ProxyError (502): it happened before anything was sent, so it must not
+    be reported in the mutation's vocabulary (a timeout there is not an
+    "outcome unknown", and a 404 there is not "no such event").
     """
     if calendar_id == "primary":
         return
-    if calendar_id.casefold() == (await get_authenticated_calendar_id()).casefold():
+    try:
+        own_calendar_id = await get_authenticated_calendar_id()
+    except ProxyError as e:
+        raise ProxyError(
+            "The ownership check for this RSVP could not be performed: reading "
+            f"the authenticated account's own calendar (GET /calendars/primary) "
+            f"failed ({e}). The RSVP was not attempted and nothing was sent."
+        ) from e
+    if calendar_id.casefold() == own_calendar_id.casefold():
         return
     # ESCAPE HATCH (deliberately not implemented): if a deliberate RSVP on a
     # shared calendar is ever wanted, add an explicit opt-in field to
@@ -1108,7 +1121,10 @@ async def respond_to_event(
     RSVP would change. Refusing keeps read and write on one calendar, where
     they agree. ``primary`` is accepted without any lookup; other ids are
     compared against the account's own calendar id, read once per process
-    from GET /calendars/primary.
+    from GET /calendars/primary. If that read fails, the answer is 502 with
+    a message saying the ownership check could not be performed and nothing
+    was sent -- never 504 "outcome unknown" or 404, because no RSVP was
+    attempted.
 
     Forwards to the proxy's dedicated /respond route. The proxy resolves the
     authenticated account's email address (from its primary calendar), finds

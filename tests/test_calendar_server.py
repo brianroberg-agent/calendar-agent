@@ -784,6 +784,72 @@ class TestEventRespondRefusesForeignCalendars:
         assert resp.json()["success"] is False
         mock_proxy_client.respond_to_event.assert_not_called()
 
+    def test_identity_lookup_timeout_is_an_upstream_failure_not_an_unknown_outcome(
+        self, client, mock_proxy_client
+    ):
+        """A read timeout on GET /calendars/primary happens before anything is
+        sent, so it must not be reported as a mutation whose outcome is
+        unknown (Opus delta review, finding 1): 502, the message says the
+        ownership check could not be performed, and no RSVP is forwarded."""
+        mock_proxy_client.get_calendar.side_effect = ProxyTimeoutError(
+            "No response from proxy after 30s"
+        )
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        data = resp.json()
+        assert data["success"] is False
+        assert "Outcome unknown" not in data["error"]
+        assert "ownership check" in data["error"]
+        assert "nothing was sent" in data["error"]
+        mock_proxy_client.respond_to_event.assert_not_awaited()
+
+    def test_identity_lookup_not_found_is_an_upstream_failure_not_a_404(
+        self, client, mock_proxy_client
+    ):
+        """A 404 on GET /calendars/primary is not "no such event": the URL
+        names an event this route never looked at. 502, nothing sent."""
+        mock_proxy_client.get_calendar.side_effect = ProxyNotFoundError(
+            "Calendar not found"
+        )
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        assert resp.json()["success"] is False
+        assert "ownership check" in resp.json()["error"]
+        mock_proxy_client.respond_to_event.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "lookup_failure",
+        [
+            ProxyForbiddenError("blocked"),
+            ProxyRequestError(429, "slow down"),
+            ProxyAuthError("bad key"),
+            ProxyError("connection refused"),
+        ],
+        ids=["forbidden", "other-4xx", "auth", "generic"],
+    )
+    def test_any_identity_lookup_failure_is_502_with_nothing_sent(
+        self, client, mock_proxy_client, lookup_failure
+    ):
+        """Pins the documented guarantee: whatever the proxy does to the
+        identity read, the caller sees 502 and no RSVP was attempted. A
+        forbidden here would otherwise read as "the operator rejected your
+        RSVP" for a read no operator ever saw."""
+        mock_proxy_client.get_calendar.side_effect = lookup_failure
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        assert resp.json()["success"] is False
+        assert "nothing was sent" in resp.json()["error"]
+        mock_proxy_client.respond_to_event.assert_not_awaited()
+
     def test_respond_invalid_status_rejected(self, client, mock_proxy_client):
         """Values outside accepted/declined/tentative are rejected with 422."""
         resp = client.post(
