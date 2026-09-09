@@ -735,6 +735,19 @@ class TestEventRespondRefusesForeignCalendars:
         assert resp.json()["success"] is True
         assert mock_proxy_client.get_calendar.await_count == 0
 
+    def test_literal_primary_is_matched_case_insensitively(self, client, mock_proxy_client):
+        """'Primary' takes the same no-lookup fast path as 'primary': the
+        address comparison already casefolds, so the literal must too
+        (Opus delta review, finding 2)."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            "/calendars/Primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert mock_proxy_client.get_calendar.await_count == 0
+
     def test_allows_the_authenticated_users_own_address(self, client, mock_proxy_client):
         mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
         resp = client.post(

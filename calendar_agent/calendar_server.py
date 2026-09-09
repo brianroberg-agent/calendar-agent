@@ -776,7 +776,7 @@ async def require_own_calendar_for_rsvp(calendar_id: str) -> None:
     be reported in the mutation's vocabulary (a timeout there is not an
     "outcome unknown", and a 404 there is not "no such event").
     """
-    if calendar_id == "primary":
+    if calendar_id.casefold() == "primary":
         return
     try:
         own_calendar_id = await get_authenticated_calendar_id()
