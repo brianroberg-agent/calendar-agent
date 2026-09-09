@@ -107,7 +107,10 @@ uv run pytest --cov=calendar_agent  # With coverage
   (`validation_error_envelope`) returns `{"success": false, "error":
   "<loc>: <msg>; ...", "detail": [...]}` — keep `detail`, callers read it
 - Every mutation envelope carries an `outcome` (`OperationOutcome`):
-  `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items.
+  `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items —
+  except a request-validation 422, which carries the validation envelope
+  above instead (nothing was attempted, so there is no outcome to report;
+  `TestValidation422CarriesNoOutcome` pins this).
   Never collapse `unknown` into `failed`: a timed-out mutation may still be
   applied when the operator approves it, and treating that as failure is what
   produced the duplicate-event incident in issue #4

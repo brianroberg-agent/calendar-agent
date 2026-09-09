@@ -2333,6 +2333,45 @@ class TestValidationErrorEnvelope:
         assert len(data["detail"]) == 2
 
 
+class TestValidation422CarriesNoOutcome:
+    """A request-validation 422 on a mutation route carries the validation
+    envelope, not an `outcome` (fix round, item 9): nothing was attempted,
+    so there is no outcome to report. Pins the exception the docs state to
+    "mutation envelopes carry an `outcome`"."""
+
+    @pytest.mark.parametrize(
+        "method,path,kwargs",
+        [
+            pytest.param(
+                "delete", "/calendars/primary/events/event_123?sendUpdates=all", {},
+                id="delete-undeclared-query-key",
+            ),
+            pytest.param(
+                "post", "/bulk-actions",
+                {"json": {"operations": [{"operation": "bogus", "event_id": "e", "calendar_id": "p"}]}},
+                id="bulk-bad-operation",
+            ),
+            pytest.param(
+                "put", "/calendars/primary/events/event_123", {"json": {}},
+                id="put-empty-body",
+            ),
+        ],
+    )
+    def test_422_on_a_mutation_route_is_the_validation_envelope(
+        self, client, mock_proxy_client, method, path, kwargs
+    ):
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 422, response.text
+        body = response.json()
+        assert body["success"] is False
+        assert body["error"]
+        assert isinstance(body["detail"], list) and body["detail"]
+        assert "outcome" not in body
+        assert "results" not in body
+        for name in ("delete_event", "update_event", "patch_event", "get_event"):
+            getattr(mock_proxy_client, name).assert_not_called()
+
+
 # ============================================================================
 # Writable-field coverage and fetch-modify-write round trips (issue #8,
 # second review round)

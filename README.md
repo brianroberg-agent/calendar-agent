@@ -118,7 +118,10 @@ Every endpoint returns a body with a `success` field, and on failure an
 Mutation envelopes (`DELETE …/events/{id}` and each `/bulk-actions` result)
 also carry an `outcome` of `succeeded` / `failed` / `unknown` (bulk only:
 `not_attempted`), so a caller reading only the body can tell "rejected" from
-"may still apply".
+"may still apply". The exception is a request-validation `422` (for example
+`DELETE …?sendUpdates=all`, an undeclared query key): it carries the
+validation envelope described below and no `outcome`, since nothing was
+attempted.
 | `500` | Unexpected internal error |
 
 #### Validation: unknown fields are rejected, not ignored
