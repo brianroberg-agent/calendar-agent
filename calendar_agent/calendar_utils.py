@@ -1,7 +1,96 @@
 """Utility functions for calendar operations."""
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal, NamedTuple, get_args
+
+# ============================================================================
+# Organizer / RSVP perspective
+#
+# Google's ``organizer.self`` / ``attendees[].self`` flags describe the
+# CALENDAR the event copy sits on, so on GET /calendars/{calendar_id}/events
+# they describe calendar_id, not the caller. For what each value below means,
+# see the ``EventSummary`` field descriptions in calendar_server.py (the
+# text /openapi.json shows); this module only defines the vocabularies.
+# ============================================================================
+
+# The three values a caller may write via POST .../respond.
+RsvpResponse = Literal["accepted", "declined", "tentative"]
+# What Google reports on an attendee entry (Google's spelling, kept verbatim
+# so the writable subset round-trips to /respond unchanged).
+ReadResponseStatus = Literal[RsvpResponse, "needsAction"]
+# What this service reports: Google's four values, or one of three snake_case
+# classifications of "no response status to report".
+RsvpState = Literal[ReadResponseStatus, "organizer_no_rsvp", "not_attendee", "unknown"]
+
+RSVP_RESPONSES: tuple[str, ...] = get_args(RsvpResponse)
+READ_RESPONSE_STATUSES: tuple[str, ...] = get_args(ReadResponseStatus)
+
+
+class CalendarPerspective(NamedTuple):
+    """What an event copy says about the calendar it sits on.
+
+    ``is_organizer`` is Google's ``organizer.self``; ``rsvp_state`` is the
+    calendar's own (``self``) attendee entry classified into ``RsvpState``.
+    """
+
+    is_organizer: bool
+    rsvp_state: RsvpState
+
+
+def _dict_rows(rows: Any) -> list[dict[str, Any]]:
+    """The dict elements of ``rows``; ``[]`` when ``rows`` is not a list."""
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def attendee_entries(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """The event's attendee rows that are dicts.
+
+    The one definition of "an attendee" shared by attendee_count, the
+    perspective classifier, the briefing prompt and format_attendees, so a
+    non-dict row (not something a Google-conformant proxy sends) is skipped
+    the same way everywhere instead of being counted in one place and
+    ignored in another. A missing or non-list ``attendees`` is ``[]``.
+    """
+    return _dict_rows(event.get("attendees"))
+
+
+def calendar_perspective(event: dict[str, Any]) -> CalendarPerspective:
+    """Organizer flag and RSVP state of the calendar this event copy sits on.
+
+    Uses Google's ``organizer.self`` and the ``self: true`` attendee entry,
+    which by Google's definition describe the calendar being read. A
+    non-dict organizer is treated as absent and non-dict attendee rows are
+    skipped (attendee_entries), rather than raised on.
+    """
+    organizer = event.get("organizer")
+    organizer = organizer if isinstance(organizer, dict) else {}
+    attendees = attendee_entries(event)
+    is_organizer = bool(organizer.get("self"))
+    own_entry = next((a for a in attendees if a.get("self")), None)
+    own_status = own_entry.get("responseStatus") if own_entry is not None else None
+
+    rsvp_state: RsvpState
+    if own_status in READ_RESPONSE_STATUSES:
+        rsvp_state = own_status
+    elif own_status is not None:
+        # A value this service cannot classify (or a non-string) is
+        # "unknown" even when the calendar is the organizer: there IS a
+        # value, so this is not "own event, no RSVP recorded".
+        rsvp_state = "unknown"
+    elif is_organizer:
+        rsvp_state = "organizer_no_rsvp"
+    elif own_entry is not None:
+        # The calendar has an entry of its own but no responseStatus, and
+        # does not organize the event: invited, answer not recorded.
+        rsvp_state = "unknown"
+    elif not organizer and not attendees:
+        # Nothing to classify from (a cancelled recurring-instance stub).
+        rsvp_state = "unknown"
+    else:
+        rsvp_state = "not_attendee"
+    return CalendarPerspective(is_organizer, rsvp_state)
 
 
 def get_event_time(event_datetime: dict[str, Any] | None) -> str:
@@ -75,7 +164,8 @@ def get_event_duration_minutes(
 
 
 def format_attendees(attendees: list[dict[str, Any]] | None) -> str:
-    """Format attendee list for display."""
+    """Format attendee list for display. Non-dict rows are skipped."""
+    attendees = _dict_rows(attendees)
     if not attendees:
         return "No attendees"
 
@@ -99,8 +189,12 @@ def parse_attendee_name(attendee: dict[str, Any]) -> str:
 
 
 def is_all_day_event(event: dict[str, Any]) -> bool:
-    """Check if an event is an all-day event."""
-    start = event.get("start", {})
+    """Check if an event is an all-day event.
+
+    A missing or null ``start`` (a cancelled recurring-instance stub) is not
+    all-day.
+    """
+    start = event.get("start") or {}
     return "date" in start and "dateTime" not in start
 
 
@@ -111,7 +205,7 @@ def get_event_summary_text(event: dict[str, Any]) -> str:
     location = event.get("location", "")
     start = event.get("start", {})
     end = event.get("end", {})
-    attendees = event.get("attendees", [])
+    attendees = attendee_entries(event)
 
     parts = [
         f"Title: {summary}",

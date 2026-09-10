@@ -1,8 +1,12 @@
 """Calendar Agent Server - A privacy-focused FastAPI server for Google Calendar.
 
 This server acts as an intermediary between AI agents (like Claude Code) and the
-Google Calendar API via a proxy server. Calendar event details are processed
-locally; only metadata and LLM-generated summaries are returned to calling agents.
+Google Calendar API via a proxy server. The LLM endpoints process event content
+locally and return generated text. List and search return EventSummary rows:
+metadata plus the organizer's and creator's email addresses, no description and
+no attendee list. The single-event detail routes (.../events/{event_id} and
+.../respond) return the full Google event, description and attendee addresses
+included.
 
 Key features:
 - Calendar and event CRUD operations via proxy
@@ -18,7 +22,7 @@ and enforces security policies.
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -26,14 +30,27 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from . import __version__
-from .calendar_utils import find_free_slots, get_time_range_rfc3339
+from .calendar_utils import (
+    READ_RESPONSE_STATUSES,
+    RSVP_RESPONSES,
+    RsvpResponse,
+    RsvpState,
+    attendee_entries,
+    calendar_perspective,
+    find_free_slots,
+    get_event_time,
+    get_time_range_rfc3339,
+    is_all_day_event,
+)
 from .exceptions import (
     LLMError,
     ProxyAuthError,
     ProxyError,
     ProxyForbiddenError,
     ProxyNotFoundError,
+    ProxyRequestError,
     ProxyTimeoutError,
+    RsvpCalendarRefusedError,
 )
 from .llm_service import get_llm_service
 from .proxy_client import get_calendar_client
@@ -122,10 +139,33 @@ class EventPatchRequest(BaseModel):
     colorId: str | None = None
 
 
+# Rendered into the field descriptions below so /openapi.json lists exactly
+# the vocabularies the code enforces.
+_RSVP_RESPONSE_LIST = ", ".join(f"'{v}'" for v in RSVP_RESPONSES)
+_READ_STATUS_LIST = ", ".join(f"'{v}'" for v in READ_RESPONSE_STATUSES)
+
+
 class RespondRequest(BaseModel):
-    """Request body for RSVPing to an event (setting the owner's own status)."""
-    response_status: Literal["accepted", "declined", "tentative"] = Field(
-        ..., description="'accepted', 'declined', or 'tentative'"
+    """Request body for RSVPing to an event.
+
+    The proxy writes the AUTHENTICATED USER's own attendee entry, found by
+    email address (it does not trust Google's ``self`` flag). Because that is
+    the opposite perspective from the read side -- whose ``calendar_*``
+    fields describe the calendar being read -- this route accepts only the
+    authenticated user's own calendar_id (``primary`` or the account's own
+    calendar id) and refuses any other with 400.
+    """
+    response_status: RsvpResponse = Field(
+        ...,
+        description=(
+            f"One of {_RSVP_RESPONSE_LIST}: the values of "
+            "EventSummary.calendar_rsvp_state that can be written back "
+            "('needsAction' and the derived states cannot). Written to the "
+            "AUTHENTICATED USER's own attendee entry. The route accepts only "
+            "the user's own calendar_id ('primary' or the account's own "
+            "calendar id); any other calendar_id is refused with 400 and "
+            "nothing is written."
+        ),
     )
 
 
@@ -267,7 +307,19 @@ class CalendarDetailResponse(BaseModel):
 
 
 class EventSummary(BaseModel):
-    """Summary of an event (metadata only, no body)."""
+    """Summary of an event: metadata plus the organizer's and creator's
+    addresses; no description and no attendee list.
+
+    The ``calendar_*`` fields describe the calendar named by ``calendar_id``,
+    because Google's ``organizer.self`` / ``attendees[].self`` flags mark
+    "the calendar on which this copy of the event appears" -- not the
+    caller. They describe the authenticated user only when reading the
+    user's own calendar (``primary`` or its own address); on a colleague's
+    or group calendar they describe that calendar. POST .../respond takes
+    the opposite perspective -- it writes the authenticated user's own entry
+    -- and for that reason accepts only the user's own calendar_id, refusing
+    any other with 400.
+    """
     id: str
     calendar_id: str
     summary: str
@@ -276,8 +328,73 @@ class EventSummary(BaseModel):
     location: str | None = None
     attendee_count: int
     is_all_day: bool
-    status: str | None = None
+    status: str | None = Field(
+        None,
+        description=(
+            "Google event status: 'confirmed', 'tentative', or 'cancelled'. "
+            "On a plain GET .../events with single_events=false, cancelled "
+            "rows are the stubs Google keeps for deleted instances of a "
+            "recurring series: empty start/end, no organizer, no attendees, "
+            "calendar_rsvp_state 'unknown'. POST /search with "
+            "filters.show_deleted=true forwards showDeleted to Google (with "
+            "singleEvents fixed to true); the cancelled rows it returns are "
+            "whatever Google sends for them, and are classified like any "
+            "other row -- they may carry real start/end, an organizer and "
+            "attendees."
+        ),
+    )
     html_link: str | None = None
+    # Organizer and creator addresses are exposed by decision (2026-09-03);
+    # attendee addresses are not -- attendee_count stays a count.
+    organizer_email: str | None = Field(
+        None,
+        description=(
+            "The organizer's address. For an event created directly on a "
+            "group calendar this is the group calendar's own id (Google makes "
+            "the calendar the organizer); see creator_email for the person. "
+            "null when the event carries no organizer (e.g. a cancelled "
+            "recurring-instance stub)."
+        ),
+    )
+    creator_email: str | None = Field(
+        None,
+        description=(
+            "The address of the account that created the event, as Google "
+            "reports it. Usually equals organizer_email; differs for events "
+            "created on a group calendar (organizer = the calendar) or moved "
+            "between calendars. null when absent."
+        ),
+    )
+    calendar_is_organizer: bool = Field(
+        ...,
+        description=(
+            "Whether the calendar named by calendar_id organizes this event "
+            "(Google's organizer.self). On a colleague's calendar this is "
+            "about the colleague; it is about the authenticated user only "
+            "when calendar_id is the user's own calendar."
+        ),
+    )
+    calendar_rsvp_state: RsvpState = Field(
+        ...,
+        description=(
+            "The RSVP of the attendee entry belonging to the calendar named "
+            "by calendar_id (Google's attendees[].self), classified. "
+            f"{_READ_STATUS_LIST}: Google's responseStatus, verbatim. "
+            "'organizer_no_rsvp': the calendar organizes the event and has no "
+            "responseStatus (no entry of its own, or an entry without one) -- "
+            "its own event, nothing to answer. 'not_attendee': the calendar "
+            "neither organizes the event nor appears in its attendee list. "
+            "'unknown': the calendar's entry carries a responseStatus this "
+            "service does not recognise (organizer or not); or the calendar "
+            "does not organize the event and its own entry has no "
+            "responseStatus at all; or the event has no organizer and no "
+            "attendees (a cancelled recurring-instance stub). On a "
+            "colleague's calendar this is the colleague's RSVP, "
+            f"not the authenticated user's. Only {_RSVP_RESPONSE_LIST} can be "
+            "sent back to POST .../respond, and only a value read from the "
+            "user's own calendar: that route refuses any other calendar_id."
+        ),
+    )
 
 
 class EventsListResponse(BaseModel):
@@ -289,10 +406,25 @@ class EventsListResponse(BaseModel):
 
 
 class EventDetailResponse(BaseModel):
-    """Full event details (for get/create/update operations)."""
+    """Full event details (for get/create/update/patch/respond).
+
+    ``event`` is the Google event as the proxy returned it, including
+    ``description`` and the ``attendees`` list with addresses -- the
+    summary-only privacy rule applies to list/search rows, not here.
+    """
     success: bool
     event: dict[str, Any] | None = None
     error: str | None = None
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Caveats about a successful result. Nothing in this service "
+            "appends to it today, so it is empty on every route: POST "
+            ".../respond used to warn when calendar_id was not the literal "
+            "'primary', and now refuses a calendar_id that is not the "
+            "authenticated user's own with 400 instead of completing it."
+        ),
+    )
 
 
 class OperationOutcome(str, Enum):
@@ -371,6 +503,8 @@ def format_proxy_error(e: Exception) -> str:
         return f"Not found: {e}"
     if isinstance(e, ProxyTimeoutError):
         return f"Outcome unknown: {e}"
+    if isinstance(e, ProxyRequestError):
+        return f"Proxy rejected the request ({e.status_code}): {e}"
     if isinstance(e, ProxyError):
         return f"Proxy error: {e}"
     return str(e)
@@ -381,14 +515,23 @@ def error_status_code(e: Exception) -> int:
 
     The success/error envelope stays in the body; the status code must agree
     with it (issue #4): 403 passes through an operator rejection or policy
-    block, 404 an absent calendar or event, 504 marks a timed-out call whose
-    outcome is unknown, 502 covers upstream proxy/LLM failures, 500 anything
-    unexpected.
+    block; 404 an absent calendar or event (ProxyNotFoundError); 400 passes
+    through a proxy 400 with its message (ProxyRequestError, e.g. /respond
+    when the authenticated user is not an attendee) and also covers this
+    server's own refusal to RSVP through a calendar that is not the
+    authenticated user's (RsvpCalendarRefusedError); 504 marks a timed-out
+    call whose outcome is unknown; 502 covers upstream proxy/LLM failures,
+    including a proxy 401 (this service's own key rejected) and any other
+    proxy 4xx; 500 anything unexpected.
     """
     if isinstance(e, ProxyForbiddenError):
         return 403
     if isinstance(e, ProxyNotFoundError):
         return 404
+    if isinstance(e, RsvpCalendarRefusedError):
+        return 400
+    if isinstance(e, ProxyRequestError) and e.status_code == 400:
+        return 400
     if isinstance(e, ProxyTimeoutError):
         return 504
     if isinstance(e, ProxyAuthError | ProxyError | LLMError):
@@ -575,28 +718,120 @@ def bulk_error_summary(results: list[BulkOperationResult]) -> str | None:
     )
 
 
-def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
-    """Convert a full event to a summary (metadata only)."""
-    start = event.get("start", {})
-    end = event.get("end", {})
-    attendees = event.get("attendees", [])
+# The authenticated account's own calendar id, as the proxy reports it
+# (GET /calendars/primary answers with the account's address in ``id``).
+# Cached for the life of the process: the credentials the proxy holds do not
+# change under a running server, so this costs ONE proxy read in total, not
+# one per RSVP.
+_authenticated_calendar_id: str | None = None
 
-    # Get time string (prefer dateTime, fall back to date for all-day)
-    start_str = start.get("dateTime") or start.get("date") or ""
-    end_str = end.get("dateTime") or end.get("date") or ""
-    is_all_day = "date" in start and "dateTime" not in start
+
+def reset_authenticated_calendar_id() -> None:
+    """Drop the cached authenticated calendar id.
+
+    Only the tests call this; nothing in the running server invalidates the
+    cache, because the proxy's credentials are fixed for the process.
+    """
+    global _authenticated_calendar_id
+    _authenticated_calendar_id = None
+
+
+async def get_authenticated_calendar_id() -> str:
+    """Return the authenticated account's own calendar id, reading it once.
+
+    Raises ProxyError if the proxy answers without an ``id`` -- there is then
+    nothing to compare a calendar_id against, and guessing would defeat the
+    check that calls this. Proxy failures propagate as their own exceptions.
+    """
+    global _authenticated_calendar_id
+    if _authenticated_calendar_id is None:
+        calendar = await get_calendar_client().get_calendar("primary")
+        calendar_id = calendar.get("id") if isinstance(calendar, dict) else None
+        if not isinstance(calendar_id, str) or not calendar_id:
+            raise ProxyError(
+                "The proxy's primary calendar carries no 'id', so the "
+                "authenticated account's own calendar cannot be identified."
+            )
+        _authenticated_calendar_id = calendar_id
+    return _authenticated_calendar_id
+
+
+async def require_own_calendar_for_rsvp(calendar_id: str) -> None:
+    """Raise RsvpCalendarRefusedError unless ``calendar_id`` is the
+    authenticated user's own calendar (Brian's decision, 2026-09-04).
+
+    Read and write take opposite perspectives on this route's calendar_id:
+    the read fields describe the calendar named, POST .../respond always
+    writes the authenticated user's own attendee entry. On a group or
+    colleague calendar those are different people, so a "you have not
+    responded" read there says nothing about the entry an RSVP would change.
+    Restricting the route to the user's own calendar is what keeps the two
+    talking about the same attendee entry.
+
+    ``primary`` is accepted without a lookup, so the ordinary path makes no
+    extra proxy call. Any other id needs the account's own calendar id, read
+    once per process from GET /calendars/primary. If that read fails -- for
+    any reason, timeout included -- the failure is re-raised as a plain
+    ProxyError (502): it happened before anything was sent, so it must not
+    be reported in the mutation's vocabulary (a timeout there is not an
+    "outcome unknown", and a 404 there is not "no such event").
+    """
+    if calendar_id.casefold() == "primary":
+        return
+    try:
+        own_calendar_id = await get_authenticated_calendar_id()
+    except ProxyError as e:
+        raise ProxyError(
+            "The ownership check for this RSVP could not be performed: reading "
+            f"the authenticated account's own calendar (GET /calendars/primary) "
+            f"failed ({e}). The RSVP was not attempted and nothing was sent."
+        ) from e
+    if calendar_id.casefold() == own_calendar_id.casefold():
+        return
+    # ESCAPE HATCH (deliberately not implemented): if a deliberate RSVP on a
+    # shared calendar is ever wanted, add an explicit opt-in field to
+    # RespondRequest and check it here -- never widen the comparison above.
+    raise RsvpCalendarRefusedError(
+        f"Refusing to RSVP through calendar '{calendar_id}': it is not the "
+        "authenticated user's own calendar. This route always writes the "
+        "authenticated user's attendee entry, while that calendar's read "
+        "fields (calendar_rsvp_state, calendar_is_organizer) describe the "
+        "calendar itself -- so an RSVP state read there is not the entry this "
+        "would change. Send the RSVP on the authenticated user's own calendar "
+        "instead: POST /calendars/primary/events/{event_id}/respond."
+    )
+
+
+def event_to_summary(event: dict[str, Any], calendar_id: str) -> EventSummary:
+    """Convert a full event to an EventSummary: metadata plus the organizer's
+    and creator's addresses; no description, no attendee list.
+
+    The ``calendar_*`` fields are derived from Google's ``self`` flags and so
+    describe ``calendar_id`` -- the calendar this copy of the event sits on.
+    """
+    organizer = event.get("organizer")
+    creator = event.get("creator")
+    perspective = calendar_perspective(event)
 
     return EventSummary(
         id=event.get("id", ""),
         calendar_id=calendar_id,
         summary=event.get("summary", "Untitled Event"),
-        start=start_str,
-        end=end_str,
+        # A cancelled recurring-instance stub has no start/end: empty strings.
+        start=get_event_time(event.get("start")),
+        end=get_event_time(event.get("end")),
         location=event.get("location"),
-        attendee_count=len(attendees) if attendees else 0,
-        is_all_day=is_all_day,
+        # A non-dict organizer/creator reads as absent and non-dict attendee
+        # rows are skipped, rather than raising; the count uses the same
+        # definition of "attendee" as calendar_rsvp_state.
+        attendee_count=len(attendee_entries(event)),
+        is_all_day=is_all_day_event(event),
         status=event.get("status"),
         html_link=event.get("htmlLink"),
+        organizer_email=organizer.get("email") if isinstance(organizer, dict) else None,
+        creator_email=creator.get("email") if isinstance(creator, dict) else None,
+        calendar_is_organizer=perspective.is_organizer,
+        calendar_rsvp_state=perspective.rsvp_state,
     )
 
 
@@ -872,18 +1107,42 @@ async def respond_to_event(
     event_id: str,
     request: RespondRequest,
 ):
-    """RSVP to an event by setting the owner's own responseStatus.
+    """RSVP to an event by setting the authenticated user's own responseStatus.
 
-    Forwards to the proxy's dedicated /respond route, which changes only the
-    self attendee's status and sends no invitations or notifications. Valid
-    values for response_status are 'accepted', 'declined', or 'tentative'.
+    ``calendar_id`` must be the authenticated user's own calendar -- the
+    literal ``primary`` or the account's own calendar id (its address).
+    Any other calendar is refused with 400 and the request is not forwarded
+    (Brian's decision, 2026-09-04). The reason is that the two sides take
+    opposite perspectives on the same ``calendar_id``: the read fields
+    (``calendar_rsvp_state``, ``calendar_is_organizer``) describe the
+    calendar being read, while this route always writes the authenticated
+    user's own attendee entry. On a group or colleague calendar those are
+    different people, so a ``needsAction`` read there is not the entry an
+    RSVP would change. Refusing keeps read and write on one calendar, where
+    they agree. ``primary`` is accepted without any lookup; other ids are
+    compared against the account's own calendar id, read once per process
+    from GET /calendars/primary. If that read fails, the answer is 502 with
+    a message saying the ownership check could not be performed and nothing
+    was sent -- never 504 "outcome unknown" or 404, because no RSVP was
+    attempted.
 
-    Like other mutations, the proxy blocks while a human operator approves
-    the RSVP: 403 means it was rejected (or the operator never answered);
-    504 means no response before this server's timeout and the outcome is
-    unknown — verify by re-reading the event.
+    Forwards to the proxy's dedicated /respond route. The proxy resolves the
+    authenticated account's email address (from its primary calendar), finds
+    that address in the event's attendee list -- it does not trust Google's
+    ``self`` flag -- patches only that entry, and sends no invitations or
+    notifications. Valid values for response_status are 'accepted',
+    'declined', or 'tentative'.
+
+    If the authenticated user is not an attendee, the proxy answers 400
+    ("You are not an attendee of this event; cannot RSVP."), which this
+    server passes through as 400 with that message in ``error``. Like other
+    mutations, the proxy blocks while a human operator approves the RSVP:
+    403 means it was rejected (or the operator never answered); 504 means
+    no response before this server's timeout and the outcome is unknown --
+    verify by re-reading the event.
     """
     try:
+        await require_own_calendar_for_rsvp(calendar_id)
         client = get_calendar_client()
         result = await client.respond_to_event(
             calendar_id,

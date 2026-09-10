@@ -4,11 +4,23 @@ A privacy-focused FastAPI server that wraps the Google Calendar API for use with
 
 ## Overview
 
-Calendar Agent acts as an intermediary between AI orchestrators (like Claude Code) and the Google Calendar API via a proxy server. Calendar event details are processed locally; only metadata and LLM-generated summaries are returned to calling agents.
+Calendar Agent acts as an intermediary between AI orchestrators (like Claude Code) and the Google Calendar API via a proxy server. Event content is processed locally for the LLM endpoints. The list and search endpoints return `EventSummary` rows -- metadata plus the organizer's and creator's email addresses, no description and no attendee list; the single-event detail routes (`GET`/`POST`/`PUT`/`PATCH .../events/{event_id}` and `POST .../respond`) return the full Google event, including `description` and `attendees[]` with addresses (see Key Privacy Features).
 
 **Key Privacy Features:**
-- Event descriptions and details never leave the local server
-- Only metadata (IDs, dates, titles, attendee counts) is exposed to cloud services
+- The LLM endpoints (`/summarize`, `/ask-about`, `/batch-summarize`,
+  `/prepare-briefing`, ...) process event content locally and return only
+  the generated text.
+- List and search rows (`EventSummary`) expose metadata (IDs, dates,
+  titles, location, status, the Google Calendar link, attendee counts) plus
+  the **organizer's and creator's email addresses** -- and nothing else
+  about attendees: no attendee list, no attendee addresses. This is pinned
+  by tests on the `EventSummary` field set.
+- The single-event detail routes are **not** summaries: they return the
+  Google event as the proxy sent it, description and attendee addresses
+  included (see their response examples below).
+  The two addresses are included by decision (2026-09-03) because on a
+  group calendar Google makes the calendar itself the organizer, so the
+  creator's address is the only way to know which person created an event.
 - LLM processing happens locally via MLX or can use hosted APIs
 
 **Architecture:**
@@ -96,10 +108,11 @@ Every endpoint returns a body with a `success` field, and on failure an
 | Status | Meaning |
 |--------|---------|
 | `200` | The operation succeeded (`success: true`) |
+| `400` | The proxy rejected the request as malformed or not applicable, and its message is in `error` (e.g. `/respond` when the authenticated user is not an attendee of the event); also this service's own refusal to RSVP through a calendar that is not the authenticated user's own, which is not forwarded to the proxy at all |
 | `403` | The proxy blocked the operation by policy, or the human operator rejected it (mutations block in the proxy until an operator approves them) |
-| `404` | The calendar or event does not exist. When verifying a deletion this is the *expected* answer: the event is gone |
+| `404` | The calendar or event does not exist (the proxy's message is in `error`). When verifying a deletion this is the *expected* answer: the event is gone |
 | `422` | Request validation failed (FastAPI's standard `detail` body, no envelope) — nothing was sent upstream. A bulk `update`/`patch` with no `updates` payload rejects the **whole batch** this way, before any operation runs |
-| `502` | The proxy or LLM backend failed — or, on a delete, the proxy claimed success for an event that is still present on re-read |
+| `502` | The proxy or LLM backend failed; the proxy answered 401 (this service's own key was rejected) or a 4xx other than 400/403/404 (its message is in `error`); or, on a delete, the proxy claimed success for an event that is still present on re-read |
 | `504` | **The outcome is unknown**: no response before this server's timeout and the resource is still present, or the verifying re-read itself failed. A confirmation-gated mutation may still complete if approved later. Verify by re-reading the resource; never issue a compensating mutation on the strength of a `504` |
 
 Mutation envelopes (`DELETE …/events/{id}` and each `/bulk-actions` result)
@@ -142,7 +155,7 @@ Response:
   "success": true,
   "calendars": [
     {
-      "id": "primary",
+      "id": "john.doe@example.com",
       "summary": "john.doe@example.com",
       "description": "Primary calendar",
       "timeZone": "America/New_York",
@@ -166,7 +179,7 @@ Response:
 {
   "success": true,
   "calendar": {
-    "id": "primary",
+    "id": "john.doe@example.com",
     "summary": "john.doe@example.com",
     "timeZone": "America/New_York"
   }
@@ -208,13 +221,85 @@ Response:
       "location": "Conference Room A",
       "attendee_count": 5,
       "is_all_day": false,
-      "status": "confirmed"
+      "status": "confirmed",
+      "html_link": "https://www.google.com/calendar/event?eid=ZXZlbnQxMjM",
+      "organizer_email": "alice@example.com",
+      "creator_email": "alice@example.com",
+      "calendar_is_organizer": false,
+      "calendar_rsvp_state": "accepted"
     }
   ],
   "next_page_token": null,
   "error": null
 }
 ```
+
+#### Organizer and RSVP fields -- whose perspective they report
+
+**The `calendar_*` fields describe the calendar named by `calendar_id`,
+not the authenticated user.** They are computed from Google's `self` flags,
+which the Events reference defines relative to the calendar:
+`attendees[].self` is "whether this entry represents **the calendar on
+which this copy of the event appears**", and `organizer.self` is "whether
+the organizer corresponds to **the calendar on which this copy of the event
+appears**". So:
+
+- Reading your own calendar (`primary`, or your own address), they describe
+  you.
+- Reading a colleague's calendar (`GET /calendars/colleague@example.com/events`),
+  they describe **the colleague**: `calendar_rsvp_state` is *their* RSVP,
+  and `calendar_is_organizer` says whether *they* organize it. Your own RSVP
+  on that event is not reported -- it is only knowable from your own calendar.
+- Reading a group calendar, they describe the group calendar: an event
+  created directly on one has the calendar itself as organizer
+  (`organizer_email` is the calendar's id, `calendar_is_organizer` is `true`).
+  `creator_email` is then the person who created it.
+
+Fields (the authoritative per-value descriptions are the `EventSummary`
+schema in `/docs` / `/openapi.json`, generated from the code; this list is
+the short form):
+
+- `organizer_email`: the organizer's address as Google reports it. For an
+  event created on a group calendar this is the group calendar's id. `null`
+  when the event carries no organizer (e.g. a cancelled recurring-instance
+  stub -- see `status`).
+- `creator_email`: the address of the account that created the event.
+  Usually the same as `organizer_email`; differs on group calendars (above)
+  and for events moved between calendars. `null` when absent.
+- `calendar_is_organizer`: Google's `organizer.self` -- the calendar being
+  read organizes this event.
+- `calendar_rsvp_state`: the RSVP of the attendee entry Google marks `self`
+  on this copy -- the calendar's own entry -- classified so the caller never
+  has to decode a missing value. Either one of Google's four values
+  (`"accepted"`, `"declined"`, `"tentative"`, `"needsAction"`) verbatim, or
+  one of this service's own: `"organizer_no_rsvp"` (the calendar's own
+  event, nothing to answer), `"not_attendee"` (neither organizer nor
+  invited -- e.g. an event copied onto the calendar, or an invitation
+  addressed to a group), `"unknown"` (a `responseStatus` this service does
+  not recognise; or the calendar's own entry has no `responseStatus` and
+  the calendar is not the organizer; or a stub with no organizer and no
+  attendees). The raw
+  Google string is not exposed separately: it is either one of the four
+  values above or something this service cannot classify.
+- `status`: Google's event status -- `"confirmed"`, `"tentative"`, or
+  `"cancelled"`. On a plain `GET` with `single_events=false`, cancelled rows
+  are the stubs Google keeps for deleted instances of a recurring series
+  (the default `single_events=true` expansion omits them): empty
+  `start`/`end`, no organizer, no attendees, so `calendar_rsvp_state:
+  "unknown"`. `POST /search` is different: `filters.show_deleted: true`
+  forwards `showDeleted` to Google (with `singleEvents` fixed to `true`
+  there), and the cancelled rows it returns are whatever Google sends for
+  them -- possibly with real times, an organizer and attendees -- classified
+  like any other row.
+
+Only `"accepted"`, `"declined"` and `"tentative"` can be sent back to `POST
+.../respond`; a `"needsAction"` or derived state cannot be echoed to it. Note
+that the read side and `/respond` take **different perspectives**: these
+fields report the calendar's own entry, while `/respond` always writes the
+**authenticated user's** entry (matched by email address, never by the
+`self` flag). On your own calendar the two coincide; on a colleague's or
+group calendar they do not, which is why `/respond` accepts only your own
+`calendar_id` and refuses the rest -- see that endpoint's note below.
 
 ### POST /calendars/{calendar_id}/events
 
@@ -427,9 +512,40 @@ until a deletion has been observed complete.
 
 ### POST /calendars/{calendar_id}/events/{event_id}/respond
 
-RSVP to an event by setting **only your own** response status. Forwards to the
-proxy's dedicated respond route, which changes only the `self` attendee's status
-and sends no invitations or notifications.
+RSVP to an event by setting the response status of **the authenticated
+user's own** attendee entry. Forwards to the proxy's dedicated respond route,
+which reads the event, finds the authenticated account's entry in the
+attendee list **by email address** (it resolves that address from the
+account's primary calendar and does not trust Google's `self` flag), patches
+only that entry, and sends no invitations or notifications.
+
+> **`calendar_id` must be your own calendar.** The route accepts the literal
+> `primary` (any capitalisation) and the authenticated account's own calendar
+> id (its address), and refuses anything else with **`400`**; the RSVP is not
+> forwarded. The one proxy call a non-`primary` id does make is the identity
+> lookup described below.
+>
+> **Why.** Whose RSVP this route changes is always the authenticated user's
+> -- the account the proxy holds credentials for. That is the opposite
+> perspective from the read side, where `calendar_rsvp_state` and
+> `calendar_is_organizer` describe *the calendar being read*. On a group or
+> colleague calendar those are two different attendee entries, so a
+> `"needsAction"` read there says nothing about the entry an RSVP would
+> write -- a read-then-respond loop across calendars answers on the strength
+> of a state that was about someone else. Refusing keeps reading and
+> answering on one calendar, where the two agree. `primary` is accepted with
+> no lookup; any other id is compared against the account's own calendar id,
+> which this service reads once per process from `GET /calendars/primary`
+> (cached for the life of the process, so the read happens on the first
+> non-`primary` RSVP after a start). If that lookup fails -- timeout, 404, 403
+> or any other proxy error -- the route answers **`502`** with a message
+> saying the ownership check could not be performed, and nothing is sent: not
+> `504` outcome-unknown and not `404`, because no RSVP was attempted.
+>
+> If the authenticated user is not an attendee, the proxy answers
+> `400 You are not an attendee of this event; cannot RSVP.` This service
+> passes that through as **`400`** with the proxy's message in `error` (see
+> Error Responses for which proxy statuses pass through and which map to 502).
 
 Request body:
 - `response_status` (string): one of `accepted`, `declined`, `tentative`
@@ -450,7 +566,23 @@ Response:
       {"email": "you@example.com", "responseStatus": "accepted", "self": true}
     ]
   },
-  "error": null
+  "error": null,
+  "warnings": []
+}
+```
+
+On any other calendar -- a colleague's, or a group calendar such as
+`POST /calendars/team_calendar@group.calendar.google.com/events/event123/respond`
+-- the RSVP is refused with `400` and is not forwarded. The proxy sees only
+the `GET /calendars/primary` identity lookup the check needs (once per
+process); if that lookup fails the answer is `502` with nothing sent, rather
+than the refusal below:
+```json
+{
+  "success": false,
+  "event": null,
+  "error": "Refusing to RSVP through calendar 'team_calendar@group.calendar.google.com': it is not the authenticated user's own calendar. This route always writes the authenticated user's attendee entry, while that calendar's read fields (calendar_rsvp_state, calendar_is_organizer) describe the calendar itself -- so an RSVP state read there is not the entry this would change. Send the RSVP on the authenticated user's own calendar instead: POST /calendars/primary/events/{event_id}/respond.",
+  "warnings": []
 }
 ```
 
@@ -658,7 +790,13 @@ Response:
 
 ### POST /search
 
-Search events in a calendar with structured filters.
+Search events in a calendar with structured filters. `filters` accepts
+`query`, `time_min`, `time_max`, `max_results` (1-500, default 100),
+`order_by` (`startTime` or `updated`) and `show_deleted` (default `false`;
+forwards Google's `showDeleted`, so cancelled events come back as
+`status: "cancelled"` rows with whatever fields Google sends for them --
+see `status` under `GET /calendars/{calendar_id}/events`). Recurring events
+are always expanded (`singleEvents=true`).
 
 ```bash
 curl -X POST http://localhost:8082/search \
@@ -687,7 +825,12 @@ Response:
       "start": "2024-01-20T14:00:00Z",
       "end": "2024-01-20T15:00:00Z",
       "attendee_count": 8,
-      "is_all_day": false
+      "is_all_day": false,
+      "status": "confirmed",
+      "organizer_email": "john.doe@example.com",
+      "creator_email": "john.doe@example.com",
+      "calendar_is_organizer": true,
+      "calendar_rsvp_state": "organizer_no_rsvp"
     }
   ],
   "next_page_token": null,

@@ -6,12 +6,14 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from calendar_agent.calendar_server import EventSummary, app, event_to_summary
 from calendar_agent.exceptions import (
     ProxyAuthError,
     ProxyConfigError,
     ProxyError,
     ProxyForbiddenError,
     ProxyNotFoundError,
+    ProxyRequestError,
     ProxyTimeoutError,
 )
 from calendar_agent.proxy_client import (
@@ -22,6 +24,15 @@ from calendar_agent.proxy_client import (
     CalendarProxyClient,
     resolve_confirm_timeout,
     resolve_confirmation_window,
+)
+from tests.factories import (
+    AUTH_USER_EMAIL,
+    CANCELLED_STUB,
+    COLLEAGUE_EMAIL,
+    GROUP_CALENDAR_ID,
+    SAMPLE_EVENTS,
+    colleague_copy,
+    get_sample_event,
 )
 
 # ============================================================================
@@ -62,7 +73,7 @@ class TestCalendarsEndpoint:
         data = response.json()
         assert data["success"] is True
         assert len(data["calendars"]) == 3
-        assert data["calendars"][0]["id"] == "primary"
+        assert data["calendars"][0]["id"] == AUTH_USER_EMAIL
 
     def test_list_calendars_empty(self, client, mock_proxy_client):
         """List calendars handles empty list."""
@@ -96,7 +107,7 @@ class TestCalendarsEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["calendar"]["id"] == "primary"
+        assert data["calendar"]["id"] == AUTH_USER_EMAIL
 
     def test_get_calendar_not_found(self, client, mock_proxy_client):
         """Get calendar handles not found."""
@@ -109,6 +120,169 @@ class TestCalendarsEndpoint:
 # ============================================================================
 # Event CRUD Endpoint Tests
 # ============================================================================
+
+
+class TestEventToSummary:
+    """event_to_summary(): organizer exposure and RSVP state (issue #9).
+
+    Google defines ``attendees[].self`` / ``organizer.self`` relative to the
+    calendar the event copy sits on, so every ``calendar_*`` field describes
+    the calendar named by ``calendar_id`` -- which is the authenticated user
+    only when that calendar is the user's own.
+    """
+
+    def test_self_flags_describe_the_calendar_being_read(self):
+        summary = event_to_summary(colleague_copy(), COLLEAGUE_EMAIL)
+        assert summary.calendar_id == COLLEAGUE_EMAIL
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_rsvp_state == "accepted"  # Carol's RSVP, not john.doe@'s
+        assert summary.organizer_email == "dave@example.com"
+        assert summary.creator_email == "dave@example.com"
+
+    def test_summary_field_set_is_exactly_the_documented_one(self):
+        """Pins the README's Key Privacy Features claim for list/search rows:
+        these fields and no others -- in particular no description and no
+        attendee list. Adding a field here is a documentation change too."""
+        expected = {
+            "id",
+            "calendar_id",
+            "summary",
+            "start",
+            "end",
+            "location",
+            "attendee_count",
+            "is_all_day",
+            "status",
+            "html_link",
+            "organizer_email",
+            "creator_email",
+            "calendar_is_organizer",
+            "calendar_rsvp_state",
+        }
+        assert set(EventSummary.model_fields) == expected
+
+    def test_no_field_claims_to_be_the_authenticated_users_rsvp(self):
+        """The old contract (is_organizer / response_status "of the
+        authenticated user") is gone: nothing on the wire is named as if it
+        described the caller rather than the calendar."""
+        dumped = event_to_summary(colleague_copy(), COLLEAGUE_EMAIL).model_dump()
+        assert "is_organizer" not in dumped
+        assert "response_status" not in dumped
+        assert "calendar_response_status" not in dumped  # dropped in round 3 (redundant)
+        assert not any(k.startswith("user_") for k in dumped)
+
+    def test_perspective_fields_are_required_in_the_openapi_schema(self):
+        """Both perspective fields are always emitted, so the schema must not
+        mark either optional (finding 15, round 3)."""
+        schema = app.openapi()["components"]["schemas"]["EventSummary"]
+        assert {"calendar_is_organizer", "calendar_rsvp_state"} <= set(schema["required"])
+        assert "calendar_response_status" not in schema["properties"]
+
+    def test_malformed_organizer_or_attendees_degrade_instead_of_raising(self):
+        """Finding 8 (round 3): a non-dict organizer/creator or attendee row
+        reads as absent instead of raising. Only these fields are guarded;
+        a malformed start/end or summary is not."""
+        event = get_sample_event()
+        event["organizer"] = "dave@example.com"
+        event["creator"] = ["dave@example.com"]
+        event["attendees"] = [None, "bob@example.com"]
+        summary = event_to_summary(event, "primary")
+        assert summary.organizer_email is None
+        assert summary.creator_email is None
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_rsvp_state == "unknown"
+        # attendee_count agrees with the perspective: the non-dict rows are
+        # not attendees, so the count is 0, not 2 (finding 7, round 4).
+        assert summary.attendee_count == 0
+        event["attendees"] = "not-a-list"
+        assert event_to_summary(event, "primary").attendee_count == 0
+
+    def test_pending_invitation_on_own_calendar(self):
+        event = get_sample_event(
+            organizer={"email": "dave@example.com", "self": False},
+            attendees=[{"email": AUTH_USER_EMAIL, "self": True, "responseStatus": "needsAction"}],
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_rsvp_state == "needsAction"
+
+    def test_own_event_with_attendees_but_no_own_entry(self):
+        """The dangerous null from issue #9: the calendar organizes, others
+        are invited, the calendar has no attendee entry of its own. Reads as
+        the calendar's own event, not an unanswered invitation."""
+        event = get_sample_event(
+            organizer={"email": AUTH_USER_EMAIL, "self": True},
+            creator={"email": AUTH_USER_EMAIL, "self": True},
+            attendees=[
+                {"email": "alice@example.com", "responseStatus": "accepted"},
+                {"email": "bob@example.com", "responseStatus": "needsAction"},
+            ],
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.attendee_count == 2
+        assert summary.calendar_is_organizer is True
+        assert summary.calendar_rsvp_state == "organizer_no_rsvp"
+
+    def test_group_calendar_native_event_names_the_calendar_and_the_creator(self):
+        """An event created directly on a group calendar: Google makes the
+        calendar itself the organizer (email == calendar id, self:true); the
+        person who created it is only in ``creator``."""
+        group = "abc123@group.calendar.google.com"
+        event = get_sample_event(
+            organizer={"email": group, "displayName": "Team Calendar", "self": True},
+            creator={"email": AUTH_USER_EMAIL},
+            attendees=None,
+        )
+        summary = event_to_summary(event, group)
+        assert summary.attendee_count == 0
+        assert summary.calendar_is_organizer is True
+        assert summary.calendar_rsvp_state == "organizer_no_rsvp"
+        assert summary.organizer_email == group
+        assert summary.creator_email == AUTH_USER_EMAIL
+
+    def test_calendar_neither_organizes_nor_attends(self):
+        event = get_sample_event(
+            organizer={"email": "dave@example.com", "self": False},
+            attendees=[{"email": "alice@example.com", "responseStatus": "accepted"}],
+        )
+        summary = event_to_summary(event, "primary")
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_rsvp_state == "not_attendee"
+
+    def test_cancelled_recurring_stub_is_unknown_not_own_event(self):
+        event = get_sample_event(status="cancelled", with_times=False)
+        summary = event_to_summary(event, "primary")
+        assert summary.status == "cancelled"
+        assert summary.attendee_count == 0
+        assert summary.calendar_is_organizer is False
+        assert summary.calendar_rsvp_state == "unknown"
+        assert summary.organizer_email is None
+        assert summary.creator_email is None
+
+    def test_bare_cancelled_stub_with_no_start_or_end(self):
+        """The real shape of a deleted recurring instance: no start, no end,
+        no summary (finding 5, round 4). Empty times, not all-day, not a
+        crash."""
+        summary = event_to_summary(CANCELLED_STUB, "primary")
+        assert summary.id == CANCELLED_STUB["id"]
+        assert summary.status == "cancelled"
+        assert summary.start == ""
+        assert summary.end == ""
+        assert summary.is_all_day is False
+        assert summary.summary == "Untitled Event"
+        assert summary.calendar_rsvp_state == "unknown"
+
+    def test_attendee_addresses_are_not_on_the_wire(self):
+        """Brian's 2026-09-03 decision: organizer and creator addresses are
+        exposed; the attendee list is still only a count."""
+        event = colleague_copy()
+        # Guard the assertion below against a fixture drift that would make
+        # it vacuous: the address must really be in the attendee list.
+        assert any(a["email"] == AUTH_USER_EMAIL for a in event["attendees"])
+        dumped = event_to_summary(event, COLLEAGUE_EMAIL).model_dump_json()
+        assert COLLEAGUE_EMAIL in dumped  # it is the calendar_id
+        assert AUTH_USER_EMAIL not in dumped
+        assert "attendees" not in dumped
 
 
 class TestEventsListEndpoint:
@@ -146,6 +320,43 @@ class TestEventsListEndpoint:
         call_kwargs = mock_proxy_client.list_events.call_args.kwargs
         assert call_kwargs["single_events"] is True
 
+    def test_list_event_without_attendees_counts_zero(self, client, mock_proxy_client):
+        """An event with no attendees key is a count of 0 on the wire, not an
+        error and not a phantom count (finding 9, round 3)."""
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["all_day_event"]]}
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 200
+        assert response.json()["events"][0]["attendee_count"] == 0
+
+    def test_list_survives_a_malformed_event_row(self, client, mock_proxy_client):
+        """A row with a non-dict organizer and a non-dict attendee entry is
+        served as null/unknown rather than 500ing the page (finding 8,
+        round 3). Only organizer, creator and attendee rows are guarded."""
+        bad = {
+            **SAMPLE_EVENTS["basic_meeting"],
+            "organizer": "dave@example.com",
+            "attendees": [None],
+        }
+        mock_proxy_client.list_events.return_value = {"items": [bad]}
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert len(data["events"]) == 1
+        assert data["events"][0]["calendar_rsvp_state"] == "unknown"
+        assert data["events"][0]["attendee_count"] == 0
+
+    def test_list_serves_a_bare_cancelled_stub(self, client, mock_proxy_client):
+        """A plain GET with single_events=false returns stubs without
+        start/end; the page must still be 200 (finding 5, round 4)."""
+        mock_proxy_client.list_events.return_value = {"items": [CANCELLED_STUB]}
+        response = client.get("/calendars/primary/events", params={"single_events": "false"})
+        assert response.status_code == 200
+        row = response.json()["events"][0]
+        assert row["status"] == "cancelled"
+        assert row["start"] == "" and row["end"] == ""
+        assert row["is_all_day"] is False
+
     def test_list_events_empty(self, client, mock_proxy_client):
         """List events handles empty results."""
         mock_proxy_client.list_events.return_value = {"items": []}
@@ -163,6 +374,55 @@ class TestEventsListEndpoint:
         response = client.get("/calendars/primary/events")
         data = response.json()
         assert data["next_page_token"] == "next_page_123"
+
+
+class TestRsvpFieldsOnTheWire:
+    """The organizer/RSVP fields as list and search actually emit them."""
+
+    def test_list_on_primary(self, client, mock_proxy_client):
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["invitation"]]}
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 200
+        event = response.json()["events"][0]
+        assert event["organizer_email"] == "dave@example.com"
+        assert event["creator_email"] == "dave@example.com"
+        assert event["calendar_is_organizer"] is False
+        assert event["calendar_rsvp_state"] == "needsAction"
+        assert event["status"] == "confirmed"
+        assert "is_organizer" not in event
+        assert "response_status" not in event
+        assert "calendar_response_status" not in event
+
+    def test_list_on_colleague_calendar_reports_the_colleagues_rsvp(
+        self, client, mock_proxy_client
+    ):
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["colleague_copy"]]}
+        response = client.get("/calendars/carol@example.com/events")
+        assert response.status_code == 200
+        event = response.json()["events"][0]
+        assert event["calendar_id"] == "carol@example.com"
+        assert event["calendar_rsvp_state"] == "accepted"  # Carol's, not john.doe's "declined"
+        assert not any(k.startswith("user_") for k in event)
+
+    def test_search_on_colleague_calendar_reports_the_colleagues_rsvp(
+        self, client, mock_proxy_client
+    ):
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["colleague_copy"]]}
+        response = client.post(
+            "/search", json={"calendar_id": "carol@example.com", "filters": {"query": "Budget"}}
+        )
+        assert response.status_code == 200
+        event = response.json()["events"][0]
+        assert event["calendar_is_organizer"] is False
+        assert event["calendar_rsvp_state"] == "accepted"
+
+    def test_read_needs_no_extra_proxy_call(self, client, mock_proxy_client):
+        """Deriving the calendar's perspective is local: one proxy call per
+        list, nothing to resolve the caller's identity."""
+        mock_proxy_client.list_events.return_value = {"items": [SAMPLE_EVENTS["colleague_copy"]]}
+        assert client.get("/calendars/carol@example.com/events").status_code == 200
+        assert mock_proxy_client.list_events.await_count == 1
+        assert mock_proxy_client.get_calendar.await_count == 0
 
 
 class TestEventCreateEndpoint:
@@ -223,6 +483,22 @@ class TestEventGetEndpoint:
         data = response.json()
         assert data["success"] is True
         assert data["event"]["id"] == "meeting_001"
+
+    def test_get_event_returns_the_full_google_event(self, client, mock_proxy_client):
+        """The detail route is not a summary: description and the attendee
+        list with addresses come back as the proxy sent them (the README's
+        privacy section says exactly this)."""
+        mock_proxy_client.get_event.return_value = SAMPLE_EVENTS["invitation"]
+        event = client.get("/calendars/primary/events/invite_001").json()["event"]
+        assert event["description"] == "Quarterly budget walkthrough"
+        assert any(a["email"] == AUTH_USER_EMAIL for a in event["attendees"])
+
+    def test_get_event_detail_has_empty_warnings(self, client, mock_proxy_client):
+        """`warnings` is on every EventDetailResponse (added for /respond);
+        the other detail routes emit an empty list."""
+        response = client.get("/calendars/primary/events/event_123")
+        assert response.status_code == 200
+        assert response.json()["warnings"] == []
 
     def test_get_event_with_timezone(self, client, mock_proxy_client):
         """Get event with timezone parameter."""
@@ -386,6 +662,207 @@ class TestEventRespondEndpoint:
         assert data["event"]["id"] == "e1"
         mock_proxy_client.respond_to_event.assert_called_once_with("primary", "e1", "accepted")
 
+    def test_respond_on_primary_carries_no_warning(self, client, mock_proxy_client):
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["warnings"] == []
+
+    def test_respond_error_envelope_has_no_warnings(self, client, mock_proxy_client):
+        mock_proxy_client.respond_to_event.side_effect = ProxyForbiddenError("blocked")
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["warnings"] == []
+
+
+class TestEventRespondRefusesForeignCalendars:
+    """POST .../respond refuses any calendar_id that is not the authenticated
+    user's own (Brian's decision, 2026-09-04).
+
+    The read fields describe the calendar being read; /respond always writes
+    the authenticated user's entry. Refusing keeps the two on the same
+    calendar, where they agree.
+    """
+
+    def test_refuses_a_group_calendar_id(self, client, mock_proxy_client):
+        """A group calendar is never the authenticated account's own."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{GROUP_CALENDAR_ID}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["success"] is False
+        assert GROUP_CALENDAR_ID in data["error"]
+        assert "primary" in data["error"]
+        mock_proxy_client.respond_to_event.assert_not_called()
+
+    def test_refuses_a_colleagues_address(self, client, mock_proxy_client):
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{COLLEAGUE_EMAIL}/events/invite_001/respond",
+            json={"response_status": "declined"},
+        )
+        assert resp.status_code == 400
+        assert COLLEAGUE_EMAIL in resp.json()["error"]
+        mock_proxy_client.respond_to_event.assert_not_called()
+
+    def test_refusal_envelope_has_no_event_and_no_warnings(self, client, mock_proxy_client):
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{COLLEAGUE_EMAIL}/events/invite_001/respond",
+            json={"response_status": "declined"},
+        )
+        assert resp.json()["event"] is None
+        assert resp.json()["warnings"] == []
+
+    def test_allows_the_literal_primary_without_resolving_an_address(
+        self, client, mock_proxy_client
+    ):
+        """'primary' needs no identity lookup, so the common path costs no
+        extra proxy call."""
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert mock_proxy_client.get_calendar.await_count == 0
+
+    def test_literal_primary_is_matched_case_insensitively(self, client, mock_proxy_client):
+        """'Primary' takes the same no-lookup fast path as 'primary': the
+        address comparison already casefolds, so the literal must too
+        (Opus delta review, finding 2)."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            "/calendars/Primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert mock_proxy_client.get_calendar.await_count == 0
+
+    def test_allows_the_authenticated_users_own_address(self, client, mock_proxy_client):
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        mock_proxy_client.respond_to_event.assert_called_once_with(
+            AUTH_USER_EMAIL, "invite_001", "accepted"
+        )
+
+    def test_own_address_matches_case_insensitively(self, client, mock_proxy_client):
+        """Google lowercases calendar ids; a caller's capitalisation must not
+        turn an allowed RSVP into a refusal."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL.upper()}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
+    def test_resolves_the_authenticated_address_once_per_process(
+        self, client, mock_proxy_client
+    ):
+        """The identity lookup is cached: two RSVPs, one GET /calendars/primary."""
+        mock_proxy_client.get_calendar.return_value = {"id": AUTH_USER_EMAIL}
+        for _ in range(2):
+            client.post(
+                f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+                json={"response_status": "accepted"},
+            )
+        assert mock_proxy_client.get_calendar.await_count == 1
+
+    def test_unresolvable_identity_is_an_upstream_failure_not_a_refusal(
+        self, client, mock_proxy_client
+    ):
+        """If the proxy's primary calendar carries no id there is nothing to
+        compare against: 502, and the RSVP is not forwarded."""
+        mock_proxy_client.get_calendar.return_value = {"summary": "no id here"}
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        assert resp.json()["success"] is False
+        mock_proxy_client.respond_to_event.assert_not_called()
+
+    def test_identity_lookup_timeout_is_an_upstream_failure_not_an_unknown_outcome(
+        self, client, mock_proxy_client
+    ):
+        """A read timeout on GET /calendars/primary happens before anything is
+        sent, so it must not be reported as a mutation whose outcome is
+        unknown (Opus delta review, finding 1): 502, the message says the
+        ownership check could not be performed, and no RSVP is forwarded."""
+        mock_proxy_client.get_calendar.side_effect = ProxyTimeoutError(
+            "No response from proxy after 30s"
+        )
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        data = resp.json()
+        assert data["success"] is False
+        assert "Outcome unknown" not in data["error"]
+        assert "ownership check" in data["error"]
+        assert "nothing was sent" in data["error"]
+        mock_proxy_client.respond_to_event.assert_not_awaited()
+
+    def test_identity_lookup_not_found_is_an_upstream_failure_not_a_404(
+        self, client, mock_proxy_client
+    ):
+        """A 404 on GET /calendars/primary is not "no such event": the URL
+        names an event this route never looked at. 502, nothing sent."""
+        mock_proxy_client.get_calendar.side_effect = ProxyNotFoundError(
+            "Calendar not found"
+        )
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        assert resp.json()["success"] is False
+        assert "ownership check" in resp.json()["error"]
+        mock_proxy_client.respond_to_event.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "lookup_failure",
+        [
+            ProxyForbiddenError("blocked"),
+            ProxyRequestError(429, "slow down"),
+            ProxyAuthError("bad key"),
+            ProxyError("connection refused"),
+        ],
+        ids=["forbidden", "other-4xx", "auth", "generic"],
+    )
+    def test_any_identity_lookup_failure_is_502_with_nothing_sent(
+        self, client, mock_proxy_client, lookup_failure
+    ):
+        """Pins the documented guarantee: whatever the proxy does to the
+        identity read, the caller sees 502 and no RSVP was attempted. A
+        forbidden here would otherwise read as "the operator rejected your
+        RSVP" for a read no operator ever saw."""
+        mock_proxy_client.get_calendar.side_effect = lookup_failure
+        resp = client.post(
+            f"/calendars/{AUTH_USER_EMAIL}/events/invite_001/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 502
+        assert resp.json()["success"] is False
+        assert "nothing was sent" in resp.json()["error"]
+        mock_proxy_client.respond_to_event.assert_not_awaited()
+
     def test_respond_invalid_status_rejected(self, client, mock_proxy_client):
         """Values outside accepted/declined/tentative are rejected with 422."""
         resp = client.post(
@@ -420,6 +897,21 @@ class TestEventRespondEndpoint:
         data = resp.json()
         assert data["success"] is False
         assert "Outcome unknown" in data["error"]
+
+    def test_respond_not_an_attendee_passes_the_proxys_400_through(self, client, mock_proxy_client):
+        """The proxy's 400 ("not an attendee") reaches the caller as 400 with
+        the proxy's message in ``error`` (finding 3, round 4) -- not 502."""
+        mock_proxy_client.respond_to_event.side_effect = ProxyRequestError(
+            400, "You are not an attendee of this event; cannot RSVP."
+        )
+        resp = client.post(
+            "/calendars/primary/events/e1/respond",
+            json={"response_status": "accepted"},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["success"] is False
+        assert "You are not an attendee of this event; cannot RSVP." in data["error"]
 
 
 # ============================================================================
@@ -603,6 +1095,48 @@ class TestProxyClientTimeouts:
                 await client.get_event("primary", "e1")
         assert not isinstance(exc_info.value, ProxyTimeoutError)
         assert "Proxy connection failed" in str(exc_info.value)
+
+
+class TestProxyClientRequestErrors:
+    """A proxy 4xx other than 401/403/404/410 raises ProxyRequestError carrying
+    the upstream status and message (finding 3, round 4). 404 and 410 stay
+    ProxyNotFoundError, which delete verification depends on (issue #4)."""
+
+    def _response(self, status: int, detail: str):
+        r = AsyncMock(spec=httpx.Response)
+        r.status_code = status
+        r.json.return_value = {"detail": detail}
+        return r
+
+    def test_400_carries_status_and_message(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyRequestError) as exc_info:
+            client._handle_response(
+                self._response(400, "You are not an attendee of this event; cannot RSVP.")
+            )
+        assert exc_info.value.status_code == 400
+        assert str(exc_info.value) == "You are not an attendee of this event; cannot RSVP."
+
+    def test_404_is_not_found_error_not_request_error(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyNotFoundError) as exc_info:
+            client._handle_response(self._response(404, "Not Found"))
+        assert not isinstance(exc_info.value, ProxyRequestError)
+        assert str(exc_info.value) == "Not Found"
+
+    def test_other_4xx_is_still_a_request_error(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyRequestError) as exc_info:
+            client._handle_response(self._response(409, "conflict"))
+        assert exc_info.value.status_code == 409
+        assert isinstance(exc_info.value, ProxyError)
+
+    def test_401_and_403_keep_their_own_types(self):
+        client = CalendarProxyClient(proxy_url="http://proxy", api_key="k")
+        with pytest.raises(ProxyAuthError):
+            client._handle_response(self._response(401, "bad key"))
+        with pytest.raises(ProxyForbiddenError):
+            client._handle_response(self._response(403, "rejected"))
 
 
 # ============================================================================
@@ -880,6 +1414,29 @@ class TestSearchEndpoint:
         response = client.post("/search", json=request_data)
         assert response.status_code == 200
 
+    def test_search_show_deleted_forwards_and_classifies_cancelled_rows(
+        self, client, mock_proxy_client
+    ):
+        """show_deleted is forwarded with single_events fixed to True, and a
+        cancelled row that carries organizer/attendees is classified like
+        any other row -- not blanked to 'unknown' (finding 2, round 4)."""
+        cancelled = colleague_copy()
+        cancelled["status"] = "cancelled"
+        mock_proxy_client.list_events.return_value = {"items": [cancelled]}
+        response = client.post(
+            "/search",
+            json={"calendar_id": COLLEAGUE_EMAIL, "filters": {"show_deleted": True}},
+        )
+        assert response.status_code == 200
+        kwargs = mock_proxy_client.list_events.call_args.kwargs
+        assert kwargs["show_deleted"] is True
+        assert kwargs["single_events"] is True
+        row = response.json()["events"][0]
+        assert row["status"] == "cancelled"
+        assert row["organizer_email"] == "dave@example.com"
+        assert row["calendar_rsvp_state"] == "accepted"
+        assert row["start"] != ""
+
     def test_search_default_filters(self, client, mock_proxy_client):
         """Search with default filters."""
         request_data = {
@@ -1014,6 +1571,35 @@ class TestProxyErrorHandling:
         data = response.json()
         assert data["success"] is False
         assert "Proxy error" in data["error"]
+
+    def test_proxy_404_passes_message_through_as_404(self, client, mock_proxy_client):
+        mock_proxy_client.get_event.side_effect = ProxyNotFoundError("Not Found")
+        response = client.get("/calendars/primary/events/nope")
+        assert response.status_code == 404
+        data = response.json()
+        assert data["success"] is False
+        assert "Not Found" in data["error"]
+
+    def test_proxy_400_passes_through_as_400(self, client, mock_proxy_client):
+        mock_proxy_client.list_events.side_effect = ProxyRequestError(400, "Bad Request")
+        response = client.get("/calendars/primary/events")
+        assert response.status_code == 400
+        assert response.json()["success"] is False
+
+    def test_other_proxy_4xx_still_maps_to_502(self, client, mock_proxy_client):
+        """Only 400 passes through (404 is ProxyNotFoundError); any other proxy
+        4xx is still 502."""
+        mock_proxy_client.get_event.side_effect = ProxyRequestError(409, "conflict")
+        response = client.get("/calendars/primary/events/e1")
+        assert response.status_code == 502
+        assert "conflict" in response.json()["error"]
+
+    def test_proxy_401_maps_to_502(self, client, mock_proxy_client):
+        """A proxy 401 (this service's own key rejected) is an upstream
+        failure from the caller's point of view: 502, not 401."""
+        mock_proxy_client.get_event.side_effect = ProxyAuthError("Invalid API key")
+        response = client.get("/calendars/primary/events/e1")
+        assert response.status_code == 502
 
 
 # ============================================================================

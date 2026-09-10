@@ -193,3 +193,34 @@ class TestLLMServiceWithApiKey:
 
         mock_provider.generate.assert_called_once()
         assert "summary" in result
+
+
+class TestPrepareBriefingAttendeeCount:
+    """The briefing prompt counts attendees the same way the API does:
+    non-dict rows are not attendees (finding 7, round 4)."""
+
+    async def test_non_dict_rows_are_not_counted(self):
+        mock_provider = AsyncMock()
+        mock_provider.generate.return_value = "briefing"
+        service = LLMService(provider=mock_provider)
+        event = {
+            "summary": "Standup",
+            "start": {"dateTime": "2024-01-15T10:00:00Z"},
+            "attendees": [None, {"email": "alice@example.com"}],
+        }
+        await service.prepare_briefing([event], briefing_type="daily")
+        prompt = mock_provider.generate.call_args.args[1]
+        assert "(1 attendees)" in prompt
+        assert "(2 attendees)" not in prompt
+
+    async def test_only_non_dict_rows_means_no_attendee_count(self):
+        mock_provider = AsyncMock()
+        mock_provider.generate.return_value = "briefing"
+        service = LLMService(provider=mock_provider)
+        event = {
+            "summary": "Standup",
+            "start": {"dateTime": "2024-01-15T10:00:00Z"},
+            "attendees": [None],
+        }
+        await service.prepare_briefing([event], briefing_type="daily")
+        assert "attendees)" not in mock_provider.generate.call_args.args[1]

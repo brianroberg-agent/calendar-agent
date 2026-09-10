@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-Calendar Agent is a FastAPI server that provides a privacy-focused interface between AI orchestrators and the Google Calendar API. It processes calendar data locally and returns only metadata and LLM-generated summaries to calling agents.
+Calendar Agent is a FastAPI server that provides a privacy-focused interface between AI orchestrators and the Google Calendar API. The LLM endpoints process event content locally and return generated text; the list and search endpoints return `EventSummary` rows (metadata plus the organizer's and creator's email addresses, no description, no attendee list); the single-event detail routes (`.../events/{event_id}` and `/respond`) return the full Google event, description and attendee addresses included.
 
 ## Key Architecture Decisions
 
 1. **Minimal Architecture**: Single-module design mirroring the email-agent pattern
 2. **Stateless Operations**: No database; all state lives in the Google Calendar backend
 3. **LLM Abstraction**: Provider interface allows swapping between local MLX and hosted APIs
-4. **Privacy-First**: Event content processed locally; only summaries returned to cloud
+4. **Privacy-First**: LLM processing of event content is local; list/search rows carry only metadata and the organizer/creator addresses (no description, no attendee list). The single-event detail routes return the full Google event -- keep that in mind before adding a route that fans a detail response out
 
 ## File Structure
 
@@ -77,16 +77,30 @@ uv run pytest --cov=calendar_agent  # With coverage
   it must not be folded into the generic upstream-error bucket)
 - Use `ProxyTimeoutError` when the proxy doesn't answer before the client
   timeout (outcome unknown — the mutation may still complete if approved)
+- Use `ProxyRequestError` for any other 4xx (it carries the proxy's status
+  and message; `error_status_code` passes 400 through and maps the rest to
+  502 — 404/410 never reach it, they are `ProxyNotFoundError`)
+- Use `RsvpCalendarRefusedError` when `POST .../respond` names a calendar
+  that is not the authenticated user's own (`primary` or the account's own
+  calendar id) — a local refusal: the RSVP is not forwarded;
+  `error_status_code` maps it to 400. The check itself reads
+  `GET /calendars/primary` once per process (cached) for a non-`primary` id;
+  if that read fails, `require_own_calendar_for_rsvp` re-raises it as a plain
+  `ProxyError` → 502 saying the ownership check could not be performed and
+  nothing was sent — not 504 or 404, because no RSVP was attempted
 - Use `ProxyError` for other proxy errors
 - Use `LLMError` for LLM failures
 - Always return the `{"success": false, "error": "..."}` envelope via
   `error_response(...)` so the HTTP status agrees with the body (issue #4):
-  403 forbidden/rejected, 404 absent, 504 outcome unknown, 502 upstream
-  proxy/LLM failure (or a delete the proxy claimed but the re-read
-  contradicts), 500 unexpected — never 200 for a failure. Caller errors are
-  422 from request validation (no envelope), raised *before* anything is
-  sent upstream — e.g. `BulkOperation`'s validator requiring `updates` for
-  update/patch. Nothing returns 400
+  400 passed through from a proxy 400 (`ProxyRequestError`; e.g. `/respond`
+  when the authenticated user is not an attendee) or a local RSVP calendar
+  refusal (`RsvpCalendarRefusedError`), 403 forbidden/rejected,
+  404 absent (`ProxyNotFoundError`), 504 outcome unknown, 502 upstream
+  proxy/LLM failure (including a proxy 401 or any other proxy 4xx, or a
+  delete the proxy claimed but the re-read contradicts), 500 unexpected —
+  never 200 for a failure. Caller errors are 422 from request validation
+  (no envelope), raised *before* anything is sent upstream — e.g.
+  `BulkOperation`'s validator requiring `updates` for update/patch
 - Every mutation envelope carries an `outcome` (`OperationOutcome`):
   `succeeded` / `failed` / `unknown`, plus `not_attempted` for bulk items.
   Never collapse `unknown` into `failed`: a timed-out mutation may still be
@@ -144,7 +158,7 @@ uv run pytest --cov=calendar_agent  # With coverage
 - Mock `get_calendar_client()` and `get_llm_service()` in tests
 - Use `subtests` for documentation verification tests
 - Test both success and error paths
-- Sample data is in `tests/conftest.py`
+- Sample data and event factories are in `tests/factories.py` (fixtures in `tests/conftest.py`)
 
 ## Dependencies
 

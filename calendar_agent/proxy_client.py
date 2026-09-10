@@ -14,6 +14,7 @@ from .exceptions import (
     ProxyError,
     ProxyForbiddenError,
     ProxyNotFoundError,
+    ProxyRequestError,
     ProxyTimeoutError,
 )
 
@@ -160,8 +161,11 @@ class CalendarProxyClient:
             raise ProxyError(f"Proxy server error: {message}")
 
         if response.status_code >= 400:
+            # Any other 4xx (404/410 were handled above): keep the proxy's status
+            # and message so the server can pass 400 through
+            # (calendar_server.error_status_code).
             message = self._parse_error_message(response, "Bad request")
-            raise ProxyError(f"Proxy error ({response.status_code}): {message}")
+            raise ProxyRequestError(response.status_code, message)
 
         return response.json()
 
@@ -333,10 +337,13 @@ class CalendarProxyClient:
         event_id: str,
         response_status: str,
     ) -> dict[str, Any]:
-        """RSVP to an event by setting the owner's own responseStatus.
+        """RSVP to an event as the authenticated user.
 
-        Forwards to the proxy's dedicated ``/respond`` route, which changes only
-        the self attendee's status and sends no notifications.
+        Forwards to the proxy's dedicated ``/respond`` route, which finds the
+        authenticated account's attendee entry by email address (not by
+        Google's ``self`` flag) on the ``calendar_id`` copy of the event,
+        patches only that entry and sends no notifications. The proxy
+        answers 400 when the authenticated user is not an attendee.
         """
         url = f"{self._event_url(calendar_id, event_id)}/respond"
         response = await self._send(

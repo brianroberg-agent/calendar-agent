@@ -1,8 +1,14 @@
 """Tests for calendar_utils module."""
 
 from datetime import datetime
+from typing import get_args
 
 from calendar_agent.calendar_utils import (
+    READ_RESPONSE_STATUSES,
+    RSVP_RESPONSES,
+    RsvpState,
+    attendee_entries,
+    calendar_perspective,
     find_free_slots,
     format_attendees,
     format_event_time,
@@ -14,6 +20,7 @@ from calendar_agent.calendar_utils import (
     is_all_day_event,
     parse_attendee_name,
 )
+from tests.factories import colleague_copy
 
 # ============================================================================
 # Tests for get_event_time
@@ -180,6 +187,36 @@ def test_format_attendees_none():
     assert format_attendees(None) == "No attendees"
 
 
+def test_format_attendees_skips_non_dict_rows():
+    """A non-dict row is skipped, not raised on (finding 7, round 4)."""
+    attendees = [
+        None,
+        "bob@example.com",
+        {"email": "alice@example.com", "responseStatus": "accepted"},
+    ]
+    assert format_attendees(attendees) == "alice@example.com (accepted)"
+
+
+def test_format_attendees_only_non_dict_rows_reads_as_none():
+    assert format_attendees([None]) == "No attendees"
+
+
+# ============================================================================
+# Tests for attendee_entries
+# ============================================================================
+
+
+def test_attendee_entries_keeps_only_dict_rows():
+    event = {"attendees": [None, "bob@example.com", {"email": "alice@example.com"}]}
+    assert attendee_entries(event) == [{"email": "alice@example.com"}]
+
+
+def test_attendee_entries_non_list_or_missing_is_empty():
+    assert attendee_entries({"attendees": "not-a-list"}) == []
+    assert attendee_entries({"attendees": None}) == []
+    assert attendee_entries({}) == []
+
+
 # ============================================================================
 # Tests for parse_attendee_name
 # ============================================================================
@@ -229,6 +266,11 @@ def test_is_all_day_event_no_start():
     """Test event without start field."""
     event = {}
     assert is_all_day_event(event) is False
+
+
+def test_is_all_day_event_start_none():
+    """An explicit ``start: null`` is not all-day and must not raise."""
+    assert is_all_day_event({"start": None}) is False
 
 
 # ============================================================================
@@ -414,3 +456,143 @@ def test_find_free_slots_all_day_event():
     )
     # All-day event should block the entire day
     assert len(slots) == 0
+
+
+# ============================================================================
+# Tests for the organizer / RSVP perspective helpers (issue #9)
+#
+# Google's contract (Events resource reference): ``attendees[].self`` is
+# "whether this entry represents the calendar on which this copy of the
+# event appears", and ``organizer.self`` is "whether the organizer
+# corresponds to the calendar on which this copy of the event appears".
+# So the ``self`` flags describe the CALENDAR BEING READ (``calendar_id``),
+# never the authenticated user -- the two coincide only on the user's own
+# calendar.
+# ============================================================================
+
+
+class TestCalendarPerspective:
+    def test_perspective_is_the_calendars_own_entry(self):
+        p = calendar_perspective(colleague_copy())
+        assert p.is_organizer is False
+        assert p.rsvp_state == "accepted"  # Carol's entry, not john.doe@'s "declined"
+
+    def test_calendar_organizes_with_no_attendees(self):
+        event = {"organizer": {"email": "carol@example.com", "self": True}}
+        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
+
+    def test_calendar_organizes_but_is_not_in_attendee_list(self):
+        event = {
+            "organizer": {"email": "carol@example.com", "self": True},
+            "attendees": [{"email": "alice@example.com", "responseStatus": "needsAction"}],
+        }
+        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
+
+    def test_organizer_as_attendee_without_response_status_is_organizer_no_rsvp(self):
+        # The organizer's own attendee entry exists but Google omitted the
+        # responseStatus key: still legibly "own event, no RSVP recorded".
+        event = {
+            "organizer": {"email": "carol@example.com", "self": True},
+            "attendees": [
+                {"email": "carol@example.com", "self": True, "organizer": True},
+                {"email": "alice@example.com", "responseStatus": "accepted"},
+            ],
+        }
+        assert calendar_perspective(event) == (True, "organizer_no_rsvp")
+
+    def test_organizer_with_unrecognised_own_response_status_is_unknown(self):
+        # Finding 6 (round 3): an organizer whose own entry carries a value
+        # this service does not recognise is NOT "own event, no RSVP value";
+        # there is a value, we just cannot classify it.
+        event = {
+            "organizer": {"email": "carol@example.com", "self": True},
+            "attendees": [
+                {
+                    "email": "carol@example.com",
+                    "self": True,
+                    "organizer": True,
+                    "responseStatus": "somethingNew",
+                },
+            ],
+        }
+        assert calendar_perspective(event) == (True, "unknown")
+
+    def test_organizer_as_attendee_with_status_reports_the_status(self):
+        event = {
+            "organizer": {"email": "carol@example.com", "self": True},
+            "attendees": [
+                {
+                    "email": "carol@example.com",
+                    "self": True,
+                    "organizer": True,
+                    "responseStatus": "accepted",
+                },
+            ],
+        }
+        assert calendar_perspective(event) == (True, "accepted")
+
+    def test_attendee_entry_without_response_status_is_unknown(self):
+        event = {
+            "organizer": {"email": "dave@example.com", "self": False},
+            "attendees": [{"email": "carol@example.com", "self": True}],
+        }
+        assert calendar_perspective(event) == (False, "unknown")
+
+    def test_not_organizer_and_not_attendee(self):
+        # The fourth null cause the PR's docs missed: neither organizer nor
+        # in the attendee list (e.g. an event that only appears on this
+        # calendar because it was copied or shared).
+        event = {
+            "organizer": {"email": "dave@example.com", "self": False},
+            "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
+        }
+        assert calendar_perspective(event) == (False, "not_attendee")
+
+    def test_cancelled_stub_with_no_organizer_or_attendees_is_unknown(self):
+        # A plain list with singleEvents=false returns cancelled recurring-
+        # instance stubs that carry neither organizer nor attendees; nothing
+        # to classify from.
+        assert calendar_perspective({"status": "cancelled"}) == (False, "unknown")
+
+    def test_needs_action_passes_through(self):
+        event = colleague_copy(calendar_entry_status="needsAction")
+        assert calendar_perspective(event) == (False, "needsAction")
+
+    def test_unrecognised_response_status_is_unknown(self):
+        # A value this service does not know is not an error: the derived
+        # state says "unknown" rather than raising or guessing.
+        event = colleague_copy(calendar_entry_status="somethingNew")
+        assert calendar_perspective(event) == (False, "unknown")
+
+    def test_non_string_response_status_is_unknown(self):
+        event = colleague_copy(calendar_entry_status=42)
+        assert calendar_perspective(event) == (False, "unknown")
+
+    def test_malformed_organizer_and_attendee_entries_do_not_raise(self):
+        # Finding 8 (round 3): a non-dict organizer or attendee element is
+        # not something a Google-conformant proxy sends. These two fields
+        # degrade to "nothing recognisable here" instead of raising; other
+        # malformed shapes (a non-dict start, a non-string summary) are not
+        # guarded here and will still fail the row.
+        assert calendar_perspective({"organizer": "dave@example.com"}) == (False, "unknown")
+        assert calendar_perspective({"attendees": [None, "bob@example.com"]}) == (False, "unknown")
+        assert calendar_perspective({"attendees": "not-a-list"}) == (False, "unknown")
+        event = {
+            "organizer": "dave@example.com",
+            "attendees": [None, {"email": "alice@example.com", "responseStatus": "accepted"}],
+        }
+        assert calendar_perspective(event) == (False, "not_attendee")
+
+
+class TestResponseStatusVocabularies:
+    RSVP_STATES = get_args(RsvpState)
+
+    def test_writable_subset_is_contained_in_read_domain(self):
+        assert set(RSVP_RESPONSES) < set(READ_RESPONSE_STATUSES) < set(self.RSVP_STATES)
+
+    def test_google_spellings_are_kept_verbatim(self):
+        # Keep Google's camelCase "needsAction" so the four RSVP values are
+        # exactly what the Calendar API emits; the derived states are
+        # snake_case to mark them as this service's own.
+        assert "needsAction" in READ_RESPONSE_STATUSES
+        assert {"organizer_no_rsvp", "not_attendee", "unknown"} < set(self.RSVP_STATES)

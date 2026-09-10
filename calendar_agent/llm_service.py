@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from .calendar_utils import format_event_time, get_event_summary_text
+from .calendar_utils import attendee_entries, format_event_time, get_event_summary_text
 from .exceptions import LLMError
 
 load_dotenv()
@@ -513,8 +513,7 @@ Please provide a {analysis_type} analysis of this schedule, including:
             summary = event.get("summary", "Untitled")
             time = format_event_time(event.get("start"))
             location = event.get("location", "")
-            attendees = event.get("attendees", [])
-            attendee_count = len(attendees) if attendees else 0
+            attendee_count = len(attendee_entries(event))
 
             detail = f"- {time}: {summary}"
             if location:
