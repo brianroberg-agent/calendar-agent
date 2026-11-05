@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from . import __version__
+from .auth import BearerAuthMiddleware
 from .calendar_utils import (
     READ_RESPONSE_STATUSES,
     RSVP_RESPONSES,
@@ -96,6 +97,15 @@ app = FastAPI(
     description="A privacy-focused FastAPI server for Google Calendar operations with AI agents",
     version=__version__,
     dependencies=[Depends(reject_unknown_query_params)],
+)
+
+# The token check wraps the whole application (issue #15): it runs before
+# routing, so the API documentation routes and any route added later are
+# covered, and a refused request never reaches a route, its validation, or
+# the proxy's operator-approval wait.
+app.add_middleware(
+    BearerAuthMiddleware,
+    get_settings=lambda: getattr(app.state, "auth_settings", None),
 )
 
 
