@@ -8,13 +8,17 @@ else, so a route added later is covered without anyone protecting it.
 
 import hashlib
 import hmac
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
 from starlette.responses import JSONResponse
+from starlette.routing import Match
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+logger = logging.getLogger(__name__)
 
 KEYS_ENV = "CALENDAR_AGENT_API_KEYS"
 MODE_ENV = "CALENDAR_AGENT_AUTH"
@@ -175,6 +179,39 @@ def bearer_token(authorization: list[bytes]) -> bytes | None:
     return parts[1]
 
 
+NO_ROUTE = "(no matching route)"
+_NOT_LOG_SAFE = re.compile(r"[^A-Za-z0-9.:_\-\[\]]")
+
+
+def _log_safe(value: object) -> str:
+    """A method or client address as it goes into a log line: anything but a
+    small safe alphabet becomes '?', so request text cannot forge a line."""
+    return _NOT_LOG_SAFE.sub("?", str(value))[:64]
+
+
+def route_template(scope: Scope) -> str:
+    """The path template of the route a request matches, for log lines.
+
+    The template (``/calendars/{calendar_id}/events``), not the request path:
+    the path carries calendar and event ids and is caller-controlled text.
+    A path that matches no route is reported as NO_ROUTE.
+    """
+    router = getattr(scope.get("app"), "router", None)
+    partial = None
+    for route in getattr(router, "routes", ()):
+        match, _ = route.matches(scope)
+        if match is Match.FULL:
+            return getattr(route, "path", NO_ROUTE)
+        if match is Match.PARTIAL and partial is None:
+            partial = getattr(route, "path", None)
+    return partial or NO_ROUTE
+
+
+def _client_host(scope: Scope) -> str:
+    client = scope.get("client")
+    return _log_safe(client[0]) if client else "unknown"
+
+
 class BearerAuthMiddleware:
     """Refuse any request that does not carry a configured token.
 
@@ -183,6 +220,12 @@ class BearerAuthMiddleware:
     reads no body and reaches no upstream call. ``get_settings`` is called
     per request and returns what the start-up hook loaded, or None if it
     never ran, in which case everything but the exempt paths is refused.
+
+    By mode: ``required`` refuses a request with no valid token; ``optional``
+    serves a request with no Authorization header (and logs it) but still
+    refuses a header that is present and not a configured token; ``off``
+    checks nothing. Log lines carry the caller's configured name, the
+    method, the route template and the client address; never a token.
     """
 
     def __init__(self, app: ASGIApp, get_settings, exempt_paths=EXEMPT_PATHS) -> None:
@@ -191,15 +234,53 @@ class BearerAuthMiddleware:
         self.exempt_paths = exempt_paths
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] in self.exempt_paths:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         settings: AuthSettings = self.get_settings() or FAIL_CLOSED
-        authorization = [value for name, value in scope["headers"] if name == b"authorization"]
-        token = bearer_token(authorization)
-        if token is not None and match_token(settings.keys, token) is not None:
+        if settings.mode is AuthMode.OFF or scope["path"] in self.exempt_paths:
             await self.app(scope, receive, send)
             return
+
+        method = _log_safe(scope.get("method", "?"))
+        authorization = [value for name, value in scope["headers"] if name == b"authorization"]
+        if not authorization:
+            if settings.mode is AuthMode.OPTIONAL:
+                logger.warning(
+                    "unauthenticated request served (%s=optional): method=%s route=%s client=%s",
+                    MODE_ENV,
+                    method,
+                    route_template(scope),
+                    _client_host(scope),
+                )
+                await self.app(scope, receive, send)
+                return
+            reason = "no Authorization header"
+        else:
+            token = bearer_token(authorization)
+            caller = match_token(settings.keys, token) if token is not None else None
+            if caller is not None:
+                logger.info(
+                    "authenticated request: caller=%s method=%s route=%s",
+                    caller,
+                    method,
+                    route_template(scope),
+                )
+                await self.app(scope, receive, send)
+                return
+            reason = (
+                "token not recognised"
+                if token is not None
+                else "Authorization header is not 'Bearer <token>'"
+            )
+
+        logger.warning(
+            "refused request: method=%s route=%s client=%s reason=%s",
+            method,
+            route_template(scope),
+            _client_host(scope),
+            reason,
+        )
         refusal = JSONResponse(
             {"success": False, "error": UNAUTHORIZED_MESSAGE},
             status_code=401,

@@ -4,6 +4,7 @@ These tests drive ``calendar_agent.calendar_server.app`` through a test
 client, with the proxy and the LLM mocked. Every token here is synthetic.
 """
 
+import logging
 import re
 
 import pytest
@@ -48,6 +49,35 @@ def routes_not_answering_401(client: TestClient, headers: dict[str, str]) -> set
 def anonymous_client(mock_proxy_client, mock_llm_service):
     """A client that sends no Authorization header unless a test adds one."""
     return TestClient(app)
+
+
+@pytest.fixture
+def use_settings():
+    """Swap the app's settings for the test: ``use_settings(mode, keys)``
+    goes through the real loader. The conftest fixture cleans up."""
+
+    def install(mode: str, keys: str | None = f"test-suite:{TEST_API_TOKEN}"):
+        environ = {auth.MODE_ENV: mode}
+        if keys is not None:
+            environ[auth.KEYS_ENV] = keys
+        app.state.auth_settings = auth.load_auth_settings(environ)
+
+    return install
+
+
+@pytest.fixture
+def auth_log(caplog):
+    """Everything the auth module logs, INFO and up."""
+    caplog.set_level(logging.INFO, logger="calendar_agent.auth")
+    return caplog
+
+
+def auth_records(caplog, level: int) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "calendar_agent.auth" and record.levelno == level
+    ]
 
 
 class TestRequiredMode:
@@ -240,3 +270,182 @@ class TestRefusalComesBeforeTheOperatorApprovalWait:
         response = anonymous_client.delete("/calendars/primary/events/event_1")
         assert response.status_code == 401
         assert "outcome" not in response.json()
+
+
+class TestOptionalMode:
+    def test_a_request_with_no_token_is_served(
+        self, use_settings, anonymous_client, mock_proxy_client
+    ):
+        use_settings("optional")
+        response = anonymous_client.get("/calendars")
+        assert response.status_code == 200
+        mock_proxy_client.list_calendars.assert_awaited_once()
+
+    def test_a_request_with_no_token_is_logged_once_with_method_route_and_client(
+        self, use_settings, anonymous_client, auth_log
+    ):
+        use_settings("optional")
+        anonymous_client.get("/calendars/someone@example.com/events")
+        warnings = auth_records(auth_log, logging.WARNING)
+        assert len(warnings) == 1
+        (line,) = warnings
+        assert "unauthenticated" in line
+        assert "method=GET" in line
+        assert "route=/calendars/{calendar_id}/events" in line
+        assert "client=testclient" in line
+
+    def test_the_log_names_the_route_template_not_the_ids_in_the_path(
+        self, use_settings, anonymous_client, auth_log
+    ):
+        use_settings("optional")
+        anonymous_client.get("/calendars/someone@example.com/events/synthetic-event-id")
+        assert "someone@example.com" not in auth_log.text
+        assert "synthetic-event-id" not in auth_log.text
+
+    def test_a_path_with_no_route_is_logged_without_repeating_the_path(
+        self, use_settings, anonymous_client, auth_log
+    ):
+        """The raw path is caller-controlled text (it can carry an encoded
+        newline), so it is not copied into a log line."""
+        use_settings("optional")
+        response = anonymous_client.get("/no-such-route/%0Aforged-line")
+        assert response.status_code == 404
+        (line,) = auth_records(auth_log, logging.WARNING)
+        assert "route=(no matching route)" in line
+        assert "forged-line" not in auth_log.text
+        assert "no-such-route" not in auth_log.text
+
+    def test_every_route_but_health_still_refuses_a_wrong_token(
+        self, use_settings, anonymous_client, mock_proxy_client, mock_llm_service
+    ):
+        use_settings("optional")
+        assert routes_not_answering_401(anonymous_client, WRONG) == {"/health"}
+        assert mock_proxy_client.mock_calls == []
+        assert mock_llm_service.mock_calls == []
+
+    @pytest.mark.parametrize("value", ["", "Bearer", f"Basic {TEST_API_TOKEN}", TEST_API_TOKEN])
+    def test_an_authorization_header_that_is_present_but_unusable_is_refused(
+        self, use_settings, anonymous_client, value
+    ):
+        """Only the absence of the header counts as "no token"."""
+        use_settings("optional")
+        response = anonymous_client.get("/calendars", headers={"Authorization": value})
+        assert response.status_code == 401
+
+    def test_the_right_token_is_served_and_not_logged_as_unauthenticated(
+        self, use_settings, anonymous_client, auth_log
+    ):
+        use_settings("optional")
+        assert anonymous_client.get("/calendars", headers=RIGHT).status_code == 200
+        assert auth_records(auth_log, logging.WARNING) == []
+
+    def test_health_is_served_and_not_logged(self, use_settings, anonymous_client, auth_log):
+        use_settings("optional")
+        assert anonymous_client.get("/health").status_code == 200
+        assert auth_records(auth_log, logging.WARNING) == []
+        assert auth_records(auth_log, logging.INFO) == []
+
+    def test_with_no_tokens_configured_tokenless_is_served_and_any_token_refused(
+        self, use_settings, anonymous_client
+    ):
+        use_settings("optional", keys=None)
+        assert anonymous_client.get("/calendars").status_code == 200
+        assert anonymous_client.get("/calendars", headers=RIGHT).status_code == 401
+
+
+class TestOffMode:
+    @pytest.mark.parametrize("headers", [{}, WRONG, RIGHT, {"Authorization": "garbage"}], ids=str)
+    def test_no_route_answers_401_whatever_the_request_carries(
+        self, use_settings, anonymous_client, headers
+    ):
+        use_settings("off")
+        every_route = {template for _, _, template in route_requests()}
+        assert routes_not_answering_401(anonymous_client, headers) == every_route
+
+    def test_requests_are_not_logged(self, use_settings, anonymous_client, auth_log):
+        use_settings("off")
+        anonymous_client.get("/calendars")
+        anonymous_client.get("/calendars", headers=WRONG)
+        assert auth_records(auth_log, logging.WARNING) == []
+        assert auth_records(auth_log, logging.INFO) == []
+
+
+class TestRequestLogging:
+    def test_an_authenticated_request_is_logged_with_the_callers_name(
+        self, anonymous_client, auth_log
+    ):
+        anonymous_client.get("/calendars/primary/events", headers=RIGHT)
+        (line,) = auth_records(auth_log, logging.INFO)
+        assert "caller=test-suite" in line
+        assert "method=GET" in line
+        assert "route=/calendars/{calendar_id}/events" in line
+
+    def test_the_log_names_which_of_several_callers_it_was(
+        self, use_settings, anonymous_client, auth_log
+    ):
+        other = "synthetic-token-other-0123456789abcdef"
+        use_settings("required", keys=f"test-suite:{TEST_API_TOKEN},scheduler:{other}")
+        anonymous_client.get("/calendars", headers={"Authorization": f"Bearer {other}"})
+        (line,) = auth_records(auth_log, logging.INFO)
+        assert "caller=scheduler" in line
+
+    @pytest.mark.parametrize(
+        "headers, reason",
+        [({}, "no Authorization header"), (WRONG, "token not recognised")],
+        ids=["no token", "wrong token"],
+    )
+    def test_a_refusal_is_logged_with_method_route_client_and_reason(
+        self, anonymous_client, auth_log, headers, reason
+    ):
+        anonymous_client.delete("/calendars/primary/events/event_1", headers=headers)
+        (line,) = auth_records(auth_log, logging.WARNING)
+        assert "refused" in line
+        assert "method=DELETE" in line
+        assert "route=/calendars/{calendar_id}/events/{event_id}" in line
+        assert "client=testclient" in line
+        assert reason in line
+
+
+class TestNoTokenTextAnywhere:
+    @pytest.mark.parametrize("mode", ["required", "optional", "off"])
+    def test_no_token_appears_in_a_log_line_or_a_response(
+        self, use_settings, anonymous_client, auth_log, mode
+    ):
+        """Right token, wrong token, no token and malformed headers, in each
+        mode, against a read, a mutation, an unknown path and /health:
+        neither the configured token nor the presented one is in any captured
+        log record (all loggers, DEBUG up) or any response body or header."""
+        auth_log.set_level(logging.DEBUG)
+        use_settings(mode)
+        presented = [
+            {},
+            RIGHT,
+            WRONG,
+            {"Authorization": f"Basic {WRONG_TOKEN}"},
+            {"Authorization": f"Bearer {TEST_API_TOKEN} {WRONG_TOKEN}"},
+            {"Authorization": WRONG_TOKEN},
+        ]
+        requests = [
+            ("GET", "/calendars"),
+            ("DELETE", "/calendars/primary/events/event_1"),
+            ("GET", "/no-such-route"),
+            ("GET", "/health"),
+            ("GET", "/openapi.json"),
+        ]
+        responses = [
+            anonymous_client.request(method, path, headers=headers)
+            for headers in presented
+            for method, path in requests
+        ]
+        if mode != "off":  # `off` logs nothing per request
+            assert any(record.name == "calendar_agent.auth" for record in auth_log.records), (
+                "the auth module logged nothing, so this would prove nothing about it"
+            )
+        for secret in (TEST_API_TOKEN, WRONG_TOKEN):
+            assert secret not in auth_log.text
+            for record in auth_log.records:
+                assert secret not in record.getMessage()
+                assert secret not in repr(record.args)
+            for response in responses:
+                assert secret not in response.text
+                assert secret not in repr(response.headers)
