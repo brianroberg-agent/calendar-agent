@@ -235,7 +235,7 @@ uv run uvicorn calendar_agent.calendar_server:app --host 0.0.0.0 --port 8082
 
 The server will be available at `http://localhost:8082`. API documentation is at `http://localhost:8082/docs`; the documentation routes need the token like any other route (see [Authentication](#authentication)), and a browser does not send one, so fetch `/openapi.json` with the header instead. The OpenAPI document declares the bearer scheme.
 
-The request examples below read the token from the shell variable `CALENDAR_AGENT_API_KEY`.
+The request examples below read the token from the shell variable `CALENDAR_AGENT_API_KEY`. They are for interactive use: the ones that send the token put it on `curl`'s command line, which other processes on the machine can read. A script should pass the header on standard input instead, as `scripts/calendar-delete-event.sh` does: `printf 'Authorization: Bearer %s\n' "$CALENDAR_AGENT_API_KEY" | curl -H @- …`.
 
 ## API Endpoints
 
