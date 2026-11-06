@@ -130,7 +130,9 @@ Each caller has its own name and token, so one caller's token can be replaced
 without touching the others. The name is what the log shows for that caller;
 the token is not logged. Checked when the server starts:
 
-- a name is made of letters, digits, `.`, `_` and `-`, and is not used twice;
+- a name is 1 to 31 characters of letters, digits, `.`, `_` and `-`, and is
+  not used twice (31 is one less than the shortest token, so a token pasted
+  into the name slot is refused rather than logged as a caller's name);
 - a token is at least 32 characters, made of the characters a Bearer header
   can carry (letters, digits, `-`, `.`, `_`, `~`, `+`, `/`, and `=` at the
   end), and is not used twice.

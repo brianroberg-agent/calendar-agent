@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 KEYS_ENV = "CALENDAR_AGENT_API_KEYS"
 MODE_ENV = "CALENDAR_AGENT_AUTH"
 MIN_TOKEN_LENGTH = 32
+# One less than the shortest token, so a token pasted into the name slot is
+# refused instead of becoming a name that every caller log line prints.
+MAX_NAME_LENGTH = MIN_TOKEN_LENGTH - 1
 # The paths exempt from the check. Compared with the request path exactly;
 # tests/test_auth_routes.py fails if this grows.
 EXEMPT_PATHS = frozenset({"/health"})
@@ -70,9 +73,10 @@ def parse_api_keys(raw: str | None) -> tuple[ApiKey, ...]:
     """Parse ``name:token`` pairs, comma-separated. Unset or blank is no keys.
 
     Raises AuthConfigError for an entry that is not ``name:token``, a name
-    outside letters/digits/``.``/``_``/``-``, a token that is empty, shorter
-    than MIN_TOKEN_LENGTH or not sendable in a Bearer header, and for a name
-    or a token that appears twice.
+    outside letters/digits/``.``/``_``/``-`` or longer than MAX_NAME_LENGTH
+    characters, a token that is empty, shorter than MIN_TOKEN_LENGTH or not
+    sendable in a Bearer header, and for a name or a token that appears
+    twice.
     """
     keys: list[ApiKey] = []
     positions: dict[str, int] = {}
@@ -88,6 +92,8 @@ def parse_api_keys(raw: str | None) -> tuple[ApiKey, ...]:
             raise _bad_keys(
                 position, "has a name with characters other than letters, digits, '.', '_', '-'"
             )
+        if len(name) > MAX_NAME_LENGTH:
+            raise _bad_keys(position, f"has a name longer than {MAX_NAME_LENGTH} characters")
         if not token:
             raise _bad_keys(position, "has an empty token")
         if not TOKEN_PATTERN.fullmatch(token):

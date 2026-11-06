@@ -91,6 +91,7 @@ class TestMatchToken:
 
 
 SHORT_TOKEN = "synthetic-short-token"  # 21 characters
+LONG_NAME = "n" * 32  # one past the longest name
 MALFORMED = {
     "no colon at all": f"laptop{TOKEN_A}",
     "no name": f":{TOKEN_A}",
@@ -107,6 +108,9 @@ MALFORMED = {
     "token with a non-ascii character": f"laptop:{TOKEN_A}é",
     "second entry bad, first fine": f"laptop:{TOKEN_A},:{TOKEN_B}",
     "name and token swapped": f"{TOKEN_A}:laptop",
+    "a token in the name slot": f"{TOKEN_A}:{TOKEN_B}",
+    "the same token in both slots": f"{TOKEN_A}:{TOKEN_A}",
+    "name longer than 31 characters": f"{LONG_NAME}:{TOKEN_A}",
 }
 
 
@@ -129,12 +133,26 @@ class TestMalformedApiKeys:
         assert "CALENDAR_AGENT_API_KEYS" in message
         for token in (TOKEN_A, TOKEN_B, SHORT_TOKEN, TOKEN_A[:20], TOKEN_A[20:]):
             assert token not in message
-        for name in ("laptop", "scheduler", "lap/top", "my laptop"):
+        for name in ("laptop", "scheduler", "lap/top", "my laptop", LONG_NAME):
             assert name not in message
 
     def test_the_refusal_says_which_entry(self):
         with pytest.raises(auth.AuthConfigError, match="entry 2"):
             auth.parse_api_keys(f"laptop:{TOKEN_A},:{TOKEN_B}")
+
+    def test_a_name_is_1_to_31_characters(self):
+        assert len(auth.parse_api_keys("n" * 31 + f":{TOKEN_A}")) == 1
+        assert len(auth.parse_api_keys(f"n:{TOKEN_A}")) == 1
+        with pytest.raises(auth.AuthConfigError, match="31"):
+            auth.parse_api_keys("n" * 32 + f":{TOKEN_A}")
+
+    def test_no_accepted_token_is_short_enough_to_be_a_name(self):
+        """A name is at most one character shorter than the shortest token,
+        so a token pasted into the name slot is refused rather than accepted
+        as a name and then printed in every log line that names the caller."""
+        assert auth.MAX_NAME_LENGTH == auth.MIN_TOKEN_LENGTH - 1
+        with pytest.raises(auth.AuthConfigError, match="entry 1"):
+            auth.parse_api_keys("a" * auth.MIN_TOKEN_LENGTH + f":{TOKEN_A}")
 
     def test_minimum_token_length_is_32(self):
         assert auth.MIN_TOKEN_LENGTH == 32
