@@ -57,6 +57,7 @@ class _FakeAgentHandler(BaseHTTPRequestHandler):
 
     def _respond(self, spec: dict) -> None:
         self.server.authorization.append(self.headers.get_all("Authorization") or [])
+        self.server.injected.extend(self.headers.get_all("X-Injected") or [])
         required = self.server.required_token
         if self.path != EVENT_PATH:
             spec = ROUTER_404
@@ -92,6 +93,7 @@ def fake_agent():
     server.daemon_threads = True
     server.calls = []
     server.authorization = []  # the Authorization header values of each request
+    server.injected = []  # any X-Injected header values (see the whitespace test)
     server.required_token = None  # set to make the stub demand a token
     server.script = {
         "delete": {"status": 200, "body": {"success": True, "message": "ok"}},
@@ -412,7 +414,41 @@ class TestBearerToken:
         assert result.returncode == EXIT_SUCCESS
         assert fake_agent.authorization == [[], []]
 
-    @pytest.mark.parametrize("value", ["", "   "])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            f"{API_TOKEN}\r",
+            f"{API_TOKEN}\n",
+            f"{API_TOKEN}\r\n",
+            f"\t{API_TOKEN}\t",
+            f"\n{API_TOKEN}",
+            f"{API_TOKEN[:20]}\r\n{API_TOKEN[20:]}",
+        ],
+        ids=["trailing CR", "trailing LF", "trailing CRLF", "tabs", "leading LF", "CRLF inside"],
+    )
+    def test_whitespace_in_the_variable_is_removed_before_the_header_is_sent(
+        self, fake_agent, value
+    ):
+        """A carriage return or newline left in the variable (a token file
+        saved with Windows line endings, a ``$(cat file)``) must not reach
+        curl's header input, where it would end the header early or start
+        another one. The stub demands the exact token."""
+        fake_agent.required_token = API_TOKEN
+        result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": value})
+        assert result.returncode == EXIT_SUCCESS, result.stderr
+        assert fake_agent.authorization == [[f"Bearer {API_TOKEN}"], [f"Bearer {API_TOKEN}"]]
+        assert fake_agent.injected == []
+
+    def test_a_newline_in_the_variable_cannot_add_a_header(self, fake_agent):
+        """What follows a newline is not sent as a header line of its own."""
+        result = run_script(
+            fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": f"{API_TOKEN}\r\nX-Injected:1"}
+        )
+        assert result.returncode == EXIT_SUCCESS, result.stderr
+        assert fake_agent.injected == []
+        assert fake_agent.authorization == [[f"Bearer {API_TOKEN}X-Injected:1"]] * 2
+
+    @pytest.mark.parametrize("value", ["", "   ", "\t", "\r\n", " \n\t\r "])
     def test_an_empty_variable_sends_no_header(self, fake_agent, value):
         result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": value})
         assert result.returncode == EXIT_SUCCESS
