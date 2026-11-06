@@ -26,8 +26,11 @@ MIN_TOKEN_LENGTH = 32
 # One less than the shortest token, so a token pasted into the name slot is
 # refused instead of becoming a name that every caller log line prints.
 MAX_NAME_LENGTH = MIN_TOKEN_LENGTH - 1
-# The paths exempt from the check. Compared with the request path exactly;
-# tests/test_auth_routes.py fails if this grows.
+# The paths exempt from the check. Compared with the request path exactly as
+# the server reports it, so behind `uvicorn --root-path` (which reports the
+# prefixed path) /health needs a token too. Do not make this a suffix or
+# prefix match: that would also exempt routes whose path parameter is
+# "health". tests/test_auth_routes.py fails if this grows.
 EXEMPT_PATHS = frozenset({"/health"})
 UNAUTHORIZED_MESSAGE = "Missing or invalid bearer token"
 # `docker run --env-file` keeps quotation marks as part of a value, so a

@@ -150,7 +150,7 @@ def _server_env(mode: str | None, keys: str | None) -> dict[str, str]:
 
 
 class _Server:
-    def __init__(self, mode: str | None, keys: str | None):
+    def __init__(self, mode: str | None, keys: str | None, *extra_args: str):
         self.port = _free_port()
         self.process = subprocess.Popen(
             [
@@ -162,6 +162,7 @@ class _Server:
                 "127.0.0.1",
                 "--port",
                 str(self.port),
+                *extra_args,
             ],  # fmt: skip
             cwd=REPO_ROOT,
             env=_server_env(mode, keys),
@@ -171,18 +172,21 @@ class _Server:
         )
         self.url = f"http://127.0.0.1:{self.port}"
 
-    def wait_until_serving(self, timeout: float = 30.0) -> None:
+    def wait_until_serving(
+        self, timeout: float = 30.0, path: str = "/health", headers: dict | None = None
+    ) -> None:
         deadline = time.monotonic() + timeout
         with httpx.Client(trust_env=False) as client:
             while time.monotonic() < deadline:
                 if self.process.poll() is not None:
                     raise AssertionError(f"server exited early:\n{self.process.stderr.read()}")
                 try:
-                    if client.get(f"{self.url}/health", timeout=1.0).status_code == 200:
+                    response = client.get(f"{self.url}{path}", headers=headers, timeout=1.0)
+                    if response.status_code == 200:
                         return
                 except httpx.TransportError:
                     time.sleep(0.1)
-        raise AssertionError("server did not start serving /health in time")
+        raise AssertionError(f"server did not start serving {path} in time")
 
     def stop(self) -> tuple[int, str]:
         """Stop the server; return its exit status and everything it wrote."""
@@ -200,8 +204,8 @@ class _Server:
 def server():
     started: list[_Server] = []
 
-    def start(mode: str | None, keys: str | None) -> _Server:
-        instance = _Server(mode, keys)
+    def start(mode: str | None, keys: str | None, *extra_args: str) -> _Server:
+        instance = _Server(mode, keys, *extra_args)
         started.append(instance)
         return instance
 
@@ -268,5 +272,23 @@ class TestTheRealServer:
             for path in ("/openapi.json", "/docs", "/redoc", "/calendars", "/no-such-route"):
                 assert client.get(f"{instance.url}{path}").status_code == 401, path
             assert client.get(f"{instance.url}/openapi.json", headers=RIGHT).status_code == 200
+        _, output = instance.stop()
+        assert TOKEN not in output
+
+    def test_under_a_root_path_health_needs_the_token(self, server):
+        """Pins current behaviour. The exemption compares the path exactly as
+        the server reports it, and ``uvicorn --root-path /cal`` reports
+        ``/cal/health``, so behind a root path ``/health`` is refused without
+        a token like any other route (it fails closed). The Dockerfile serves
+        at the root of the host, where ``/health`` is open. The comparison is
+        exact on purpose: a suffix match would also open
+        ``/calendars/health/events/health`` (see test_auth_routes.py)."""
+        instance = server("required", f"laptop:{TOKEN}", "--root-path", "/cal")
+        instance.wait_until_serving(headers=RIGHT)
+        with httpx.Client(trust_env=False) as client:
+            refused = client.get(f"{instance.url}/health")
+            assert refused.status_code == 401
+            assert refused.headers["www-authenticate"] == "Bearer"
+            assert client.get(f"{instance.url}/health", headers=RIGHT).status_code == 200
         _, output = instance.stop()
         assert TOKEN not in output

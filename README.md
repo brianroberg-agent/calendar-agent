@@ -101,7 +101,11 @@ The check sits in front of the whole application rather than on individual
 routes, and it runs before routing and request validation. The API
 documentation routes (`/docs`, `/redoc`, `/openapi.json`), paths that do not
 exist, and routes added later are therefore covered without being listed
-anywhere. The one list is of exemptions, and `/health` is its only entry. A
+anywhere. The one list is of exemptions, and `/health` is its only entry.
+The exemption compares the request path exactly as the server reports it.
+Served at the root of its host, as the Dockerfile runs it, `/health` needs no
+token. Behind `uvicorn --root-path /prefix` the server reports the path as
+`/prefix/health`, so there `/health` needs a token like any other route. A
 refused request is answered straight away: it is not validated, and it does
 not reach the proxy or the proxy's operator-approval wait.
 
@@ -215,7 +219,9 @@ with neither setting exits at start-up**, so set both before upgrading:
    the two modes apart. The start-up log line also names the mode.
 
 To undo, set `CALENDAR_AGENT_AUTH=off` and restart. A container health check
-should request `/health`, which needs no token in any mode.
+should request `/health`, which needs no token in any mode when the server is
+served at the root of its host, as the Dockerfile runs it (not behind
+`--root-path`; see above).
 
 ### Running the Server
 
@@ -336,7 +342,9 @@ the query string is fixed and the request is resent.
 ### GET /health
 
 Health check endpoint. Returns server status and version. It is the one route
-that needs no token, in every mode.
+that needs no token, in every mode, when the server is served at the root of
+its host as the Dockerfile runs it (behind `uvicorn --root-path` it needs one;
+see [Authentication](#authentication)).
 
 ```bash
 curl http://localhost:8082/health
