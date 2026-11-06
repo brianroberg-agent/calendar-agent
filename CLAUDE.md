@@ -58,6 +58,11 @@ uv run pytest --cov=calendar_agent  # With coverage
   doing nothing: do not add a per-route auth dependency, and do not move the
   check behind routing (it must stay ahead of validation and of the proxy's
   operator-approval wait)
+- Keep `BearerAuthMiddleware` the outermost user middleware: `add_middleware`
+  puts each new middleware in front of the earlier ones, and one in front of
+  the check sees and can answer a request before its token is checked. Add
+  any new middleware before the check's `add_middleware` call.
+  `test_the_token_check_is_the_outermost_middleware` fails otherwise
 - There is one list, `EXEMPT_PATHS`, and it lists exemptions.
   `tests/test_auth_routes.py::TestRequiredMode` walks `app.routes` and fails
   if any route other than `/health` answers a tokenless or wrong-token

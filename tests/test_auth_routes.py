@@ -133,6 +133,12 @@ class TestRequiredMode:
         assert mock_proxy_client.mock_calls == []
         assert mock_llm_service.mock_calls == []
 
+    def test_the_token_check_is_the_outermost_middleware(self):
+        """``add_middleware`` puts each new middleware in front of the ones
+        added before it, and a middleware in front of the check would see,
+        and could answer, a request before its token is checked."""
+        assert app.user_middleware[0].cls is auth.BearerAuthMiddleware
+
     def test_the_exempt_list_is_health_alone(self):
         assert set(auth.EXEMPT_PATHS) == {"/health"}
 
