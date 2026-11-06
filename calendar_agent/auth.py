@@ -160,6 +160,63 @@ def match_token(keys: tuple[ApiKey, ...], presented: bytes) -> str | None:
     return caller
 
 
+def ensure_log_output() -> None:
+    """Make this package's log lines visible when the host configured nothing.
+
+    A server started with plain ``uvicorn`` sets up only uvicorn's own
+    loggers, so the per-request lines here (info level) would be dropped. If
+    neither the root logger nor the ``calendar_agent`` logger has a handler,
+    give the package logger one on stderr at info level. A host that has
+    configured logging is left alone.
+    """
+    package_logger = logging.getLogger("calendar_agent")
+    if package_logger.handlers or logging.getLogger().handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s: %(message)s"))
+    package_logger.addHandler(handler)
+    package_logger.setLevel(logging.INFO)
+
+
+def _describe_keys(keys: tuple[ApiKey, ...]) -> str:
+    if not keys:
+        return "no caller tokens are configured"
+    return f"{len(keys)} caller token(s) configured: {', '.join(key.name for key in keys)}"
+
+
+def settings_at_startup(environ: Mapping[str, str]) -> AuthSettings:
+    """Load the settings for a starting server and log what will be enforced.
+
+    Raises AuthConfigError (see load_auth_settings) when the server must not
+    start, after logging its message as an error. Otherwise logs one line: a warning for ``off`` and for ``optional``, info
+    for ``required``. Caller names are logged; tokens are not.
+    """
+    ensure_log_output()
+    try:
+        settings = load_auth_settings(environ)
+    except AuthConfigError as error:
+        logger.error("refusing to start: %s", error)
+        raise
+    if settings.mode is AuthMode.OFF:
+        logger.warning(
+            "%s=off: no token is required; every route is served to any caller", MODE_ENV
+        )
+    elif settings.mode is AuthMode.OPTIONAL:
+        logger.warning(
+            "%s=optional: requests with no token are served and logged; %s",
+            MODE_ENV,
+            _describe_keys(settings.keys),
+        )
+    else:
+        logger.info(
+            "%s=required: every route but %s needs a token; %s",
+            MODE_ENV,
+            ", ".join(sorted(EXEMPT_PATHS)),
+            _describe_keys(settings.keys),
+        )
+    return settings
+
+
 # What applies when nothing has loaded the settings (the start-up hook did not
 # run): `required` with no keys, so every non-exempt request is refused.
 FAIL_CLOSED = AuthSettings(mode=AuthMode.REQUIRED)
@@ -226,6 +283,10 @@ class BearerAuthMiddleware:
     refuses a header that is present and not a configured token; ``off``
     checks nothing. Log lines carry the caller's configured name, the
     method, the route template and the client address; never a token.
+
+    HTTP requests are answered 401; a WebSocket handshake is refused by
+    closing it (the exempt paths apply to HTTP only); a connection type
+    that is neither is dropped.
     """
 
     def __init__(self, app: ASGIApp, get_settings, exempt_paths=EXEMPT_PATHS) -> None:
@@ -234,15 +295,24 @@ class BearerAuthMiddleware:
         self.exempt_paths = exempt_paths
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        kind = scope["type"]
+        if kind == "lifespan":
             await self.app(scope, receive, send)
             return
         settings: AuthSettings = self.get_settings() or FAIL_CLOSED
-        if settings.mode is AuthMode.OFF or scope["path"] in self.exempt_paths:
+        if settings.mode is AuthMode.OFF:
             await self.app(scope, receive, send)
             return
+        if kind == "http" and scope["path"] in self.exempt_paths:
+            await self.app(scope, receive, send)
+            return
+        if kind not in ("http", "websocket"):
+            # Nothing sends another connection type today. One this check
+            # does not understand is dropped, not handed on unchecked.
+            logger.warning("refused connection of unsupported type %s", _log_safe(kind))
+            return
 
-        method = _log_safe(scope.get("method", "?"))
+        method = _log_safe(scope.get("method", "WEBSOCKET"))
         authorization = [value for name, value in scope["headers"] if name == b"authorization"]
         if not authorization:
             if settings.mode is AuthMode.OPTIONAL:
@@ -281,6 +351,10 @@ class BearerAuthMiddleware:
             _client_host(scope),
             reason,
         )
+        if kind == "websocket":
+            # Closing before accepting refuses the handshake (1008: policy violation).
+            await send({"type": "websocket.close", "code": 1008})
+            return
         refusal = JSONResponse(
             {"success": False, "error": UNAUTHORIZED_MESSAGE},
             status_code=401,

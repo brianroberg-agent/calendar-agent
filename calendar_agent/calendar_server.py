@@ -20,6 +20,7 @@ and enforces security policies.
 """
 
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Annotated, Any, Literal
@@ -32,7 +33,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from . import __version__
-from .auth import BearerAuthMiddleware
+from .auth import BearerAuthMiddleware, settings_at_startup
 from .calendar_utils import (
     READ_RESPONSE_STATUSES,
     RSVP_RESPONSES,
@@ -92,11 +93,25 @@ async def reject_unknown_query_params(request: Request) -> None:
         ])
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start-up hook: read the authentication settings (issue #15).
+
+    CALENDAR_AGENT_AUTH and CALENDAR_AGENT_API_KEYS are read here, when the
+    server starts, not at import. An unusable combination raises
+    AuthConfigError, which fails start-up: the server exits instead of
+    serving. See calendar_agent/auth.py.
+    """
+    app.state.auth_settings = settings_at_startup(os.environ)
+    yield
+
+
 app = FastAPI(
     title="Calendar Agent",
     description="A privacy-focused FastAPI server for Google Calendar operations with AI agents",
     version=__version__,
     dependencies=[Depends(reject_unknown_query_params)],
+    lifespan=lifespan,
 )
 
 # The token check wraps the whole application (issue #15): it runs before
