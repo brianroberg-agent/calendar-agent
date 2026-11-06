@@ -206,6 +206,13 @@ with neither setting exits at start-up**, so set both before upgrading:
    route that some caller still uses without a token.
 4. When there are none left, set `CALENDAR_AGENT_AUTH=required` (or remove
    the setting) and restart.
+5. Check that `required` is in force. Request a route other than `/health`
+   with no `Authorization` header, for example with
+   `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8082/calendars`,
+   and expect `401`. Any other status means the request got past the token
+   check, so the server is not in `required` mode. Do not test with a wrong
+   token instead: `optional` answers that with `401` too, so it cannot tell
+   the two modes apart. The start-up log line also names the mode.
 
 To undo, set `CALENDAR_AGENT_AUTH=off` and restart. A container health check
 should request `/health`, which needs no token in any mode.
