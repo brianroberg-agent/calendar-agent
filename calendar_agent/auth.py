@@ -167,13 +167,17 @@ def match_token(keys: tuple[ApiKey, ...], presented: bytes) -> str | None:
 
 
 def ensure_log_output() -> None:
-    """Make this package's log lines visible when the host configured nothing.
+    """Make this package's log lines visible when no handler would get them.
 
-    With no logging configured (as under plain ``uvicorn``, which sets up
-    its own loggers) the info-level lines here would be dropped. If neither
-    the root logger nor the ``calendar_agent`` logger has a handler, give the
-    package logger one on stderr at info level. A host that has configured
-    logging is left alone.
+    Plain ``uvicorn`` configures only its own loggers, so without this the
+    info-level lines here would be dropped. If neither the root logger nor
+    the ``calendar_agent`` logger has a handler, this gives the package
+    logger one on stderr and sets its level to INFO, whatever uvicorn's own
+    ``--log-level`` is. If either already has a handler, nothing is changed.
+    To quiet these lines, give the root or the ``calendar_agent`` logger a
+    handler before start-up (for example with uvicorn's ``--log-config``)
+    and set the level wanted there. A level set on ``calendar_agent``
+    without any handler is replaced by INFO here.
     """
     package_logger = logging.getLogger("calendar_agent")
     if package_logger.handlers or logging.getLogger().handlers:

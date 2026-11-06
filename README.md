@@ -180,9 +180,13 @@ refused request: method=DELETE route=/calendars/{calendar_id}/events/{event_id} 
 The first is at info level, the other two at warning level. `route` is the
 route's template, not the request path, so calendar and event ids are not
 copied into the log; a path that matches no route is shown as
-`(no matching route)`. If the process that runs the server has not
-configured logging, as when it is started with plain `uvicorn`, these lines
-go to stderr at info level. (uvicorn's own access log is separate from
+`(no matching route)`. If neither the root logger nor the `calendar_agent`
+logger has a handler at start-up, as when the server is started with plain
+`uvicorn`, these lines go to stderr at info level, whatever uvicorn's own
+`--log-level` is. To quiet them, give the root or the `calendar_agent`
+logger a handler (for example with uvicorn's `--log-config`) and set the
+level there; a level set on `calendar_agent` with no handler anywhere is
+replaced by info. (uvicorn's own access log is separate from
 these lines, and it does print the request path.)
 
 #### Rolling it out
