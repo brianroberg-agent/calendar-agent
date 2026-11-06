@@ -45,9 +45,18 @@ def parameterised_route_requests(fill: str) -> list[tuple[str, str, str]]:
     return requests
 
 
-def routes_not_answering_401(client: TestClient, headers: dict[str, str]) -> set[str]:
+# What the walk compares: (method, route template) pairs, so one method
+# answering wrongly is not hidden by another method on the same template.
+HEALTH = {("GET", "/health")}
+
+
+def every_route() -> set[tuple[str, str]]:
+    return {(method, template) for method, _, template in route_requests()}
+
+
+def routes_not_answering_401(client: TestClient, headers: dict[str, str]) -> set[tuple[str, str]]:
     return {
-        template
+        (method, template)
         for method, path, template in route_requests()
         if client.request(method, path, headers=headers).status_code != 401
     }
@@ -97,14 +106,14 @@ class TestRequiredMode:
         """Walks the app's own route list. The only route left open is
         ``/health``: a new route is covered without being listed anywhere,
         and adding a path to the exempt list fails this test."""
-        assert routes_not_answering_401(anonymous_client, {}) == {"/health"}
+        assert routes_not_answering_401(anonymous_client, {}) == HEALTH
         assert mock_proxy_client.mock_calls == []
         assert mock_llm_service.mock_calls == []
 
     def test_every_route_but_health_refuses_a_wrong_token(
         self, anonymous_client, mock_proxy_client, mock_llm_service
     ):
-        assert routes_not_answering_401(anonymous_client, WRONG) == {"/health"}
+        assert routes_not_answering_401(anonymous_client, WRONG) == HEALTH
         assert mock_proxy_client.mock_calls == []
         assert mock_llm_service.mock_calls == []
 
@@ -128,8 +137,7 @@ class TestRequiredMode:
         assert set(auth.EXEMPT_PATHS) == {"/health"}
 
     def test_no_route_refuses_the_right_token(self, anonymous_client):
-        every_route = {template for _, _, template in route_requests()}
-        assert routes_not_answering_401(anonymous_client, RIGHT) == every_route
+        assert routes_not_answering_401(anonymous_client, RIGHT) == every_route()
 
     def test_the_right_token_reaches_the_route(self, anonymous_client, mock_proxy_client):
         response = anonymous_client.get("/calendars", headers=RIGHT)
@@ -240,8 +248,8 @@ class TestSettingsNeverLoaded:
     def test_everything_but_health_is_refused_even_with_a_plausible_token(self, anonymous_client):
         del app.state.auth_settings
         try:
-            assert routes_not_answering_401(anonymous_client, {}) == {"/health"}
-            assert routes_not_answering_401(anonymous_client, RIGHT) == {"/health"}
+            assert routes_not_answering_401(anonymous_client, {}) == HEALTH
+            assert routes_not_answering_401(anonymous_client, RIGHT) == HEALTH
         finally:
             app.state.auth_settings = None  # the conftest fixture deletes it
 
@@ -397,7 +405,7 @@ class TestOptionalMode:
         self, use_settings, anonymous_client, mock_proxy_client, mock_llm_service
     ):
         use_settings("optional")
-        assert routes_not_answering_401(anonymous_client, WRONG) == {"/health"}
+        assert routes_not_answering_401(anonymous_client, WRONG) == HEALTH
         assert mock_proxy_client.mock_calls == []
         assert mock_llm_service.mock_calls == []
 
@@ -437,8 +445,7 @@ class TestOffMode:
         self, use_settings, anonymous_client, headers
     ):
         use_settings("off")
-        every_route = {template for _, _, template in route_requests()}
-        assert routes_not_answering_401(anonymous_client, headers) == every_route
+        assert routes_not_answering_401(anonymous_client, headers) == every_route()
 
     def test_requests_are_not_logged(self, use_settings, anonymous_client, auth_log):
         use_settings("off")
