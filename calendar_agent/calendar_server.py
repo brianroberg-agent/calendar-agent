@@ -116,7 +116,7 @@ app = FastAPI(
 
 # The token check wraps the whole application (issue #15): it runs before
 # routing, so the API documentation routes and any route added later are
-# covered, and a refused request never reaches a route, its validation, or
+# covered, and a refused request does not reach a route, its validation, or
 # the proxy's operator-approval wait.
 app.add_middleware(
     BearerAuthMiddleware,

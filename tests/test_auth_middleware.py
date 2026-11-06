@@ -115,3 +115,37 @@ class TestOtherConnectionTypes:
         middleware = auth.BearerAuthMiddleware(inner, get_settings=lambda: settings)
         await middleware({"type": "future-transport", "path": "/page", "headers": []}, None, None)
         assert seen == []
+
+
+class TestLogLinesAreNotForgeable:
+    """The method and the client address come from the connection. They go
+    into a log line through a small safe alphabet, so text carrying a newline
+    does not start a second, forged line."""
+
+    @pytest.mark.parametrize("mode", ["optional", "required"])
+    async def test_a_newline_in_the_method_or_client_does_not_reach_the_log(self, caplog, mode):
+        caplog.set_level(logging.INFO, logger="calendar_agent.auth")
+        sent = []
+
+        async def inner(scope, receive, send):
+            pass
+
+        async def send(message):
+            sent.append(message)
+
+        settings = auth.load_auth_settings({auth.MODE_ENV: mode, auth.KEYS_ENV: f"laptop:{TOKEN}"})
+        middleware = auth.BearerAuthMiddleware(inner, get_settings=lambda: settings)
+        scope = {
+            "type": "http",
+            "method": "GET\nWARNING forged-method-line",
+            "path": "/page",
+            "headers": [],
+            "client": ("192.0.2.7\nWARNING forged-client-line", 4321),
+        }
+        await middleware(scope, None, send)
+
+        lines = [r.getMessage() for r in caplog.records if r.name == "calendar_agent.auth"]
+        assert len(lines) == 1
+        assert "\n" not in lines[0]
+        assert "method=GET?WARNING?forged-method-line " in lines[0]
+        assert "client=192.0.2.7?WARNING?forged-client-line" in lines[0]

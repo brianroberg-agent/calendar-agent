@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 KEYS_ENV = "CALENDAR_AGENT_API_KEYS"
 MODE_ENV = "CALENDAR_AGENT_AUTH"
 MIN_TOKEN_LENGTH = 32
-# The only paths served without a token. Compared with the request path
-# exactly; tests/test_auth_routes.py fails if this grows.
+# The paths exempt from the check. Compared with the request path exactly;
+# tests/test_auth_routes.py fails if this grows.
 EXEMPT_PATHS = frozenset({"/health"})
 UNAUTHORIZED_MESSAGE = "Missing or invalid bearer token"
 NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
@@ -163,11 +163,11 @@ def match_token(keys: tuple[ApiKey, ...], presented: bytes) -> str | None:
 def ensure_log_output() -> None:
     """Make this package's log lines visible when the host configured nothing.
 
-    A server started with plain ``uvicorn`` sets up only uvicorn's own
-    loggers, so the per-request lines here (info level) would be dropped. If
-    neither the root logger nor the ``calendar_agent`` logger has a handler,
-    give the package logger one on stderr at info level. A host that has
-    configured logging is left alone.
+    With no logging configured (as under plain ``uvicorn``, which sets up
+    its own loggers) the info-level lines here would be dropped. If neither
+    the root logger nor the ``calendar_agent`` logger has a handler, give the
+    package logger one on stderr at info level. A host that has configured
+    logging is left alone.
     """
     package_logger = logging.getLogger("calendar_agent")
     if package_logger.handlers or logging.getLogger().handlers:
@@ -188,8 +188,9 @@ def settings_at_startup(environ: Mapping[str, str]) -> AuthSettings:
     """Load the settings for a starting server and log what will be enforced.
 
     Raises AuthConfigError (see load_auth_settings) when the server must not
-    start, after logging its message as an error. Otherwise logs one line: a warning for ``off`` and for ``optional``, info
-    for ``required``. Caller names are logged; tokens are not.
+    start, after logging its message as an error. Otherwise logs one line: a
+    warning for ``off`` and for ``optional``, info for ``required``. Caller
+    names are logged; tokens are not.
     """
     ensure_log_output()
     try:
@@ -275,7 +276,8 @@ _NOT_LOG_SAFE = re.compile(r"[^A-Za-z0-9.:_\-\[\]]")
 
 def _log_safe(value: object) -> str:
     """A method or client address as it goes into a log line: anything but a
-    small safe alphabet becomes '?', so request text cannot forge a line."""
+    small safe alphabet becomes '?', so a newline in it does not start a
+    second line."""
     return _NOT_LOG_SAFE.sub("?", str(value))[:64]
 
 
