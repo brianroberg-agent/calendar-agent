@@ -213,6 +213,31 @@ class TestSettingsNeverLoaded:
         finally:
             app.state.auth_settings = None  # the conftest fixture deletes it
 
+    @pytest.mark.parametrize("headers", [{}, RIGHT, WRONG], ids=["no token", "right", "wrong"])
+    def test_the_refusal_is_logged_as_an_error_naming_the_missing_settings(
+        self, anonymous_client, auth_log, headers
+    ):
+        """The reason given is the one the operator has to act on: the
+        settings were never loaded. Not "token not recognised", which would
+        send them looking for a token mismatch. The caller's answer is the
+        ordinary refusal."""
+        del app.state.auth_settings
+        try:
+            response = anonymous_client.delete("/calendars/primary/events/event_1", headers=headers)
+        finally:
+            app.state.auth_settings = None  # the conftest fixture deletes it
+        assert response.status_code == 401
+        assert response.json() == {"success": False, "error": "Missing or invalid bearer token"}
+        assert response.headers["www-authenticate"] == "Bearer"
+        (line,) = auth_records(auth_log, logging.ERROR)
+        assert line.startswith("refused request: method=DELETE")
+        assert "route=/calendars/{calendar_id}/events/{event_id}" in line
+        assert "settings are not loaded" in line
+        assert "start-up hook did not run" in line
+        assert "token not recognised" not in line
+        assert "no Authorization header" not in line
+        assert auth_records(auth_log, logging.WARNING) == []
+
 
 # Requests that, sent with a token, go on to a call the proxy holds open while
 # a human operator approves it (for minutes). Bodies are valid, so the only

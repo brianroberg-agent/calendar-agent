@@ -321,7 +321,9 @@ class BearerAuthMiddleware:
     routing, request validation and the route itself: a refused request
     reads no body and reaches no upstream call. ``get_settings`` is called
     per request and returns what the start-up hook loaded, or None if it
-    never ran, in which case everything but the exempt paths is refused.
+    never ran, in which case everything but the exempt paths is refused and
+    each refusal is logged at error level saying the settings are not
+    loaded.
 
     By mode: ``required`` refuses a request with no valid token; ``optional``
     serves a request with no Authorization header (and logs it) but still
@@ -344,7 +346,8 @@ class BearerAuthMiddleware:
         if kind == "lifespan":
             await self.app(scope, receive, send)
             return
-        settings: AuthSettings = self.get_settings() or FAIL_CLOSED
+        loaded: AuthSettings | None = self.get_settings()
+        settings = FAIL_CLOSED if loaded is None else loaded
         if settings.mode is AuthMode.OFF:
             await self.app(scope, receive, send)
             return
@@ -358,6 +361,18 @@ class BearerAuthMiddleware:
             return
 
         method = _log_safe(scope.get("method", "WEBSOCKET"))
+        if loaded is None:
+            # The token is not looked at: no token could be right, and the
+            # operator's problem is the missing settings, not a mismatch.
+            logger.error(
+                "refused request: method=%s route=%s client=%s reason=authentication "
+                "settings are not loaded (the start-up hook did not run)",
+                method,
+                route_template(scope),
+                _client_host(scope),
+            )
+            await self._refuse(kind, scope, receive, send)
+            return
         authorization = [value for name, value in scope["headers"] if name == b"authorization"]
         if not authorization:
             if settings.mode is AuthMode.OPTIONAL:
@@ -396,6 +411,10 @@ class BearerAuthMiddleware:
             _client_host(scope),
             reason,
         )
+        await self._refuse(kind, scope, receive, send)
+
+    @staticmethod
+    async def _refuse(kind: str, scope: Scope, receive: Receive, send: Send) -> None:
         if kind == "websocket":
             # Closing before accepting refuses the handshake (1008: policy violation).
             await send({"type": "websocket.close", "code": 1008})
