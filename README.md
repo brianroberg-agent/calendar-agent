@@ -749,7 +749,7 @@ RESULT: SUCCESS - event no longer present
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
-| `CALENDAR_AGENT_API_KEY` | This caller's bearer token (see [Authentication](#authentication)), sent as `Authorization: Bearer <token>` on the DELETE and on the verifying GET. The script hands it to `curl` on standard input (`-H @-`, curl 7.55 or later) rather than on the command line, and does not print it. When unset, no `Authorization` header is sent; against a server in `required` mode that is a `401` and exit `4` | (unset) |
+| `CALENDAR_AGENT_API_KEY` | This caller's bearer token (see [Authentication](#authentication)), sent as `Authorization: Bearer <token>` on the DELETE and on the verifying GET. The script hands it to `curl` on standard input (`-H @-`, curl 7.55 or later) rather than on the command line, and does not print it (tracing with `bash -x` does, as it prints each command as expanded). When unset, no `Authorization` header is sent; against a server in `required` mode that is a `401` and exit `4` | (unset) |
 | `CALENDAR_AGENT_CONFIRM_TIMEOUT` | calendar-agent's own mutation budget (its `PROXY_CONFIRM_TIMEOUT`); the script cannot read it across the container boundary, so keep them in step by hand | `330` |
 | `CALENDAR_DELETE_MAX_TIME` | `curl` deadline for the DELETE. **Must exceed the budget** — the script refuses (exit `4`) otherwise, because a shorter deadline abandons the DELETE while the operator can still approve it, re-creating one hop out the very mismatch the server guards against | budget + 10 = `340` |
 | `CALENDAR_DELETE_VERIFY_MAX_TIME` | `curl` deadline for the verifying GET (an ordinary 30s-bounded read) | `35` |

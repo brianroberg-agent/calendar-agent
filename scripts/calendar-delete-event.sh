@@ -97,7 +97,9 @@ URL="$CALENDAR_AGENT_URL/calendars/$enc_cal/events/$enc_evt"
 
 # Every request to calendar-agent goes through here. The token reaches curl on
 # stdin (`-H @-`, curl 7.55+), never on its command line, which any process on
-# the machine can read. It is never echoed.
+# the machine can read. The script does not print it, but tracing (`bash -x`)
+# prints each command as expanded, the token included: do not trace a run
+# with a real token.
 API_KEY="${CALENDAR_AGENT_API_KEY:-}"
 API_KEY="${API_KEY//[[:space:]]/}"
 agent_curl() {
