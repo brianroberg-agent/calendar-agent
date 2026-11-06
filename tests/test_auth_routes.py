@@ -497,6 +497,13 @@ class TestRequestLogging:
         assert reason in line
 
 
+def token_fragments(token: str) -> list[str]:
+    """The whole token and three 16-character pieces of it (start, middle,
+    end), so a log line that printed most of a token is caught too."""
+    middle = len(token) // 2 - 8
+    return [token, token[:16], token[middle : middle + 16], token[-16:]]
+
+
 class TestNoTokenTextAnywhere:
     @pytest.mark.parametrize("mode", ["required", "optional", "off"])
     def test_no_token_appears_in_a_log_line_or_a_response(
@@ -504,8 +511,9 @@ class TestNoTokenTextAnywhere:
     ):
         """Right token, wrong token, no token and malformed headers, in each
         mode, against a read, a mutation, an unknown path and /health:
-        neither the configured token nor the presented one is in any captured
-        log record (all loggers, DEBUG up) or any response body or header."""
+        neither the configured token nor the presented one, nor a 16-character
+        piece of either, is in any captured log record (all loggers, DEBUG
+        up) or any response body or header."""
         auth_log.set_level(logging.DEBUG)
         use_settings(mode)
         presented = [
@@ -532,14 +540,15 @@ class TestNoTokenTextAnywhere:
             assert any(record.name == "calendar_agent.auth" for record in auth_log.records), (
                 "the auth module logged nothing, so this would prove nothing about it"
             )
-        for secret in (TEST_API_TOKEN, WRONG_TOKEN):
-            assert secret not in auth_log.text
-            for record in auth_log.records:
-                assert secret not in record.getMessage()
-                assert secret not in repr(record.args)
-            for response in responses:
-                assert secret not in response.text
-                assert secret not in repr(response.headers)
+        for token in (TEST_API_TOKEN, WRONG_TOKEN):
+            for secret in token_fragments(token):
+                assert secret not in auth_log.text
+                for record in auth_log.records:
+                    assert secret not in record.getMessage()
+                    assert secret not in repr(record.args)
+                for response in responses:
+                    assert secret not in response.text
+                    assert secret not in repr(response.headers)
 
 
 def _operations(document: dict):

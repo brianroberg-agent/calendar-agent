@@ -38,6 +38,13 @@ UNAUTHORIZED = {
 API_TOKEN = "synthetic-script-token-0123456789abcdef"  # not a real credential
 
 
+def token_fragments(token: str) -> list[str]:
+    """The whole token and three 16-character pieces of it (start, middle,
+    end), so output that carried most of a token is caught too."""
+    middle = len(token) // 2 - 8
+    return [token, token[:16], token[middle : middle + 16], token[-16:]]
+
+
 class _FakeAgentHandler(BaseHTTPRequestHandler):
     """Serves ``server.script`` for the one real event route, and records what
     was asked. Any other path gets FastAPI's bare router 404, so a script that
@@ -439,11 +446,14 @@ class TestBearerToken:
         assert fake_agent.calls == [("DELETE", EVENT_PATH), ("GET", EVENT_PATH)]
 
     def test_the_token_is_never_printed(self, fake_agent):
+        """Neither the token nor a 16-character piece of it (start, middle,
+        end) is in the script's output, accepted or refused."""
         for required in (API_TOKEN, "synthetic-script-other-0123456789abcdef"):
             fake_agent.required_token = required
             result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": API_TOKEN})
-            assert API_TOKEN not in result.stdout
-            assert API_TOKEN not in result.stderr
+            for fragment in token_fragments(API_TOKEN):
+                assert fragment not in result.stdout
+                assert fragment not in result.stderr
 
     def test_the_token_is_not_passed_on_curls_command_line(self, fake_agent, tmp_path):
         """A command line is readable by every process on the machine (``ps``).
@@ -463,4 +473,5 @@ class TestBearerToken:
         assert result.returncode == EXIT_SUCCESS
         recorded = log.read_text()
         assert "DELETE" in recorded, "the stand-in curl was not the one that ran"
-        assert API_TOKEN not in recorded
+        for fragment in token_fragments(API_TOKEN):
+            assert fragment not in recorded
