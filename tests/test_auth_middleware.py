@@ -85,6 +85,22 @@ class TestWebSocketConnections:
         assert len(served) == 1
         assert "method=WEBSOCKET" in served[0]
 
+    def test_a_connection_is_refused_when_no_settings_are_loaded(self):
+        """The fail-closed path (the start-up hook never ran) refuses a
+        WebSocket handshake too, with the right token or without it."""
+
+        async def socket(websocket):
+            await websocket.accept()
+            await websocket.send_text("served")
+            await websocket.close()
+
+        inner = Starlette(routes=[WebSocketRoute("/socket", socket)])
+        client = TestClient(auth.BearerAuthMiddleware(inner, get_settings=lambda: None))
+        assert connects(client, "/socket", RIGHT) is False
+        with pytest.raises(WebSocketDisconnect) as excinfo, client.websocket_connect("/socket"):
+            pass
+        assert excinfo.value.code == 1008
+
     def test_off_serves_any_connection(self):
         client = TestClient(wrapped_app("off"))
         assert connects(client, "/socket", {}) is True

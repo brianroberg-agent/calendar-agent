@@ -186,11 +186,12 @@ route's template, not the request path, so calendar and event ids are not
 copied into the log; a path that matches no route is shown as
 `(no matching route)`. If neither the root logger nor the `calendar_agent`
 logger has a handler at start-up, as when the server is started with plain
-`uvicorn`, these lines go to stderr at info level, whatever uvicorn's own
-`--log-level` is. To quiet them, give the root or the `calendar_agent`
-logger a handler (for example with uvicorn's `--log-config`) and set the
-level there; a level set on `calendar_agent` with no handler anywhere is
-replaced by info. (uvicorn's own access log is separate from
+`uvicorn`, these lines go to stderr at info level. uvicorn's own
+`--log-level` sets uvicorn's loggers and does not quiet them. To quiet
+them, give the root or the `calendar_agent` logger a handler (for example
+with uvicorn's `--log-config`) and set the level there. (Those two cases
+were checked by hand against a running server; the tests cover the
+no-handler case and the already-configured case.) (uvicorn's own access log is separate from
 these lines, and it does print the request path with its query string, so a
 token a caller puts in the query string is written there even though it is
 not accepted.)
@@ -213,8 +214,8 @@ with neither setting exits at start-up**, so set both before upgrading:
 5. Check that `required` is in force. Request a route other than `/health`
    with no `Authorization` header, for example with
    `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8082/calendars`,
-   and expect `401`. Any other status means the request got past the token
-   check, so the server is not in `required` mode. Do not test with a wrong
+   and expect `401`. Any other HTTP status means the request got past the
+   token check, so the server is not in `required` mode. Do not test with a wrong
    token instead: `optional` answers that with `401` too, so it cannot tell
    the two modes apart. The start-up log line also names the mode.
 

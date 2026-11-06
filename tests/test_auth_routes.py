@@ -123,7 +123,7 @@ class TestRequiredMode:
         """Every parameterised route again, with each parameter set to
         ``health``: ``DELETE /calendars/health/events/health`` must be refused
         like any other path. Catches an exemption that matches the end of a
-        path (or any part of it) rather than the whole path."""
+        path rather than the whole path."""
         not_refused = {
             (method, path)
             for method, path, _ in parameterised_route_requests("health")

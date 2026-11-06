@@ -29,8 +29,9 @@ MAX_NAME_LENGTH = MIN_TOKEN_LENGTH - 1
 # The paths exempt from the check. Compared with the request path exactly as
 # the server reports it, so behind `uvicorn --root-path` (which reports the
 # prefixed path) /health needs a token too. Do not make this a suffix or
-# prefix match: that would also exempt routes whose path parameter is
-# "health". tests/test_auth_routes.py fails if this grows.
+# prefix match: a suffix match would also exempt routes whose last path
+# parameter is "health", and a prefix match would exempt every path under
+# /health/. tests/test_auth_routes.py fails if this grows.
 EXEMPT_PATHS = frozenset({"/health"})
 UNAUTHORIZED_MESSAGE = "Missing or invalid bearer token"
 # `docker run --env-file` keeps quotation marks as part of a value, so a
@@ -180,12 +181,14 @@ def ensure_log_output() -> None:
     Plain ``uvicorn`` configures only its own loggers, so without this the
     info-level lines here would be dropped. If neither the root logger nor
     the ``calendar_agent`` logger has a handler, this gives the package
-    logger one on stderr and sets its level to INFO, whatever uvicorn's own
-    ``--log-level`` is. If either already has a handler, nothing is changed.
-    To quiet these lines, give the root or the ``calendar_agent`` logger a
-    handler before start-up (for example with uvicorn's ``--log-config``)
-    and set the level wanted there. A level set on ``calendar_agent``
-    without any handler is replaced by INFO here.
+    logger one on stderr and sets its level to INFO. uvicorn's own
+    ``--log-level`` does not change that: it sets uvicorn's loggers. If
+    either already has a handler, nothing is changed. To quiet these lines,
+    give the root or the ``calendar_agent`` logger a handler before start-up
+    (for example with uvicorn's ``--log-config``) and set the level wanted
+    there. (The quieter-level and ``--log-config`` cases were checked by
+    hand against a running server on 2026-11-05; the tests cover the
+    no-handler case and the already-configured case.)
     """
     package_logger = logging.getLogger("calendar_agent")
     if package_logger.handlers or logging.getLogger().handlers:

@@ -69,9 +69,11 @@ uv run pytest --cov=calendar_agent  # With coverage
   request with anything but 401, so growing the exempt list means changing
   that test on purpose
 - `EXEMPT_PATHS` is compared with `scope["path"]` exactly. Keep it exact: a
-  suffix or prefix match would also exempt a real route whose path parameter
-  is spelled `health` (`DELETE /calendars/health/events/health`), which
-  `test_a_path_parameter_spelled_health_does_not_open_a_route` checks. The
+  suffix match would also exempt a real route whose last path parameter is
+  spelled `health` (`DELETE /calendars/health/events/health`), which
+  `test_a_path_parameter_spelled_health_does_not_open_a_route` checks; a
+  prefix match would exempt every path under `/health/`, which
+  `test_a_path_or_method_the_app_does_not_have_is_refused_too` checks. The
   cost of exact matching: behind `uvicorn --root-path` the path includes the
   prefix, so `/health` needs a token there (it fails closed; the Dockerfile
   uses no root path). `test_under_a_root_path_health_needs_the_token` pins
