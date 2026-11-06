@@ -20,20 +20,28 @@ RIGHT = {"Authorization": f"Bearer {TEST_API_TOKEN}"}
 WRONG = {"Authorization": f"Bearer {WRONG_TOKEN}"}
 
 
-def route_requests() -> list[tuple[str, str, str]]:
+def route_requests(fill: str = "placeholder") -> list[tuple[str, str, str]]:
     """(method, concrete path, route template) for every route the app has
-    registered, derived from the app itself. A route type this walk does not
-    understand fails it, rather than being skipped."""
+    registered, derived from the app itself, with every path parameter set
+    to ``fill``. A route type this walk does not understand fails it, rather
+    than being skipped."""
     requests = []
     for route in app.routes:
         assert isinstance(route, Route), (
             f"{route!r} is not a plain HTTP route: teach this walk how to call it, "
             "so it cannot go unchecked"
         )
-        path = re.sub(r"\{[^}]+\}", "placeholder", route.path)
+        path = re.sub(r"\{[^}]+\}", fill, route.path)
         for method in sorted(route.methods):
             requests.append((method, path, route.path))
     assert len(requests) > 18, "the walk found suspiciously few routes"
+    return requests
+
+
+def parameterised_route_requests(fill: str) -> list[tuple[str, str, str]]:
+    """The walk restricted to routes with a path parameter."""
+    requests = [request for request in route_requests(fill) if "{" in request[2]]
+    assert len(requests) >= 8, "the walk found suspiciously few parameterised routes"
     return requests
 
 
@@ -100,6 +108,22 @@ class TestRequiredMode:
         assert mock_proxy_client.mock_calls == []
         assert mock_llm_service.mock_calls == []
 
+    def test_a_path_parameter_spelled_health_does_not_open_a_route(
+        self, anonymous_client, mock_proxy_client, mock_llm_service
+    ):
+        """Every parameterised route again, with each parameter set to
+        ``health``: ``DELETE /calendars/health/events/health`` must be refused
+        like any other path. Catches an exemption that matches the end of a
+        path (or any part of it) rather than the whole path."""
+        not_refused = {
+            (method, path)
+            for method, path, _ in parameterised_route_requests("health")
+            if anonymous_client.request(method, path).status_code != 401
+        }
+        assert not_refused == set()
+        assert mock_proxy_client.mock_calls == []
+        assert mock_llm_service.mock_calls == []
+
     def test_the_exempt_list_is_health_alone(self):
         assert set(auth.EXEMPT_PATHS) == {"/health"}
 
@@ -120,6 +144,14 @@ class TestRequiredMode:
         assert anonymous_client.options("/calendars").status_code == 401
         assert anonymous_client.post("/health/extra").status_code == 401
         assert anonymous_client.get("/health/").status_code == 401
+        for path in (
+            "/x/health",
+            "/no-such-route/health",
+            "/calendars/primary/events/event_1/health",
+            "//health",
+        ):
+            assert anonymous_client.get(path).status_code == 401, path
+            assert anonymous_client.delete(path).status_code == 401, path
 
     @pytest.mark.parametrize("headers", [{}, WRONG], ids=["no token", "wrong token"])
     def test_a_refusal_is_401_with_the_envelope_and_a_bearer_challenge(
