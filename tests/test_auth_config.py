@@ -188,6 +188,36 @@ class TestResolveAuthMode:
         assert f"'{raw}'" not in message and f'"{raw}"' not in message
 
 
+QUOTE_HINT = "check for quotation marks around the value"
+
+
+class TestQuotedValues:
+    """``docker run --env-file`` keeps quotation marks as part of the value,
+    so a correctly typed value in quotes is refused. The message says to
+    check for them, and still repeats nothing from the value."""
+
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_a_quoted_mode_is_refused_with_the_hint(self, quote):
+        raw = f"{quote}required{quote}"
+        with pytest.raises(auth.AuthConfigError) as excinfo:
+            auth.load_auth_settings({auth.MODE_ENV: raw, auth.KEYS_ENV: f"laptop:{TOKEN_A}"})
+        message = str(excinfo.value)
+        assert QUOTE_HINT in message
+        assert raw not in message
+        assert TOKEN_A not in message and "laptop" not in message
+
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_a_quoted_keys_value_is_refused_with_the_hint(self, quote):
+        raw = f"{quote}laptop:{TOKEN_A}{quote}"
+        with pytest.raises(auth.AuthConfigError) as excinfo:
+            auth.load_auth_settings({auth.KEYS_ENV: raw})
+        message = str(excinfo.value)
+        assert QUOTE_HINT in message
+        assert "entry 1" in message
+        for fragment in (TOKEN_A, TOKEN_A[:16], TOKEN_A[-16:], "laptop"):
+            assert fragment not in message
+
+
 class TestLoadAuthSettings:
     def test_required_with_tokens(self):
         settings = auth.load_auth_settings({"CALENDAR_AGENT_API_KEYS": f"laptop:{TOKEN_A}"})

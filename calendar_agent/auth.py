@@ -30,6 +30,9 @@ MAX_NAME_LENGTH = MIN_TOKEN_LENGTH - 1
 # tests/test_auth_routes.py fails if this grows.
 EXEMPT_PATHS = frozenset({"/health"})
 UNAUTHORIZED_MESSAGE = "Missing or invalid bearer token"
+# `docker run --env-file` keeps quotation marks as part of a value, so a
+# correctly typed value in quotes reaches the parser as an invalid one.
+QUOTE_HINT = "check for quotation marks around the value"
 NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 # RFC 6750 section 2.1, the b64token a Bearer header carries.
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
@@ -90,7 +93,9 @@ def parse_api_keys(raw: str | None) -> tuple[ApiKey, ...]:
             raise _bad_keys(position, "has no name before the colon")
         if not NAME_PATTERN.fullmatch(name):
             raise _bad_keys(
-                position, "has a name with characters other than letters, digits, '.', '_', '-'"
+                position,
+                "has a name with characters other than letters, digits, '.', '_', '-' "
+                f"({QUOTE_HINT})",
             )
         if len(name) > MAX_NAME_LENGTH:
             raise _bad_keys(position, f"has a name longer than {MAX_NAME_LENGTH} characters")
@@ -132,7 +137,7 @@ def resolve_auth_mode(raw: str | None) -> AuthMode:
     except ValueError:
         allowed = ", ".join(mode.value for mode in AuthMode)
         raise AuthConfigError(
-            f"{MODE_ENV} is set to a value that is not one of: {allowed}"
+            f"{MODE_ENV} is set to a value that is not one of: {allowed} ({QUOTE_HINT})"
         ) from None
 
 
