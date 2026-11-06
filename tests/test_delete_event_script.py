@@ -30,6 +30,12 @@ EXIT_USAGE = 4
 
 EVENT_PATH = "/calendars/primary/events/event_1"
 ROUTER_404 = {"status": 404, "body": {"detail": "Not Found"}}  # FastAPI, no envelope
+# calendar-agent's own refusal of a missing or wrong token (issue #15).
+UNAUTHORIZED = {
+    "status": 401,
+    "body": {"success": False, "error": "Missing or invalid bearer token"},
+}
+API_TOKEN = "synthetic-script-token-0123456789abcdef"  # not a real credential
 
 
 class _FakeAgentHandler(BaseHTTPRequestHandler):
@@ -43,8 +49,12 @@ class _FakeAgentHandler(BaseHTTPRequestHandler):
         pass
 
     def _respond(self, spec: dict) -> None:
+        self.server.authorization.append(self.headers.get_all("Authorization") or [])
+        required = self.server.required_token
         if self.path != EVENT_PATH:
             spec = ROUTER_404
+        elif required and self.headers.get("Authorization") != f"Bearer {required}":
+            spec = UNAUTHORIZED
         if spec.get("delay"):
             time.sleep(spec["delay"])
         payload = json.dumps(spec.get("body", {})).encode()
@@ -74,6 +84,8 @@ def fake_agent():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeAgentHandler)
     server.daemon_threads = True
     server.calls = []
+    server.authorization = []  # the Authorization header values of each request
+    server.required_token = None  # set to make the stub demand a token
     server.script = {
         "delete": {"status": 200, "body": {"success": True, "message": "ok"}},
         "get": {"status": 404, "body": {"success": False, "event": None}},
@@ -374,3 +386,81 @@ class TestUsage:
         assert result.returncode == EXIT_USAGE
         assert "python3" in result.stderr
         assert fake_agent.calls == []
+
+
+class TestBearerToken:
+    """Issue #15: calendar-agent requires ``Authorization: Bearer <token>``.
+    The script reads the token from CALENDAR_AGENT_API_KEY."""
+
+    def test_the_token_is_sent_on_the_delete_and_on_the_verifying_get(self, fake_agent):
+        fake_agent.required_token = API_TOKEN
+        result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": API_TOKEN})
+        assert result.returncode == EXIT_SUCCESS
+        assert fake_agent.calls == [("DELETE", EVENT_PATH), ("GET", EVENT_PATH)]
+        assert fake_agent.authorization == [[f"Bearer {API_TOKEN}"], [f"Bearer {API_TOKEN}"]]
+
+    def test_no_authorization_header_is_sent_when_the_variable_is_unset(self, fake_agent):
+        """A server running without the requirement keeps working unchanged."""
+        result = run_script(fake_agent)
+        assert result.returncode == EXIT_SUCCESS
+        assert fake_agent.authorization == [[], []]
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_an_empty_variable_sends_no_header(self, fake_agent, value):
+        result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": value})
+        assert result.returncode == EXIT_SUCCESS
+        assert fake_agent.authorization == [[], []]
+
+    @pytest.mark.parametrize(
+        "token", [None, "synthetic-script-wrong-0123456789abcdef"], ids=["no token", "wrong token"]
+    )
+    def test_a_refused_token_is_a_configuration_error_and_nothing_else_is_sent(
+        self, fake_agent, token
+    ):
+        """The server refuses before the request reaches a route, so nothing
+        was attempted: exit 4, not "unknown", and no verifying GET."""
+        fake_agent.required_token = API_TOKEN
+        fake_agent.script["get"] = confirmed_event()
+        result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": token})
+        assert result.returncode == EXIT_USAGE
+        assert fake_agent.calls == [("DELETE", EVENT_PATH)]
+        assert "CALENDAR_AGENT_API_KEY" in result.stderr
+        assert "nothing was attempted" in result.stderr.lower()
+        assert "RESULT:" not in result.stdout
+
+    def test_a_401_without_the_envelope_is_not_read_as_a_token_refusal(self, fake_agent):
+        """Some other server answering 401 says nothing about calendar-agent;
+        that stays "unknown", decided by the re-read like any other answer
+        without the envelope."""
+        fake_agent.script["delete"] = {"status": 401, "body": {"detail": "Unauthorized"}}
+        fake_agent.script["get"] = confirmed_event()
+        result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": API_TOKEN})
+        assert result.returncode == EXIT_UNKNOWN
+        assert fake_agent.calls == [("DELETE", EVENT_PATH), ("GET", EVENT_PATH)]
+
+    def test_the_token_is_never_printed(self, fake_agent):
+        for required in (API_TOKEN, "synthetic-script-other-0123456789abcdef"):
+            fake_agent.required_token = required
+            result = run_script(fake_agent, extra_env={"CALENDAR_AGENT_API_KEY": API_TOKEN})
+            assert API_TOKEN not in result.stdout
+            assert API_TOKEN not in result.stderr
+
+    def test_the_token_is_not_passed_on_curls_command_line(self, fake_agent, tmp_path):
+        """A command line is readable by every process on the machine (``ps``).
+        A stand-in ``curl`` records its arguments, then runs the real one."""
+        real_curl = shutil.which("curl")
+        log = tmp_path / "curl-args.log"
+        shim = tmp_path / "bin" / "curl"
+        shim.parent.mkdir()
+        shim.write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" >> "{log}"\nexec "{real_curl}" "$@"\n')
+        shim.chmod(0o755)
+        fake_agent.required_token = API_TOKEN
+        result = run_script(
+            fake_agent,
+            extra_env={"CALENDAR_AGENT_API_KEY": API_TOKEN},
+            path=f"{shim.parent}:/usr/bin:/bin:/usr/local/bin",
+        )
+        assert result.returncode == EXIT_SUCCESS
+        recorded = log.read_text()
+        assert "DELETE" in recorded, "the stand-in curl was not the one that ran"
+        assert API_TOKEN not in recorded
