@@ -187,7 +187,9 @@ logger has a handler at start-up, as when the server is started with plain
 logger a handler (for example with uvicorn's `--log-config`) and set the
 level there; a level set on `calendar_agent` with no handler anywhere is
 replaced by info. (uvicorn's own access log is separate from
-these lines, and it does print the request path.)
+these lines, and it does print the request path with its query string, so a
+token a caller puts in the query string is written there even though it is
+not accepted.)
 
 #### Rolling it out
 
