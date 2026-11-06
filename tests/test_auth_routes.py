@@ -449,3 +449,47 @@ class TestNoTokenTextAnywhere:
             for response in responses:
                 assert secret not in response.text
                 assert secret not in repr(response.headers)
+
+
+def _operations(document: dict):
+    for path, item in document["paths"].items():
+        for method, operation in item.items():
+            yield path, method, operation
+
+
+class TestOpenApiDocument:
+    def test_it_declares_one_http_bearer_scheme(self):
+        schemes = app.openapi()["components"]["securitySchemes"]
+        assert schemes == {"bearerAuth": {"type": "http", "scheme": "bearer"}}
+
+    def test_the_scheme_is_required_for_the_whole_api(self):
+        assert app.openapi()["security"] == [{"bearerAuth": []}]
+
+    def test_health_is_marked_as_needing_no_token_and_nothing_else_is(self):
+        """An empty ``security`` list on an operation overrides the
+        document-wide requirement: that is how OpenAPI says "open"."""
+        opted_out = {
+            path for path, _, operation in _operations(app.openapi()) if "security" in operation
+        }
+        assert opted_out == {"/health"}
+        assert app.openapi()["paths"]["/health"]["get"]["security"] == []
+
+    def test_every_operation_but_health_documents_the_401(self):
+        document = app.openapi()
+        operations = list(_operations(document))
+        assert len(operations) == 18
+        without_401 = {
+            path for path, _, operation in operations if "401" not in operation["responses"]
+        }
+        assert without_401 == {"/health"}
+
+    def test_the_rest_of_the_document_is_untouched(self):
+        document = app.openapi()
+        assert "EventSummary" in document["components"]["schemas"]
+        assert document["info"]["title"] == "Calendar Agent"
+
+    def test_the_served_document_is_the_same_one(self, anonymous_client):
+        served = anonymous_client.get("/openapi.json", headers=RIGHT)
+        assert served.status_code == 200
+        assert served.json() == app.openapi()
+        assert served.json()["components"]["securitySchemes"]["bearerAuth"]["scheme"] == "bearer"

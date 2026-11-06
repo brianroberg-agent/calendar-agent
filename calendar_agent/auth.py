@@ -236,6 +236,39 @@ def bearer_token(authorization: list[bytes]) -> bytes | None:
     return parts[1]
 
 
+OPENAPI_SCHEME_NAME = "bearerAuth"
+_OPENAPI_METHODS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
+
+
+def declare_bearer_scheme(document: dict, exempt_paths=EXEMPT_PATHS) -> dict:
+    """Declare the token requirement in an OpenAPI document, in place.
+
+    Adds the HTTP bearer scheme, requires it document-wide, gives each
+    operation outside ``exempt_paths`` a 401 response, and marks operations
+    on the exempt paths as open (an empty ``security`` list). Applying it
+    twice changes nothing more.
+    """
+    schemes = document.setdefault("components", {}).setdefault("securitySchemes", {})
+    schemes[OPENAPI_SCHEME_NAME] = {"type": "http", "scheme": "bearer"}
+    document["security"] = [{OPENAPI_SCHEME_NAME: []}]
+    for path, item in document.get("paths", {}).items():
+        for method, operation in item.items():
+            if method not in _OPENAPI_METHODS:
+                continue
+            if path in exempt_paths:
+                operation["security"] = []
+            else:
+                operation.setdefault("responses", {})["401"] = {
+                    "description": UNAUTHORIZED_MESSAGE,
+                    "content": {
+                        "application/json": {
+                            "example": {"success": False, "error": UNAUTHORIZED_MESSAGE}
+                        }
+                    },
+                }
+    return document
+
+
 NO_ROUTE = "(no matching route)"
 _NOT_LOG_SAFE = re.compile(r"[^A-Za-z0-9.:_\-\[\]]")
 

@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from . import __version__
-from .auth import BearerAuthMiddleware, settings_at_startup
+from .auth import BearerAuthMiddleware, declare_bearer_scheme, settings_at_startup
 from .calendar_utils import (
     READ_RESPONSE_STATUSES,
     RSVP_RESPONSES,
@@ -122,6 +122,22 @@ app.add_middleware(
     BearerAuthMiddleware,
     get_settings=lambda: getattr(app.state, "auth_settings", None),
 )
+
+
+_generate_openapi = app.openapi
+
+
+def openapi_with_bearer_scheme() -> dict[str, Any]:
+    """The generated OpenAPI document, with the token requirement declared.
+
+    The check is a middleware, not a FastAPI security dependency, so FastAPI
+    does not know to document it; this adds the declaration to the document
+    FastAPI generates (and caches).
+    """
+    return declare_bearer_scheme(_generate_openapi())
+
+
+app.openapi = openapi_with_bearer_scheme
 
 
 @app.exception_handler(RequestValidationError)
