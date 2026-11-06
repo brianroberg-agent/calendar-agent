@@ -272,6 +272,27 @@ class TestRefusalComesBeforeTheOperatorApprovalWait:
         assert "outcome" not in response.json()
 
 
+class TestHealthInEveryMode:
+    @pytest.mark.parametrize("mode", ["required", "optional", "off"])
+    @pytest.mark.parametrize(
+        "headers",
+        [{}, WRONG, RIGHT, {"Authorization": "garbage"}],
+        ids=["no token", "wrong token", "right token", "garbage header"],
+    )
+    def test_health_answers_200_whatever_the_request_carries(
+        self, use_settings, anonymous_client, mode, headers
+    ):
+        use_settings(mode)
+        response = anonymous_client.get("/health", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+    @pytest.mark.parametrize("mode", ["required", "optional"])
+    def test_health_is_open_even_with_no_tokens_loaded(self, anonymous_client, mode):
+        app.state.auth_settings = auth.AuthSettings(mode=auth.AuthMode(mode))
+        assert anonymous_client.get("/health").status_code == 200
+
+
 class TestOptionalMode:
     def test_a_request_with_no_token_is_served(
         self, use_settings, anonymous_client, mock_proxy_client
